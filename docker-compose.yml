@@ -1,0 +1,22 @@
+version: '3.9'
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - RAG_EMBEDDING_PROVIDER=local
+      - RAG_VECTOR_STORE=chroma
+      - RAG_DATABASE_URL=sqlite:///./rag.db
+    volumes:
+      - .:/app
+    depends_on:
+      - vectordb
+  vectordb:
+    image: chromadb/chroma:latest
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/data
+volumes:
+  chroma_data:

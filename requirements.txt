@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+chromadb
+pypdf
+python-multipart
+pytest
