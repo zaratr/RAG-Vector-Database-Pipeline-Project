@@ -95,7 +95,7 @@ class FastEmbedTextProvider:
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
         self._init_model()
         results = list(self._model.embed(texts))
-        return [[float(v) for v in r] for r in results]
+        return [list(r) for r in results]
 
 
 class FastEmbedImageProvider:

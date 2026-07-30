@@ -5,7 +5,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.db import Base
 from app.persistence import repositories
-from app.services.embeddings import LocalEmbeddingProvider
+from app.services.embeddings import HashEmbeddingProvider as LocalEmbeddingProvider
 from app.services.ingestion import ingest_text
 from app.services.vector_store import ChromaVectorStore
 

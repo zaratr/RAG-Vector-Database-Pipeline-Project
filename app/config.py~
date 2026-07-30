@@ -15,9 +15,6 @@ class Settings(BaseSettings):
     embedding_provider: Literal["local", "fastembed", "openai"] = Field(default="fastembed")
     embedding_model: str = Field(default="jinaai/jina-clip-v1")
     vector_store: Literal["chroma"] = Field(default="chroma")
-    llm_provider: Literal["dummy", "ollama", "openai"] = Field(default="ollama")
-    llm_base_url: str = Field(default="http://localhost:11434/v1")
-    llm_model: str = Field(default="gemma4:latest")
 
     openai_api_key: Optional[str] = Field(default=None)
     chroma_persist_directory: Optional[str] = Field(default=None)

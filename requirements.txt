@@ -8,5 +8,6 @@ pypdf
 python-multipart
 pytest
 pytest-asyncio
+fastembed
 
 

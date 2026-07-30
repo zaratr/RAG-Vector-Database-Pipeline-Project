@@ -15,7 +15,7 @@ from app.core.db import get_db
 from app.core.models import DocumentDetail, DocumentSummary
 from app.persistence import models, repositories
 from app.services.embeddings import get_embedding_provider
-from app.services.ingestion import chunks_for_document, ingest_text, ingest_image
+from app.services.ingestion import chunks_for_document, ingest_text
 from app.services.vector_store import get_vector_store
 from app.services.embeddings import get_image_embedding_provider 
 

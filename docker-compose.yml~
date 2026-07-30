@@ -3,8 +3,10 @@ services:
     build: .
     ports:
       - "8000:8000"
-    env_file:
-      - .env
+    environment:
+      - RAG_EMBEDDING_PROVIDER=fastembed
+      - RAG_VECTOR_STORE=chroma
+      - RAG_DATABASE_URL=sqlite:///./rag.db
     volumes:
       - .:/app
     depends_on:

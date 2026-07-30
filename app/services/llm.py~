@@ -58,10 +58,8 @@ def get_llm_client(api_key: str | None = None, provider: str = "dummy",
                    base_url: str | None = None, model: str | None = None) -> LLMClient:
     if provider == "ollama":
         return OllamaLLMClient(
-            base_url=base_url or "http://localhost:11434/v1",
-            model=model or "gemma4:latest",
-        )
+                base_url = base_url or "http://localhost:11434/v1"
+                model = model or "gemma4:latest",
+                )
             
-    if provider == "openai":
-        return OpenAILLMClient(api_key)
     return DummyLLMClient()

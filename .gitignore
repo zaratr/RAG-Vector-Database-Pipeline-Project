@@ -14,3 +14,5 @@ venv/
 *.lance
 chroma_db/
 data/processed/
+
+.env
