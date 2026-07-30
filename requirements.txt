@@ -2,7 +2,11 @@ fastapi
 uvicorn[standard]
 sqlalchemy
 pydantic
+pydantic-settings
 chromadb
 pypdf
 python-multipart
 pytest
+pytest-asyncio
+
+

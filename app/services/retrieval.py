@@ -12,4 +12,4 @@ async def retrieve(
 ) -> List[dict]:
     query_embedding = (await embedding_provider.embed_texts([query]))[0]
     results = await vector_store.query(query_embedding, top_k=top_k, filters=filters)
-    return [result.dict() for result in results]
+    return [result.model_dump() for result in results]

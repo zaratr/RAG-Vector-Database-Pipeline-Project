@@ -15,7 +15,13 @@ settings = get_settings()
 
 
 class VectorStore(Protocol):
-    async def index_embeddings(self, embeddings: List[List[float]], metadatas: List[dict], ids: List[str]) -> None:
+    async def index_embeddings(
+        self,
+        embeddings: List[List[float]],
+        metadatas: List[dict],
+        ids: List[str],
+        documents: List[str] | None = None,
+    ) -> None:
         ...
 
     async def query(self, embedding: List[float], top_k: int, filters: dict | None = None) -> List[RetrievedChunk]:
@@ -26,18 +32,31 @@ class ChromaVectorStore:
     """Wrapper around Chroma DB."""
 
     def __init__(self, collection_name: str = "rag-collection") -> None:
-        client_settings = ChromaSettings(persist_directory=settings.chroma_persist_directory)
+        kwargs = {}
+        if settings.chroma_persist_directory:
+            kwargs["persist_directory"] = settings.chroma_persist_directory
+        client_settings = ChromaSettings(**kwargs)
         self.client = Client(settings=client_settings)
         self.collection = self.client.get_or_create_collection(name=collection_name, embedding_function=None)
 
-    async def index_embeddings(self, embeddings: List[List[float]], metadatas: List[dict], ids: List[str]) -> None:
+    async def index_embeddings(
+        self,
+        embeddings: List[List[float]],
+        metadatas: List[dict],
+        ids: List[str],
+        documents: List[str] | None = None,
+    ) -> None:
         logger.info("Indexing %s embeddings", len(embeddings))
-        await run_in_threadpool(self.collection.add, embeddings=embeddings, metadatas=metadatas, ids=ids)
+        kwargs = {"embeddings": embeddings, "metadatas": metadatas, "ids": ids}
+        if documents is not None:
+            kwargs["documents"] = documents
+        await run_in_threadpool(self.collection.add, **kwargs)
 
     async def query(self, embedding: List[float], top_k: int, filters: dict | None = None) -> List[RetrievedChunk]:
         logger.info("Querying vector store with top_k=%s", top_k)
+        where_clause = filters if filters else None
         result = await run_in_threadpool(
-            self.collection.query, query_embeddings=[embedding], n_results=top_k, where=filters or {}
+            self.collection.query, query_embeddings=[embedding], n_results=top_k, where=where_clause
         )
         contexts = []
         for text, score, metadata in zip(

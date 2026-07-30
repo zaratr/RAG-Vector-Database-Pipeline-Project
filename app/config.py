@@ -2,7 +2,8 @@
 from functools import lru_cache
 from typing import Literal, Optional
 
-from pydantic import BaseSettings, Field
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -17,9 +18,7 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = Field(default=None)
     chroma_persist_directory: Optional[str] = Field(default=None)
 
-    class Config:
-        env_prefix = "RAG_"
-        env_file = ".env"
+    model_config = SettingsConfigDict(env_prefix="RAG_", env_file=".env", extra="ignore")
 
 
 @lru_cache()

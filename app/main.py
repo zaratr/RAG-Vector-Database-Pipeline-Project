@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.db import Base, engine
+from app.persistence import models  # noqa: F401
 from app.api import routes_documents, routes_query
 from app.config import get_settings
 from app.core.logging import logger

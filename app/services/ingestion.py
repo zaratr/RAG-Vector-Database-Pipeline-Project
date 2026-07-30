@@ -30,9 +30,10 @@ async def ingest_text(
     chunk_models: List[models.Chunk] = repositories.create_chunks(session, document=document, chunks=chunks)
 
     embeddings = await embedding_provider.embed_texts([chunk.text for chunk in chunk_models])
-    metadata_entries = [chunk.metadata() for chunk in chunk_models]
+    metadata_entries = [chunk.get_chunk_metadata() for chunk in chunk_models]
     ids = [str(uuid.uuid4()) for _ in chunk_models]
-    await vector_store.index_embeddings(embeddings, metadata_entries, ids)
+    texts = [chunk.text for chunk in chunk_models]
+    await vector_store.index_embeddings(embeddings, metadata_entries, ids, documents=texts)
 
     logger.info("Ingested document %s with %s chunks", document.id, len(chunk_models))
     return {"document_id": document.id, "chunks": len(chunk_models)}

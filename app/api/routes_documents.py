@@ -4,13 +4,13 @@ from __future__ import annotations
 import io
 from typing import List
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi import status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.models import DocumentCreate, DocumentDetail, DocumentSummary
+from app.core.models import DocumentDetail, DocumentSummary
 from app.persistence import models, repositories
 from app.services.embeddings import get_embedding_provider
 from app.services.ingestion import chunks_for_document, ingest_text
@@ -31,13 +31,16 @@ class DocumentCreateResponse(BaseModel):
 
 @router.post("", response_model=DocumentCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_document(
-    payload: DocumentCreate = Depends(),
+    title: str = Form(...),
+    source: str | None = Form(default=None),
+    tags: str | None = Form(default=None),
+    text: str | None = Form(default=None),
     file: UploadFile | None = File(default=None),
     session: Session = Depends(get_db),
 ):
     embedding_provider = get_embedding_provider()
     vector_store = get_vector_store()
-    text_content = payload.text
+    text_content = text
 
     if file:
         if file.content_type not in {"application/pdf", "text/plain"}:
@@ -54,10 +57,12 @@ async def create_document(
     if not text_content:
         raise HTTPException(status_code=400, detail="No text provided")
 
+    parsed_tags = [t.strip() for t in tags.split(",")] if tags else None
+
     result = await ingest_text(
-        title=payload.title,
-        source=payload.source,
-        tags=payload.tags,
+        title=title,
+        source=source,
+        tags=parsed_tags,
         text=text_content,
         embedding_provider=embedding_provider,
         vector_store=vector_store,
