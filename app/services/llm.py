@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import List, Protocol
 
+import httpx
+
 
 class LLMClient(Protocol):
     async def generate_answer(self, query: str, context: List[str]) -> str:
@@ -32,24 +34,40 @@ class OpenAILLMClient:
 class OllamaLLMClient:
     """LLM client using Ollama's OpenAI-compatible API."""
     
-    def __init__(self, base_url: str, model: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.transport = transport
 
     async def generate_answer(self, query: str, context: List[str]) -> str:
-        import httpx
-        context_text = "\n\n".join(context)
+        context_text = "\n".join(
+            f"Evidence [{index}]: {text}" for index, text in enumerate(context, start=1)
+        )
         payload = {
                 "model": self.model,
+                "temperature": 0,
                 "messages": [
                     {
-                        "role": "system", "content": "Answer the question based on the provided context. If the context doesn't contain relevant information, say so."
+                        "role": "system",
+                        "content": (
+                            "Answer using only the supplied evidence. Combine facts transitively "
+                            "when each link in a relationship chain is explicitly supported; for "
+                            "example, if A relates to B and B relates to C, explain how A connects "
+                            "to C. Do not say a connection is unstated when all of its links appear "
+                            "in the evidence. Cite the supporting evidence numbers in the answer. "
+                            "If no supported path answers the question, say so."
+                        )
                      },
                     {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {query}"
                      },
                 ],
         }
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=120.0, transport=self.transport) as client:
             resp = await client.post(f"{self.base_url}/chat/completions", json=payload)
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]

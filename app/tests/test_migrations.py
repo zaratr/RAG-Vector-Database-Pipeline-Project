@@ -15,14 +15,25 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from app.core.db import Base, create_database_engine
+from app.core.db import create_database_engine
 from app.core import migrations
 from app.core.migrations import upgrade_database
 from app.persistence import models
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
-REVISION = "dee48bc24a7f"
+BASELINE_REVISION = "dee48bc24a7f"
+REVISION = "a6e2c4f8b1d9"
+HEAD_TABLES = {
+    "alembic_version",
+    "chunks",
+    "documents",
+    "entity_mentions",
+    "graph_edge_evidence",
+    "graph_edges",
+    "graph_entities",
+    "graph_extractions",
+}
 
 
 def _db_url(path: Path) -> str:
@@ -105,7 +116,7 @@ def test_baseline_creates_exact_schema_on_empty_db(tmp_path):
 
     engine = create_engine(db_url)
     insp = inspect(engine)
-    assert set(insp.get_table_names()) == {"alembic_version", "chunks", "documents"}
+    assert set(insp.get_table_names()) == HEAD_TABLES
 
     doc_cols = {column["name"]: column for column in insp.get_columns("documents")}
     expected_docs = {
@@ -113,6 +124,8 @@ def test_baseline_creates_exact_schema_on_empty_db(tmp_path):
         "title": ("VARCHAR", False, 0),
         "source": ("VARCHAR", True, 0),
         "tags": ("VARCHAR", True, 0),
+        "ingestion_status": ("VARCHAR(20)", False, 0),
+        "failure_code": ("VARCHAR(100)", True, 0),
     }
     assert {
         name: (str(column["type"]), column["nullable"], column["primary_key"])
@@ -128,6 +141,7 @@ def test_baseline_creates_exact_schema_on_empty_db(tmp_path):
         "text": ("TEXT", False, 0),
         "start_offset": ("INTEGER", False, 0),
         "end_offset": ("INTEGER", False, 0),
+        "vector_id": ("VARCHAR(255)", True, 0),
     }
     assert {
         name: (str(column["type"]), column["nullable"], column["primary_key"])
@@ -142,13 +156,93 @@ def test_baseline_creates_exact_schema_on_empty_db(tmp_path):
     assert foreign_keys[0]["referred_columns"] == ["id"]
     assert foreign_keys[0]["options"] == {"ondelete": "CASCADE"}
 
-    assert insp.get_indexes("documents") == [
-        {"name": "ix_documents_id", "column_names": ["id"], "unique": 0, "dialect_options": {}}
-    ]
-    assert insp.get_indexes("chunks") == [
-        {"name": "ix_chunks_id", "column_names": ["id"], "unique": 0, "dialect_options": {}}
-    ]
+    assert {
+        index["name"]: (index["column_names"], index["unique"])
+        for index in insp.get_indexes("documents")
+    } == {
+        "ix_documents_id": (["id"], 0),
+        "ix_documents_ingestion_status": (["ingestion_status"], 0),
+    }
+    assert {
+        index["name"]: (index["column_names"], index["unique"])
+        for index in insp.get_indexes("chunks")
+    } == {
+        "ix_chunks_id": (["id"], 0),
+        "ix_chunks_vector_id": (["vector_id"], 1),
+    }
     assert _revision(engine) == REVISION
+    engine.dispose()
+
+
+def test_graph_head_has_provenance_constraints_indexes_and_cascades(tmp_path):
+    db_url = _db_url(tmp_path / "graph-head.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    inspector = inspect(engine)
+
+    assert {
+        constraint["name"]
+        for constraint in inspector.get_check_constraints("documents")
+    } == {"ck_documents_ingestion_status"}
+
+    assert {
+        constraint["name"]
+        for constraint in inspector.get_unique_constraints("entity_mentions")
+    } == {"uq_entity_mentions_entity_extraction"}
+    assert {
+        constraint["name"]
+        for constraint in inspector.get_unique_constraints("graph_edges")
+    } == {"uq_graph_edges_triplet"}
+    assert {
+        constraint["name"]
+        for constraint in inspector.get_unique_constraints("graph_edge_evidence")
+    } == {"uq_graph_edge_evidence_location"}
+    assert {
+        constraint["name"]
+        for constraint in inspector.get_unique_constraints("graph_entities")
+    } == {"uq_graph_entities_name_type"}
+    entity_indexes = {
+        index["name"]: (index["column_names"], index["unique"])
+        for index in inspector.get_indexes("graph_entities")
+    }
+    assert entity_indexes["ix_graph_entities_canonical_name"] == (
+        ["canonical_name"],
+        0,
+    )
+    edge_indexes = {
+        index["name"] for index in inspector.get_indexes("graph_edges")
+    }
+    assert "ix_graph_edges_predicate" in edge_indexes
+
+    for table in (
+        "graph_extractions",
+        "entity_mentions",
+        "graph_edges",
+        "graph_edge_evidence",
+    ):
+        foreign_keys = inspector.get_foreign_keys(table)
+        assert foreign_keys
+        assert all(
+            foreign_key["options"] == {"ondelete": "CASCADE"}
+            for foreign_key in foreign_keys
+        )
+    engine.dispose()
+
+
+def test_graph_head_rejects_invalid_document_ingestion_status(tmp_path):
+    db_url = _db_url(tmp_path / "invalid-document-status.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO documents (title, ingestion_status) "
+                    "VALUES ('invalid', 'not_a_state')"
+                )
+            )
+
     engine.dispose()
 
 
@@ -159,19 +253,20 @@ def test_migration_entrypoint_migrates_configured_fresh_database(tmp_path):
 
     assert result.returncode == 0, result.stderr
     engine = create_engine(db_url)
-    assert set(inspect(engine).get_table_names()) == {"alembic_version", "chunks", "documents"}
+    assert set(inspect(engine).get_table_names()) == HEAD_TABLES
     assert _revision(engine) == REVISION
     engine.dispose()
 
 
 def test_migration_entrypoint_adopts_matching_legacy_database_and_preserves_rows(tmp_path):
     db_url = _db_url(tmp_path / "legacy.db")
+    command.upgrade(_alembic_config(db_url), BASELINE_REVISION)
     engine = create_engine(db_url)
-    Base.metadata.create_all(engine)
     with engine.begin() as conn:
         conn.execute(
             text("INSERT INTO documents (id, title, source, tags) VALUES (7, 'Legacy', 'unit', 'kept')")
         )
+        conn.execute(text("DROP TABLE alembic_version"))
     engine.dispose()
 
     result = _run_migration_entrypoint(db_url)
@@ -179,15 +274,20 @@ def test_migration_entrypoint_adopts_matching_legacy_database_and_preserves_rows
     assert result.returncode == 0, result.stderr
     engine = create_engine(db_url)
     with engine.connect() as conn:
-        row = conn.execute(text("SELECT title, source, tags FROM documents WHERE id = 7")).one()
-    assert tuple(row) == ("Legacy", "unit", "kept")
+        row = conn.execute(
+            text(
+                "SELECT title, source, tags, ingestion_status, failure_code "
+                "FROM documents WHERE id = 7"
+            )
+        ).one()
+    assert tuple(row) == ("Legacy", "unit", "kept", "ready", None)
     assert _revision(engine) == REVISION
     engine.dispose()
 
 
 def test_legacy_adoption_stamps_baseline_then_applies_future_migrations(tmp_path, monkeypatch):
     db_url = _db_url(tmp_path / "legacy-future.db")
-    command.upgrade(_alembic_config(db_url), REVISION)
+    command.upgrade(_alembic_config(db_url), BASELINE_REVISION)
     engine = create_engine(db_url)
     with engine.begin() as conn:
         conn.execute(text("INSERT INTO documents (id, title) VALUES (9, 'Before Future')"))
@@ -285,7 +385,7 @@ def test_alembic_cli_honors_rag_database_url(tmp_path):
     assert "No new upgrade operations detected" in check.stdout
 
     engine = create_engine(db_url)
-    assert set(inspect(engine).get_table_names()) == {"alembic_version", "chunks", "documents"}
+    assert set(inspect(engine).get_table_names()) == HEAD_TABLES
     assert _revision(engine) == REVISION
     engine.dispose()
 
@@ -293,10 +393,11 @@ def test_alembic_cli_honors_rag_database_url(tmp_path):
 def test_migration_entrypoint_imports_legacy_sqlite_into_durable_target(tmp_path):
     legacy_path = tmp_path / "legacy-source.db"
     legacy_url = _db_url(legacy_path)
+    command.upgrade(_alembic_config(legacy_url), BASELINE_REVISION)
     legacy_engine = create_engine(legacy_url)
-    Base.metadata.create_all(legacy_engine)
     with legacy_engine.begin() as conn:
         conn.execute(text("INSERT INTO documents (id, title) VALUES (11, 'Moved Legacy')"))
+        conn.execute(text("DROP TABLE alembic_version"))
     legacy_engine.dispose()
 
     durable_url = _db_url(tmp_path / "data" / "rag.db")
@@ -315,8 +416,10 @@ def test_migration_entrypoint_imports_legacy_sqlite_into_durable_target(tmp_path
 @pytest.mark.parametrize("target_object", ["table", "view"])
 def test_legacy_import_refuses_any_existing_target_schema_object(tmp_path, target_object):
     legacy_path = tmp_path / "legacy-source.db"
+    command.upgrade(_alembic_config(_db_url(legacy_path)), BASELINE_REVISION)
     legacy_engine = create_engine(_db_url(legacy_path))
-    Base.metadata.create_all(legacy_engine)
+    with legacy_engine.begin() as conn:
+        conn.execute(text("DROP TABLE alembic_version"))
     legacy_engine.dispose()
 
     target_path = tmp_path / f"target-{target_object}.db"
@@ -515,7 +618,7 @@ def test_upgrade_head_is_idempotent(tmp_path):
     upgrade_database(db_url)
 
     engine = create_engine(db_url)
-    assert set(inspect(engine).get_table_names()) == {"alembic_version", "chunks", "documents"}
+    assert set(inspect(engine).get_table_names()) == HEAD_TABLES
     assert _revision(engine) == REVISION
     engine.dispose()
 
@@ -531,7 +634,7 @@ def test_downgrade_base_then_upgrade_restores_schema(tmp_path):
 
     upgrade_database(db_url)
     engine = create_engine(db_url)
-    assert set(inspect(engine).get_table_names()) == {"alembic_version", "chunks", "documents"}
+    assert set(inspect(engine).get_table_names()) == HEAD_TABLES
     assert _revision(engine) == REVISION
     engine.dispose()
 

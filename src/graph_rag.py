@@ -1,31 +1,39 @@
-import networkx as nx
+"""Operator CLI for querying the persisted GraphRAG relationship graph."""
+from __future__ import annotations
 
-class GraphRAGPipeline:
-    def __init__(self):
-        self.graph = nx.DiGraph()
-    
-    def extract_entities_with_gemma(self, text):
-        # In a real run, this calls Ollama Gemma to extract (Entity1, Relationship, Entity2)
-        # Mocking the LLM response for validation checkpoint
-        return [("User", "purchases", "Subscription"), ("Subscription", "grants", "PremiumAccess")]
-        
-    def build_graph(self, documents):
-        for doc in documents:
-            triplets = self.extract_entities_with_gemma(doc)
-            for e1, rel, e2 in triplets:
-                self.graph.add_edge(e1, e2, relation=rel)
-                
-    def query_graph(self, entity):
-        if entity in self.graph:
-            edges = self.graph.edges(entity, data=True)
-            return [(u, v, d['relation']) for u, v, d in edges]
-        return []
+import argparse
+import json
+import sys
+from pathlib import Path
 
-if __name__ == '__main__':
-    pipeline = GraphRAGPipeline()
-    docs = ["User purchases Subscription which grants PremiumAccess."]
-    pipeline.build_graph(docs)
-    
-    result = pipeline.query_graph("User")
-    print(f"Graph query for 'User': {result}")
-    print("Phase 2 Step 1 Validation: GraphRAG local setup complete.")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.core.db import session_scope
+from app.services.graph_retrieval import retrieve_graph_contexts
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Traverse persisted GraphRAG relationships with provenance."
+    )
+    parser.add_argument("query", help="Question or entity name used to seed traversal")
+    parser.add_argument("--hops", type=int, default=2, choices=range(1, 6))
+    parser.add_argument("--limit", type=int, default=10)
+    args = parser.parse_args()
+    if args.limit < 1:
+        parser.error("--limit must be at least 1")
+
+    with session_scope() as session:
+        contexts = retrieve_graph_contexts(
+            session,
+            query=args.query,
+            max_hops=args.hops,
+            limit=args.limit,
+        )
+    print(json.dumps(contexts, indent=2))
+
+
+if __name__ == "__main__":
+    main()

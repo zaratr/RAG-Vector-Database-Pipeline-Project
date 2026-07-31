@@ -1,116 +1,110 @@
-"""Tests for NetworkX dependency and graph_rag.py spike execution.
+"""Subprocess coverage for the persisted GraphRAG operator CLI."""
+from __future__ import annotations
 
-Covers: dependency availability, happy-path pipeline execution, script
-execution via subprocess, and edge cases the spike code already handles
-correctly (empty graph, missing entity, 2nd-hop entity, empty doc list,
-multi-doc accumulation).
-"""
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-import pytest
+from sqlalchemy.orm import sessionmaker
+
+from app.core.db import Base, create_database_engine
+from app.persistence import models
+from app.persistence.graph_repository import persist_chunk_extraction
+from app.services.graph_extraction import ExtractedEntity, ExtractedRelation
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.fixture(autouse=True)
-def restore_sys_path():
-    """Ensure /app/src is removed from sys.path after each test to prevent leaks."""
-    yield
-    sys.path[:] = [p for p in sys.path if p != "/app/src"]
-
-
-def _import_pipeline():
-    """Import GraphRAGPipeline from src/graph_rag.py with path isolation."""
-    if "/app/src" not in sys.path:
-        sys.path.insert(0, "/app/src")
-    from graph_rag import GraphRAGPipeline
-    return GraphRAGPipeline
-
-
 def test_networkx_importable():
-    """NetworkX must be installed and importable inside the Docker container."""
     import networkx
-    assert networkx.__version__ is not None
+
+    assert networkx.__version__ == "3.6.1"
 
 
-def test_graph_rag_pipeline_builds_and_queries():
-    """The GraphRAGPipeline class must build a graph and produce expected query results."""
-    Pipeline = _import_pipeline()
-    pipeline = Pipeline()
-    docs = ["User purchases Subscription which grants PremiumAccess."]
-    pipeline.build_graph(docs)
-
-    result = pipeline.query_graph("User")
-    assert len(result) == 1
-    assert result[0] == ("User", "Subscription", "purchases")
-
-
-def test_graph_rag_script_executes():
-    """The src/graph_rag.py script must execute via `python src/graph_rag.py` and produce expected stdout."""
+def test_graph_rag_cli_help_executes():
     result = subprocess.run(
-        [sys.executable, "src/graph_rag.py"],
+        [sys.executable, "src/graph_rag.py", "--help"],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
-    assert "Graph query for 'User':" in result.stdout
-    assert "('User', 'Subscription', 'purchases')" in result.stdout
-    assert "GraphRAG local setup complete" in result.stdout
+    assert result.returncode == 0, result.stderr
+    assert "persisted GraphRAG relationships" in result.stdout
 
 
-def test_query_empty_graph_returns_empty():
-    """Querying a freshly initialized graph (no documents built) returns []."""
-    Pipeline = _import_pipeline()
-    pipeline = Pipeline()
-    result = pipeline.query_graph("User")
-    assert result == []
-
-
-def test_query_missing_entity_returns_empty():
-    """Querying for an entity that doesn't exist in the graph returns []."""
-    Pipeline = _import_pipeline()
-    pipeline = Pipeline()
-    pipeline.build_graph(["User purchases Subscription which grants PremiumAccess."])
-    result = pipeline.query_graph("NonExistentEntity")
-    assert result == []
-
-
-def test_query_2nd_hop_entity():
-    """The intermediate entity (Subscription) must have its own outgoing edges."""
-    Pipeline = _import_pipeline()
-    pipeline = Pipeline()
-    pipeline.build_graph(["User purchases Subscription which grants PremiumAccess."])
-
-    result = pipeline.query_graph("Subscription")
-    assert len(result) == 1
-    assert result[0] == ("Subscription", "PremiumAccess", "grants")
-
-
-def test_build_graph_with_empty_doc_list():
-    """Building a graph with an empty document list produces an empty graph."""
-    Pipeline = _import_pipeline()
-    pipeline = Pipeline()
-    pipeline.build_graph([])
-    assert pipeline.graph.number_of_nodes() == 0
-    assert pipeline.graph.number_of_edges() == 0
-
-
-def test_multi_doc_accumulation_deduplicates_edges():
-    """Building from multiple identical documents deduplicates nodes/edges in the DiGraph."""
-    Pipeline = _import_pipeline()
-    pipeline = Pipeline()
-    docs = [
-        "User purchases Subscription which grants PremiumAccess.",
-        "User purchases Subscription which grants PremiumAccess.",
+def test_graph_rag_cli_queries_persisted_multihop_provenance(tmp_path):
+    database_path = tmp_path / "graph-cli.db"
+    database_url = f"sqlite:///{database_path}"
+    engine = create_database_engine(database_url)
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    document = models.Document(title="CLI graph", source="unit")
+    session.add(document)
+    session.flush()
+    chunks = [
+        models.Chunk(
+            document_id=document.id,
+            index=index,
+            text=text,
+            start_offset=0,
+            end_offset=len(text),
+        )
+        for index, text in enumerate(
+            ["User purchases Subscription.", "Subscription grants PremiumAccess."]
+        )
     ]
-    pipeline.build_graph(docs)
+    session.add_all(chunks)
+    session.flush()
+    for chunk, source, predicate, target in (
+        (chunks[0], "User", "purchases", "Subscription"),
+        (chunks[1], "Subscription", "grants", "PremiumAccess"),
+    ):
+        persist_chunk_extraction(
+            session,
+            chunk=chunk,
+            relations=[
+                ExtractedRelation(
+                    source=ExtractedEntity(
+                        name=source,
+                        canonical_name=source.casefold(),
+                        entity_type="concept",
+                    ),
+                    predicate=predicate,
+                    target=ExtractedEntity(
+                        name=target,
+                        canonical_name=target.casefold(),
+                        entity_type="concept",
+                    ),
+                    evidence=chunk.text,
+                    evidence_start=0,
+                    evidence_end=len(chunk.text),
+                    confidence=1.0,
+                )
+            ],
+            provider="ollama",
+            model="gemma4:latest",
+        )
+    session.commit()
+    session.close()
+    engine.dispose()
 
-    # DiGraph deduplicates: same 3 nodes, same 2 edges regardless of doc count
-    assert pipeline.graph.number_of_nodes() == 3
-    assert pipeline.graph.number_of_edges() == 2
+    env = os.environ.copy()
+    env["RAG_DATABASE_URL"] = database_url
+    result = subprocess.run(
+        [sys.executable, "src/graph_rag.py", "User", "--hops", "2"],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
-    result = pipeline.query_graph("User")
-    assert len(result) == 1  # No duplicate edges
+    assert result.returncode == 0, result.stderr
+    contexts = json.loads(result.stdout)
+    assert [context["metadata"]["graph"]["predicate"] for context in contexts] == [
+        "purchases",
+        "grants",
+    ]

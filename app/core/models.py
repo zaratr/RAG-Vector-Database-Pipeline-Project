@@ -1,7 +1,7 @@
 """Pydantic schemas for API requests and responses."""
-from typing import List, Optional
+from typing import List, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DocumentCreate(BaseModel):
@@ -36,15 +36,18 @@ class DocumentDetail(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    query: str
-    top_k: int = 5
+    query: str = Field(min_length=1)
+    top_k: int = Field(default=5, ge=1, le=50)
     filters: Optional[dict] = None
+    retrieval_mode: Literal["vector", "graph", "hybrid"] = "vector"
+    graph_max_hops: int = Field(default=2, ge=1, le=3)
 
 
 class RetrievedChunk(BaseModel):
     text: str
     score: float
     metadata: dict
+    vector_id: Optional[str] = Field(default=None, exclude=True)
 
 
 class QueryResponse(BaseModel):
