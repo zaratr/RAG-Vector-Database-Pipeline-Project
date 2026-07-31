@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     llm_provider: Literal["dummy", "ollama", "openai"] = Field(default="ollama")
     llm_base_url: str = Field(default="http://localhost:11434/v1")
     llm_model: str = Field(default="gemma4:latest")
+    graph_extraction_enabled: bool = Field(default=True)
+    graph_extraction_model: Optional[str] = Field(default=None)
+    graph_max_hops: int = Field(default=2, ge=1, le=3)
 
     openai_api_key: Optional[str] = Field(default=None)
     chroma_host: Optional[str] = Field(default=None)

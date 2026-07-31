@@ -1,3 +1,4 @@
+import chromadb
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -6,6 +7,15 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.db import Base, get_db
 from app.main import app
+from app.persistence import models
+from app.services.graph_extraction import (
+    DisabledGraphExtractor,
+    GraphExtractionError,
+    GraphProviderUnavailable,
+    get_graph_extractor,
+)
+from app.services.vector_store import ChromaVectorStore
+from app.api import routes_documents, routes_query
 
 test_engine = create_engine(
     "sqlite:///:memory:",
@@ -28,14 +38,26 @@ def override_get_db():
 
 
 app.dependency_overrides[get_db] = override_get_db
+app.dependency_overrides[get_graph_extractor] = lambda: DisabledGraphExtractor()
 client = TestClient(app)
 
 
 @pytest.fixture(scope="module", autouse=True)
 def setup_db():
+    client = chromadb.EphemeralClient()
+    vector_store = ChromaVectorStore(
+        collection_name="test-rag-api", client=client
+    )
+    original_documents_store = routes_documents.get_vector_store
+    original_query_store = routes_query.get_vector_store
+    routes_documents.get_vector_store = lambda: vector_store
+    routes_query.get_vector_store = lambda: vector_store
     Base.metadata.create_all(bind=test_engine)
     yield
     Base.metadata.drop_all(bind=test_engine)
+    routes_documents.get_vector_store = original_documents_store
+    routes_query.get_vector_store = original_query_store
+    client.delete_collection("test-rag-api")
 
 
 def test_ingest_and_query():
@@ -51,9 +73,70 @@ def test_ingest_and_query():
     payload = query_response.json()
     assert "answer" in payload
     assert len(payload["context"]) >= 1
+    assert "vector" in payload["context"][0]["metadata"]["retrieval_sources"]
 
     detail = client.get(f"/documents/{doc_id}")
     assert detail.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"query": "test", "retrieval_mode": "unknown"},
+        {"query": "test", "graph_max_hops": 0},
+        {"query": "test", "graph_max_hops": 4},
+        {"query": "test", "top_k": 0},
+        {"query": ""},
+    ],
+)
+def test_query_rejects_invalid_retrieval_controls(payload):
+    response = client.post("/query", json=payload)
+    assert response.status_code == 422
+
+
+def test_graph_extraction_provider_failure_returns_502_and_rolls_back_document():
+    class FailingExtractor:
+        async def extract(self, text):
+            raise GraphExtractionError("unavailable")
+
+    app.dependency_overrides[get_graph_extractor] = lambda: FailingExtractor()
+    try:
+        response = client.post(
+            "/documents",
+            data={"title": "Must Roll Back", "text": "Alice works at Acme."},
+        )
+    finally:
+        app.dependency_overrides[get_graph_extractor] = lambda: DisabledGraphExtractor()
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Graph extraction provider failed"
+    session = TestSessionLocal()
+    try:
+        assert session.query(models.Document).filter_by(title="Must Roll Back").count() == 0
+    finally:
+        session.close()
+
+
+def test_graph_provider_unavailable_returns_503_and_writes_nothing():
+    class UnavailableExtractor:
+        async def extract(self, text):
+            raise GraphProviderUnavailable("offline")
+
+    app.dependency_overrides[get_graph_extractor] = lambda: UnavailableExtractor()
+    try:
+        response = client.post(
+            "/documents",
+            data={"title": "Unavailable Graph", "text": "Alice works at Acme."},
+        )
+    finally:
+        app.dependency_overrides[get_graph_extractor] = lambda: DisabledGraphExtractor()
+
+    assert response.status_code == 503
+    session = TestSessionLocal()
+    try:
+        assert session.query(models.Document).filter_by(title="Unavailable Graph").count() == 0
+    finally:
+        session.close()
 
 
 # ── Markdown ingestion tests (F3) ───────────────────────────────────

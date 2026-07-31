@@ -24,6 +24,21 @@ class VectorStore(Protocol):
     async def query(self, embedding: List[float], top_k: int, filters: dict | None = None) -> List[RetrievedChunk]:
         ...
 
+    async def upsert_embeddings(
+        self,
+        embeddings: List[List[float]],
+        metadatas: List[dict],
+        ids: List[str],
+        documents: List[str] | None = None,
+    ) -> None:
+        ...
+
+    async def delete(self, ids: List[str]) -> None:
+        ...
+
+    async def list_ids(self) -> List[str]:
+        ...
+
 
 def _create_client() -> chromadb.api.ClientAPI:
     """Create the correct Chroma client based on configuration.
@@ -66,6 +81,27 @@ class ChromaVectorStore:
             kwargs["documents"] = documents
         await run_in_threadpool(self.collection.add, **kwargs)
 
+    async def upsert_embeddings(
+        self,
+        embeddings: List[List[float]],
+        metadatas: List[dict],
+        ids: List[str],
+        documents: List[str] | None = None,
+    ) -> None:
+        logger.info("Upserting %s embeddings", len(embeddings))
+        kwargs = {"embeddings": embeddings, "metadatas": metadatas, "ids": ids}
+        if documents is not None:
+            kwargs["documents"] = documents
+        await run_in_threadpool(self.collection.upsert, **kwargs)
+
+    async def delete(self, ids: List[str]) -> None:
+        if ids:
+            await run_in_threadpool(self.collection.delete, ids=ids)
+
+    async def list_ids(self) -> List[str]:
+        result = await run_in_threadpool(self.collection.get, include=[])
+        return list(result.get("ids", []))
+
     async def query(self, embedding: List[float], top_k: int, filters: dict | None = None) -> List[RetrievedChunk]:
         logger.info("Querying vector store with top_k=%s", top_k)
         where_clause = filters if filters else None
@@ -73,10 +109,20 @@ class ChromaVectorStore:
             self.collection.query, query_embeddings=[embedding], n_results=top_k, where=where_clause
         )
         contexts = []
-        for text, score, metadata in zip(
-            result.get("documents", [[]])[0], result.get("distances", [[]])[0], result.get("metadatas", [[]])[0]
+        for vector_id, text, score, metadata in zip(
+            result.get("ids", [[]])[0],
+            result.get("documents", [[]])[0],
+            result.get("distances", [[]])[0],
+            result.get("metadatas", [[]])[0],
         ):
-            contexts.append(RetrievedChunk(text=text, score=float(score), metadata=metadata))
+            contexts.append(
+                RetrievedChunk(
+                    text=text,
+                    score=float(score),
+                    metadata=metadata,
+                    vector_id=vector_id,
+                )
+            )
         return contexts
 
 

@@ -81,6 +81,7 @@ async def test_index_and_query_roundtrip(store):
     assert len(results) == 1
     assert results[0].text == "hello world"
     assert results[0].score == 0.0
+    assert results[0].vector_id == "rt-1"
 
 
 @pytest.mark.asyncio
@@ -89,6 +90,26 @@ async def test_query_empty_collection_returns_empty(store):
     embedding = [0.0] * 8
     results = await store.query(embedding, top_k=5)
     assert len(results) == 0
+
+
+@pytest.mark.asyncio
+async def test_upsert_is_idempotent_for_deterministic_chunk_id(store):
+    await store.upsert_embeddings(
+        embeddings=[[0.1] * 8],
+        metadatas=[{"chunk_id": 7}],
+        ids=["chunk:7"],
+        documents=["first"],
+    )
+    await store.upsert_embeddings(
+        embeddings=[[0.2] * 8],
+        metadatas=[{"chunk_id": 7}],
+        ids=["chunk:7"],
+        documents=["updated"],
+    )
+
+    assert store.collection.count() == 1
+    result = await store.query([0.2] * 8, top_k=1)
+    assert result[0].text == "updated"
 
 
 @pytest.mark.asyncio

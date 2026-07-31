@@ -16,8 +16,16 @@ from app.core.models import DocumentDetail, DocumentSummary
 from app.persistence import models, repositories
 from app.services.embeddings import get_embedding_provider
 from app.services.ingestion import chunks_for_document, ingest_text, ingest_image
+from app.services.graph_extraction import (
+    DisabledGraphExtractor,
+    GraphExtractionError,
+    GraphExtractor,
+    GraphProviderUnavailable,
+    get_graph_extractor,
+)
 from app.services.vector_store import get_vector_store
 from app.services.embeddings import get_image_embedding_provider 
+from app.config import get_settings
 
 try:
     from pypdf import PdfReader
@@ -30,6 +38,7 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 class DocumentCreateResponse(BaseModel):
     document_id: int
     chunks: int
+    relations: int = 0
 
 
 @router.post("", response_model=DocumentCreateResponse, status_code=status.HTTP_201_CREATED)
@@ -40,6 +49,7 @@ async def create_document(
     text: str | None = Form(default=None),
     file: UploadFile | None = File(default=None),
     session: Session = Depends(get_db),
+    graph_extractor: GraphExtractor = Depends(get_graph_extractor),
 ):
     embedding_provider = get_embedding_provider()
     vector_store = get_vector_store()
@@ -57,16 +67,19 @@ async def create_document(
                 tmp_path= tmp.name
             image_provider = get_image_embedding_provider()
 
-            result = await ingest_image(
-                    title = title,
-                    source = source,
-                    tags = parsed_tags,
-                    image_path = tmp_path,
-                    media_type = file.content_type,
-                    embedding_provider = image_provider,
-                    vector_store = vector_store,
-                    session = session
-            )
+            try:
+                result = await ingest_image(
+                        title = title,
+                        source = source,
+                        tags = parsed_tags,
+                        image_path = tmp_path,
+                        media_type = file.content_type,
+                        embedding_provider = image_provider,
+                        vector_store = vector_store,
+                        session = session
+                )
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
             return DocumentCreateResponse(**result)
         
         elif file.content_type == "application/pdf":
@@ -96,15 +109,31 @@ async def create_document(
 
 
 
-    result = await ingest_text(
-        title=title,
-        source=source,
-        tags=parsed_tags,
-        text=text_content,
-        embedding_provider=embedding_provider,
-        vector_store=vector_store,
-        session=session,
-    )
+    settings = get_settings()
+    try:
+        result = await ingest_text(
+            title=title,
+            source=source,
+            tags=parsed_tags,
+            text=text_content,
+            embedding_provider=embedding_provider,
+            vector_store=vector_store,
+            graph_extractor=(
+                None if isinstance(graph_extractor, DisabledGraphExtractor) else graph_extractor
+            ),
+            graph_extraction_model=(
+                settings.graph_extraction_model or settings.llm_model
+            ),
+            session=session,
+        )
+    except GraphProviderUnavailable as exc:
+        raise HTTPException(
+            status_code=503, detail="Graph extraction provider unavailable"
+        ) from exc
+    except GraphExtractionError as exc:
+        raise HTTPException(
+            status_code=502, detail="Graph extraction provider failed"
+        ) from exc
     return DocumentCreateResponse(**result)
 
 
