@@ -20,7 +20,13 @@ async def query(payload: QueryRequest, session: Session = Depends(get_db)):
     settings = get_settings()
     embedding_provider = get_embedding_provider()
     vector_store = get_vector_store()
-    llm_client = get_llm_client(api_key=settings.openai_api_key, provider="dummy")
+    # llm_client = get_llm_client(api_key=settings.openai_api_key, provider="dummy")
+    llm_client = get_llm_client(
+            provider = settings.llm_provider,
+            base_url = settings.llm_base_url,
+            model = settings.llm_model,
+            api_key = settings.openai_api_key,
+    )
     result = await answer_query(
         query=payload.query,
         embedding_provider=embedding_provider,

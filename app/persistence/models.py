@@ -30,11 +30,16 @@ class Chunk(Base):
 
     document = relationship("Document", back_populates="chunks")
 
-    def metadata(self) -> dict:
-        return {
+    def get_chunk_metadata(self) -> dict:
+        meta = {
             "document_id": self.document_id,
             "chunk_id": self.id,
             "index": self.index,
-            "title": self.document.title if self.document else None,
-            "tags": self.document.tags.split(",") if self.document and self.document.tags else [],
         }
+        if self.document and self.document.title:
+            meta["title"] = self.document.title
+        if self.document and self.document.tags:
+            tags = [t.strip() for t in self.document.tags.split(",") if t.strip()]
+            if tags:
+                meta["tags"] = tags
+        return meta

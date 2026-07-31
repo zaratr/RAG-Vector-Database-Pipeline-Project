@@ -29,8 +29,39 @@ class OpenAILLMClient:
         context_preview = " ".join(context)[:2000]
         return f"[OpenAI simulated] {query} | context: {context_preview}"
 
+class OllamaLLMClient:
+    """LLM client using Ollama's OpenAI-compatible API."""
+    
+    def __init__(self, base_url: str, model: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
 
-def get_llm_client(api_key: str | None = None, provider: str = "dummy") -> LLMClient:
+    async def generate_answer(self, query: str, context: List[str]) -> str:
+        import httpx
+        context_text = "\n\n".join(context)
+        payload = {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system", "content": "Answer the question based on the provided context. If the context doesn't contain relevant information, say so."
+                     },
+                    {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {query}"
+                     },
+                ],
+        }
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(f"{self.base_url}/chat/completions", json=payload)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+
+def get_llm_client(api_key: str | None = None, provider: str = "dummy",
+                   base_url: str | None = None, model: str | None = None) -> LLMClient:
+    if provider == "ollama":
+        return OllamaLLMClient(
+            base_url=base_url or "http://localhost:11434/v1",
+            model=model or "gemma4:latest",
+        )
+            
     if provider == "openai":
         return OpenAILLMClient(api_key)
     return DummyLLMClient()

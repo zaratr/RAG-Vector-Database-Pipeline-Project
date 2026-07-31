@@ -4,15 +4,11 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.core.db import Base, engine
 from app.api import routes_documents, routes_query
 from app.config import get_settings
 from app.core.logging import logger
 
 settings = get_settings()
-
-# Ensure tables exist
-Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title=settings.app_name, debug=settings.debug)
 

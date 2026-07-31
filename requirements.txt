@@ -1,8 +1,39 @@
-fastapi
-uvicorn[standard]
-sqlalchemy
-pydantic
-chromadb
-pypdf
-python-multipart
-pytest
+# RAG Vector Database Pipeline — locked dependencies
+# Pinned to exact versions verified working in the Docker container.
+# Regenerate with: docker compose exec api pip freeze
+
+# --- Core API framework ---
+fastapi==0.141.1
+uvicorn[standard]==0.52.0
+starlette==1.3.1
+python-multipart==0.0.32
+
+# --- Data validation ---
+pydantic==2.13.4
+pydantic-settings==2.14.2
+
+# --- Database ---
+SQLAlchemy==2.0.51
+alembic==1.18.5
+
+# --- Vector store ---
+chromadb==1.5.9
+
+# --- Embeddings (local ONNX inference) ---
+fastembed==0.8.0
+onnxruntime==1.28.0
+numpy==2.4.6
+pillow==12.3.0
+
+# --- HTTP client (Ollama API calls) ---
+httpx==0.28.1
+
+# --- Graph (knowledge graph layer) ---
+networkx==3.6.1
+
+# --- Document parsing ---
+pypdf==6.14.2
+
+# --- Testing ---
+pytest==9.1.1
+pytest-asyncio==1.4.0

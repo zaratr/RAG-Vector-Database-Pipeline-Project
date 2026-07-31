@@ -14,3 +14,13 @@ venv/
 *.lance
 chroma_db/
 data/processed/
+*.db
+
+.env
+
+# Validation artifacts
+query*.json
+
+# Editor junk
+*~
+*.un~

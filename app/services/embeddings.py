@@ -2,41 +2,139 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+from pathlib import Path
 from typing import List, Protocol
-
-try:
-    from sentence_transformers import SentenceTransformer  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    SentenceTransformer = None
 
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# Default dimension for jina-clip-v1 (shared text + image space)
+CLIP_DIMENSION = 768
 
 
 class EmbeddingProvider(Protocol):
+    """Interface for text embedding providers."""
+
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
         ...
 
+    @property
+    def dimension(self) -> int:
+        """Return the embedding vector dimension."""
+        ...
 
-class LocalEmbeddingProvider:
-    """Deterministic embedding using sentence-transformers if available, otherwise hashing."""
 
-    def __init__(self) -> None:
-        if SentenceTransformer:
-            self.model = SentenceTransformer("all-MiniLM-L6-v2")
-        else:
-            self.model = None
+class ImageEmbeddingProvider(Protocol):
+    """Interface for image embedding providers."""
+
+    async def embed_images(self, image_paths: List[str | Path]) -> List[List[float]]:
+        ...
+
+    @property
+    def dimension(self) -> int:
+        """Return the embedding vector dimension."""
+        ...
+
+
+class HashEmbeddingProvider:
+    """Deterministic fallback embedding using SHA-256 hashes.
+
+    Produces CLIP_DIMENSION vectors so that ChromaDB collection dimension
+    stays consistent even in test mode.
+    Used when RAG_EMBEDDING_PROVIDER=local.
+    """
+
+    dimension = CLIP_DIMENSION
 
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        if self.model:
-            return self.model.encode(texts, convert_to_numpy=True).tolist()
         embeddings: List[List[float]] = []
         for text in texts:
             digest = hashlib.sha256(text.encode("utf-8")).digest()
-            vector = [float(int.from_bytes(digest[i : i + 4], "big") % 1000) for i in range(0, 32, 4)]
-            embeddings.append(vector)
+            vec = []
+            for i in range(self.dimension):
+                byte_idx = i % 32
+                vec.append(float(digest[byte_idx]) / 255.0)
+            embeddings.append(vec)
         return embeddings
+
+
+class FastEmbedTextProvider:
+    """Local text embedding using FastEmbed TextEmbedding.
+
+    Supports CLIP models (e.g. jina-clip-v1) that share a vector space
+    with image embeddings.
+    """
+
+    _model = None
+    _dim: int | None = None
+
+    def __init__(self, model_name: str | None = None) -> None:
+        self._model_name = model_name or settings.embedding_model
+
+    def _init_model(self) -> None:
+        """Lazy-load the model on first use."""
+        if self._model is not None:
+            return
+        from fastembed import TextEmbedding
+
+        logger.info("Loading FastEmbed text model: %s", self._model_name)
+        self._model = TextEmbedding(model_name=self._model_name)
+        sample = list(self._model.embed(["dimension probe"]))
+        self._dim = len(sample[0])
+        logger.info("FastEmbed text model loaded, dimension=%d", self._dim)
+
+    @property
+    def dimension(self) -> int:
+        if self._dim is None:
+            self._init_model()
+        return self._dim  # type: ignore
+
+    async def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        self._init_model()
+        results = list(self._model.embed(texts))
+        return [[float(v) for v in r] for r in results]
+
+
+class FastEmbedImageProvider:
+    """Local image embedding using FastEmbed ImageEmbedding.
+
+    Must use a CLIP model (e.g. jina-clip-v1) that produces vectors
+    in the same space as the text embedder.
+    """
+
+    _model = None
+    _dim: int | None = None
+
+    def __init__(self, model_name: str | None = None) -> None:
+        self._model_name = model_name or settings.embedding_model
+
+    def _init_model(self) -> None:
+        """Lazy-load the model on first use."""
+        if self._model is not None:
+            return
+        from fastembed import ImageEmbedding
+
+        logger.info("Loading FastEmbed image model: %s", self._model_name)
+        self._model = ImageEmbedding(model_name=self._model_name)
+        # ImageEmbedding.embed() requires actual file paths, so we can't
+        # probe with a dummy string like we do for text. Use the known
+        # CLIP dimension (768 for jina-clip-v1).
+        self._dim = CLIP_DIMENSION
+        logger.info("FastEmbed image model loaded, dimension=%d", self._dim)
+
+    @property
+    def dimension(self) -> int:
+        if self._dim is None:
+            self._init_model()
+        return self._dim  # type: ignore
+
+    async def embed_images(self, image_paths: List[str | Path]) -> List[List[float]]:
+        self._init_model()
+        results = list(self._model.embed(image_paths))
+        return [[float(v) for v in r ] for r in results]
 
 
 class OpenAIEmbeddingProvider:
@@ -45,14 +143,27 @@ class OpenAIEmbeddingProvider:
     def __init__(self, api_key: str | None) -> None:
         self.api_key = api_key
 
+    @property
+    def dimension(self) -> int:
+        return CLIP_DIMENSION
+
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required for OpenAIEmbeddingProvider")
-        # Stub implementation to avoid external calls during tests.
-        return [[float(len(text)) for _ in range(8)] for text in texts]
+        return [[float(len(text)) for _ in range(self.dimension)] for text in texts]
 
 
 def get_embedding_provider() -> EmbeddingProvider:
+    """Factory: returns the text embedding provider configured via RAG_EMBEDDING_PROVIDER."""
+    if settings.embedding_provider == "fastembed":
+        return FastEmbedTextProvider()
     if settings.embedding_provider == "openai":
         return OpenAIEmbeddingProvider(settings.openai_api_key)
-    return LocalEmbeddingProvider()
+    return HashEmbeddingProvider()
+
+
+def get_image_embedding_provider() -> ImageEmbeddingProvider:
+    """Factory: returns the image embedding provider."""
+    if settings.embedding_provider == "fastembed":
+        return FastEmbedImageProvider()
+    raise RuntimeError("Image embedding requires RAG_EMBEDDING_PROVIDER=fastembed")

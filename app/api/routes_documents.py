@@ -3,18 +3,21 @@ from __future__ import annotations
 
 import io
 from typing import List
+import tempfile
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi import status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
-from app.core.models import DocumentCreate, DocumentDetail, DocumentSummary
+from app.core.models import DocumentDetail, DocumentSummary
 from app.persistence import models, repositories
 from app.services.embeddings import get_embedding_provider
-from app.services.ingestion import chunks_for_document, ingest_text
+from app.services.ingestion import chunks_for_document, ingest_text, ingest_image
 from app.services.vector_store import get_vector_store
+from app.services.embeddings import get_image_embedding_provider 
 
 try:
     from pypdf import PdfReader
@@ -31,33 +34,72 @@ class DocumentCreateResponse(BaseModel):
 
 @router.post("", response_model=DocumentCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_document(
-    payload: DocumentCreate = Depends(),
+    title: str = Form(...),
+    source: str | None = Form(default=None),
+    tags: str | None = Form(default=None),
+    text: str | None = Form(default=None),
     file: UploadFile | None = File(default=None),
     session: Session = Depends(get_db),
 ):
     embedding_provider = get_embedding_provider()
     vector_store = get_vector_store()
-    text_content = payload.text
+    text_content = text
+
+    parsed_tags = [t.strip() for t in tags.split(",")] if tags else None
 
     if file:
-        if file.content_type not in {"application/pdf", "text/plain"}:
-            raise HTTPException(status_code=400, detail="Unsupported file type")
         content = await file.read()
-        if file.content_type == "application/pdf":
+
+        if file.content_type  in {"image/png", "image/jpeg", "image/gif", "image/webp" }:
+            suffix = Path(file.filename).suffix or ".png"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(content)
+                tmp_path= tmp.name
+            image_provider = get_image_embedding_provider()
+
+            result = await ingest_image(
+                    title = title,
+                    source = source,
+                    tags = parsed_tags,
+                    image_path = tmp_path,
+                    media_type = file.content_type,
+                    embedding_provider = image_provider,
+                    vector_store = vector_store,
+                    session = session
+            )
+            return DocumentCreateResponse(**result)
+        
+        elif file.content_type == "application/pdf":
             if not PdfReader:
                 raise HTTPException(status_code=500, detail="PDF support not available")
-            reader = PdfReader(io.BytesIO(content))
-            text_content = "\n".join(page.extract_text() or "" for page in reader.pages)
+            try:
+                reader = PdfReader(io.BytesIO(content))
+                text_content = "\n".join(page.extract_text() or "" for page in reader.pages)
+            except Exception:
+                raise HTTPException(status_code=400, detail="Could not parse PDF file")
+        elif file.content_type in {"text/plain", "text/markdown"}:
+            try:
+                text_content = content.decode("utf-8")
+            except UnicodeDecodeError:
+                raise HTTPException(status_code=400, detail="File is not valid UTF-8 text")
+        elif file.filename and Path(file.filename).suffix.lower() in {".md", ".markdown", ".txt"}:
+            try:
+                text_content = content.decode("utf-8")
+            except UnicodeDecodeError:
+                raise HTTPException(status_code=400, detail="File is not valid UTF-8 text")
         else:
-            text_content = content.decode("utf-8")
+            raise HTTPException(status_code=400, detail="Unsupported file type")
 
-    if not text_content:
-        raise HTTPException(status_code=400, detail="No text provided")
+    if not text_content or not text_content.strip():
+        raise HTTPException(status_code=400, detail="No text content provided")
+
+
+
 
     result = await ingest_text(
-        title=payload.title,
-        source=payload.source,
-        tags=payload.tags,
+        title=title,
+        source=source,
+        tags=parsed_tags,
         text=text_content,
         embedding_provider=embedding_provider,
         vector_store=vector_store,
