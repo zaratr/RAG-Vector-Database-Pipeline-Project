@@ -1,76 +1,218 @@
-# Local RAG Pipeline with Gemma Generation
+# RAG Vector Database Pipeline
 
-A standard retrieve-augmented generation pipeline running entirely against
-local models: FastEmbed dense embeddings persisted in ChromaDB, with a
-pluggable LLM client (Ollama / Gemma by default) for the generation step.
-Ingest markdown/text/documents → chunk → embed → store → retrieve top-k →
-generate.
-
-A separate NetworkX script (`src/graph_rag.py`) is included as a **research
-spike** that sketches how a graph layer would look; see the _Graph layer
-spike_ section below for its (intentionally limited) scope.
-
-## What is actually implemented
-
-| component | status | location |
-|---|---|---|
-| Document ingestion + persistence | implemented | `app/services/ingestion.py`, `app/persistence/` |
-| Text chunking | implemented | `app/services/chunking.py` |
-| FastEmbed embedding provider | implemented | `app/services/embeddings.py` |
-| ChromaDB vector store | implemented | `app/services/vector_store.py` |
-| Top-k retrieval | implemented | `app/services/retrieval.py` |
-| RAG orchestration (retrieve → generate) | implemented | `app/services/rag.py` |
-| Pluggable LLM client (Ollama/Gemma) | scaffolded (thin) | `app/services/llm.py` |
-| FastAPI surface (documents + query) | implemented | `app/api/routes_documents.py`, `app/api/routes_query.py`, `app/main.py` |
-| Tests (ingestion, retrieval, RAG API) | implemented | `app/tests/` |
-
-### Pipeline shape
+A multimodal retrieval-augmented generation pipeline with text and image support,
+running entirely on local models. Documents are chunked, embedded into a shared
+text+image vector space via Jina CLIP v1 (FastEmbed/ONNX), stored in ChromaDB, and
+queried through a FastAPI surface with Gemma4 generation via Ollama.
 
 ```
-document → chunking → FastEmbed embed → ChromaDB upsert
-                                                ↓
-query    → FastEmbed embed → top-k retrieve → Gemma generate → answer
+document ─→ chunk ─→ jina-clip-v1 embed ─→ ChromaDB store
+(text/PDF/image)                              │
+                                               ↓
+query ──→ jina-clip-v1 embed ─→ top-k retrieve ─→ Gemma4 generate ─→ answer
 ```
 
-## Graph layer spike (NOT wired into the pipeline)
+## Quick Start (Docker)
 
-An earlier headline framed this repository as **GraphRAG** with multi-hop
-knowledge-graph reasoning over extracted (Entity, Relationship, Entity)
-triplets. The code does not deliver that end-to-end. What exists is
-`src/graph_rag.py`: a 30-line **isolated spike** that:
+### Prerequisites
 
-- imports `networkx` and constructs an in-memory `DiGraph`,
-- **returns hardcoded mock triplets** from `extract_entities_with_gemma`
-  (the Ollama call is stubbed in a comment), and
-- is **not imported by anything under `app/`** — it does not participate
-  in ingestion or query.
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+- [Ollama](https://ollama.com/) running somewhere reachable, with `gemma4:latest` pulled
 
-So the live pipeline is **standard vector RAG**, not GraphRAG. Multi-hop
-reasoning, entity extraction at ingest time, and graph-augmented retrieval
-are **not implemented**. The spike is kept as a starting point for future
-work, not as a claim of capability.
+### 1. Configure environment
 
-## What is NOT implemented (explicitly)
+```bash
+cp .env.example .env
+```
 
-- **No multi-hop reasoning.** Retrieval is single-shot top-k vector search.
-- **No live entity extraction.** `src/graph_rag.py` returns canned triplets;
-  no document is parsed into a graph at ingest time.
-- **No graph-augmented retrieval.** The ChromaDB path and the NetworkX spike
-  do not share an index.
+Edit `.env` to point at your Ollama instance:
 
-## Roadmap
+```env
+RAG_LLM_PROVIDER=ollama
+RAG_LLM_BASE_URL=<ollama server>:11434/v1
+RAG_LLM_MODEL=gemma4:latest
+RAG_EMBEDDING_PROVIDER=fastembed
+RAG_EMBEDDING_MODEL=jinaai/jina-clip-v1
+```
 
-1. Wire `extract_entities_with_gemma` in `src/graph_rag.py` to a real
-   Ollama/Gemma call producing triplets from chunk text.
-2. Persist triplets alongside chunks at ingest time and expose a graph
-   index that the retriever can consult.
-3. Add a hybrid retriever that expands seed entities via graph neighbours
-   before falling back to dense top-k.
+### 2. Build and start
 
-## Tech stack
+```bash
+docker compose up --build -d
+```
 
-- **Backend:** FastAPI, Python
-- **Embeddings:** FastEmbed
-- **Vector store:** ChromaDB
-- **Generation:** Ollama (Gemma)
-- **Graph spike (unwired):** NetworkX
+The API will be available at `http://localhost:8000`.
+Swagger UI at `http://localhost:8000/docs`.
+
+First request will be slow — FastEmbed downloads the ONNX model (~900MB for
+text + vision) on first embed call, then caches it in the Docker volume.
+
+### 3. Ingest documents
+
+**Text / Markdown:**
+
+```bash
+# Inline text
+curl -X POST http://localhost:8000/documents \
+  -F "title=My Document" \
+  -F "text=Some content to ingest" \
+  -F "source=manual"
+
+# File upload (.txt, .md)
+curl -X POST http://localhost:8000/documents \
+  -F "title=RAG Article" \
+  -F "file=@article.txt" \
+  -F "source=wikipedia"
+
+# PDF
+curl -X POST http://localhost:8000/documents \
+  -F "title=Research Paper" \
+  -F "file=@paper.pdf"
+```
+
+**Images (PNG, JPEG, GIF, WebP):**
+
+```bash
+curl -X POST http://localhost:8000/documents \
+  -F "title=Diagram" \
+  -F "file=@diagram.png"
+```
+
+Images are embedded into the **same 768-dim vector space** as text via Jina CLIP,
+so text queries can find relevant images and vice versa.
+
+### 4. Query
+
+```bash
+# Write JSON body to file (avoids PowerShell quoting issues)
+echo '{"query":"What is retrieval augmented generation?","top_k":3}' > query.json
+
+curl -X POST http://localhost:8000/query \
+  -H "Content-Type: application/json" \
+  -d "@query.json"
+```
+
+Response includes the Gemma-generated answer plus the retrieved context chunks
+with similarity scores.
+
+### 5. List / inspect documents
+
+```bash
+# List all documents
+curl http://localhost:8000/documents
+
+# Get a specific document with its chunks
+curl http://localhost:8000/documents/1
+```
+
+### 6. Run tests
+
+```bash
+docker compose exec api python -m pytest -q
+```
+
+### 7. Stop / clean up
+
+```bash
+# Stop containers (data persists in volumes)
+docker compose down
+
+# Stop and wipe all data (Chroma vectors + SQLite DB)
+docker compose down -v
+```
+
+> **Note:** `docker compose down -v` deletes the ChromaDB volume. After wiping,
+> you must re-ingest all documents before queries will return results.
+
+## API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Health check |
+| `POST` | `/documents` | Ingest text, file (.txt/.pdf), or image (png/jpg/gif/webp) |
+| `GET` | `/documents` | List all documents |
+| `GET` | `/documents/{id}` | Get document detail with chunks |
+| `POST` | `/query` | RAG query — retrieve top-k chunks + generate answer |
+
+## Architecture
+
+| Component | Technology | Details |
+|-----------|-----------|---------|
+| **API** | FastAPI 0.141 | Async, auto-docs at `/docs` |
+| **Embeddings** | FastEmbed + jina-clip-v1 | 768-dim shared text+image space, ONNX CPU inference |
+| **Vector Store** | ChromaDB 1.5.9 | Persistent HTTP server mode (Docker), L2 distance |
+| **Generation** | Ollama (Gemma4) | OpenAI-compatible `/v1/chat/completions` endpoint |
+| **Database** | SQLite + SQLAlchemy | Document/chunk metadata tracking |
+| **Container** | Docker Compose | `api` + `vectordb` services |
+
+### Configuration
+
+All settings are loaded from `.env` (see `.env.example`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RAG_LLM_PROVIDER` | `ollama` | `dummy`, `ollama`, or `openai` |
+| `RAG_LLM_BASE_URL` | `http://localhost:11434/v1` | Ollama API endpoint |
+| `RAG_LLM_MODEL` | `gemma4:latest` | Model name in Ollama |
+| `RAG_EMBEDDING_PROVIDER` | `fastembed` | `local` (hash fallback), `fastembed`, or `openai` |
+| `RAG_EMBEDDING_MODEL` | `jinaai/jina-clip-v1` | FastEmbed model name |
+| `RAG_DATABASE_URL` | `sqlite:///./rag.db` | SQLAlchemy connection string |
+| `RAG_CHROMA_HOST` | `vectordb` | ChromaDB server hostname (Docker service name). Leave empty for standalone. |
+| `RAG_CHROMA_PORT` | `8000` | ChromaDB server port |
+| `RAG_CHROMA_PERSIST_DIRECTORY` | *(empty)* | Local persistence path for standalone mode (when `RAG_CHROMA_HOST` is empty) |
+
+## Project Structure  
+
+```
+.
+├── app/
+│   ├── api/
+│   │   ├── routes_documents.py   # POST/GET /documents
+│   │   └── routes_query.py       # POST /query
+│   ├── services/
+│   │   ├── embeddings.py         # FastEmbed text + image providers
+│   │   ├── ingestion.py          # Chunking + embedding pipeline
+│   │   ├── vector_store.py       # ChromaDB wrapper
+│   │   ├── retrieval.py          # Top-k vector search
+│   │   ├── llm.py                # Ollama / Dummy / OpenAI clients
+│   │   ├── rag.py                # Retrieve → generate orchestration
+│   │   └── chunking.py           # Text splitter
+│   ├── persistence/
+│   │   ├── models.py             # SQLAlchemy Document + Chunk
+│   │   └── repositories.py       # DB CRUD
+│   ├── core/
+│   │   ├── db.py                 # Engine + session factory
+│   │   ├── models.py             # Pydantic schemas
+│   │   └── logging.py            # Logger setup
+│   ├── tests/                    # pytest (ingestion, retrieval, API)
+│   ├── config.py                 # Pydantic Settings (.env loading)
+│   └── main.py                   # FastAPI app factory
+├── src/
+│   └── graph_rag.py              # GraphRAG spike (not integrated — see below)
+├── .env.example                  # Environment template
+├── docker-compose.yml            # Compose config
+├── Dockerfile                    # python:3.11-slim + vim
+├── requirements.txt              # Pinned dependencies
+└── README.md
+```
+
+## GraphRAG (Roadmap)
+
+`src/graph_rag.py` is an isolated research spike using NetworkX. It is **not**
+wired into the live pipeline — no entity extraction runs at ingest time, and
+no graph traversal participates in retrieval.
+
+**Planned integration:**
+
+1. Entity extraction on ingested chunks via LLM (extract Entity-Relationship-Entity triplets)
+2. Persist triplets in a graph store alongside the vector index
+3. Hybrid retrieval: expand seed entities via graph neighbors before dense top-k fallback
+
+## Tech Stack
+
+- **Backend:** FastAPI, Python 3.11
+- **Embeddings:** FastEmbed (ONNX) with jina-clip-v1
+- **Vector Store:** ChromaDB
+- **Generation:** Ollama (Gemma4)
+- **Graph (planned):** NetworkX
+- **Container:** Docker Compose

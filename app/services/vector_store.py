@@ -3,15 +3,12 @@ from __future__ import annotations
 
 from typing import List, Protocol
 
-from chromadb import Client
-from chromadb.config import Settings as ChromaSettings
+import chromadb
 from starlette.concurrency import run_in_threadpool
 
 from app.config import get_settings
 from app.core.logging import logger
 from app.core.models import RetrievedChunk
-
-settings = get_settings()
 
 
 class VectorStore(Protocol):
@@ -28,16 +25,33 @@ class VectorStore(Protocol):
         ...
 
 
-class ChromaVectorStore:
-    """Wrapper around Chroma DB."""
+def _create_client() -> chromadb.api.ClientAPI:
+    """Create the correct Chroma client based on configuration.
 
-    def __init__(self, collection_name: str = "rag-collection") -> None:
-        kwargs = {}
-        if settings.chroma_persist_directory:
-            kwargs["persist_directory"] = settings.chroma_persist_directory
-        client_settings = ChromaSettings(**kwargs)
-        self.client = Client(settings=client_settings)
-        self.collection = self.client.get_or_create_collection(name=collection_name, embedding_function=None)
+    Precedence:
+      1. chroma_host set       → HttpClient (Docker/production)
+      2. persist_directory set → PersistentClient (standalone)
+      3. otherwise             → EphemeralClient (tests/dev)
+    """
+    settings = get_settings()
+    if settings.chroma_host:
+        logger.info("Creating Chroma HttpClient(host=%s, port=%s)", settings.chroma_host, settings.chroma_port)
+        return chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
+    if settings.chroma_persist_directory:
+        logger.info("Creating Chroma PersistentClient(path=%s)", settings.chroma_persist_directory)
+        return chromadb.PersistentClient(path=settings.chroma_persist_directory)
+    logger.info("Creating Chroma EphemeralClient")
+    return chromadb.EphemeralClient()
+
+
+class ChromaVectorStore:
+    """Wrapper around Chroma DB with configurable client mode."""
+
+    def __init__(self, collection_name: str = "rag-collection", client=None) -> None:
+        self.client = client or _create_client()
+        self.collection = self.client.get_or_create_collection(
+            name=collection_name, embedding_function=None
+        )
 
     async def index_embeddings(
         self,

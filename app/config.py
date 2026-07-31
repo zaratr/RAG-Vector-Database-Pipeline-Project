@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     llm_model: str = Field(default="gemma4:latest")
 
     openai_api_key: Optional[str] = Field(default=None)
+    chroma_host: Optional[str] = Field(default=None)
+    chroma_port: int = Field(default=8000)
     chroma_persist_directory: Optional[str] = Field(default=None)
 
     model_config = SettingsConfigDict(env_prefix="RAG_", env_file=".env", extra="ignore")

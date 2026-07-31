@@ -72,12 +72,26 @@ async def create_document(
         elif file.content_type == "application/pdf":
             if not PdfReader:
                 raise HTTPException(status_code=500, detail="PDF support not available")
-            reader = PdfReader(io.BytesIO(content))
-            text_content = "\n".join(page.extract_text() or "" for page in reader.pages)
-        elif file.content_type == "text/plain":
-            text_content = content.decode("utf-8")
+            try:
+                reader = PdfReader(io.BytesIO(content))
+                text_content = "\n".join(page.extract_text() or "" for page in reader.pages)
+            except Exception:
+                raise HTTPException(status_code=400, detail="Could not parse PDF file")
+        elif file.content_type in {"text/plain", "text/markdown"}:
+            try:
+                text_content = content.decode("utf-8")
+            except UnicodeDecodeError:
+                raise HTTPException(status_code=400, detail="File is not valid UTF-8 text")
+        elif file.filename and Path(file.filename).suffix.lower() in {".md", ".markdown", ".txt"}:
+            try:
+                text_content = content.decode("utf-8")
+            except UnicodeDecodeError:
+                raise HTTPException(status_code=400, detail="File is not valid UTF-8 text")
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type")
+
+    if not text_content or not text_content.strip():
+        raise HTTPException(status_code=400, detail="No text content provided")
 
 
 

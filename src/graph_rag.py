@@ -1,5 +1,4 @@
 import networkx as nx
-import json
 
 class GraphRAGPipeline:
     def __init__(self):

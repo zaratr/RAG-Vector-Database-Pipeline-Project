@@ -1,0 +1,40 @@
+# Version-control and local agent metadata
+.git
+.git/**
+.hermes
+.hermes/**
+
+# Secrets and local configuration
+.env
+.env.*
+
+# Python build/runtime caches
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+**/.pytest_cache
+.venv
+venv
+*.egg-info
+
+# Local databases and vector/runtime data
+*.db
+**/*.db
+chroma_db
+chroma_db/**
+data/processed
+data/processed/**
+
+# Validation payloads and local artifacts
+query*.json
+**/query*.json
+
+# Editor and OS artifacts
+*~
+**/*~
+*.un~
+**/*.un~
+.idea
+.vscode
+.DS_Store
+Thumbs.db

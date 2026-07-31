@@ -1,19 +1,43 @@
 services:
+  migrate:
+    build: .
+    env_file:
+      - .env
+    environment:
+      RAG_DATABASE_URL: ${RAG_DATABASE_URL:-sqlite:////data/rag.db}
+    volumes:
+      - relational_data:/data
+    command: ["python", "-m", "app.core.migrations"]
+    restart: "no"
   api:
     build: .
     ports:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      RAG_DATABASE_URL: ${RAG_DATABASE_URL:-sqlite:////data/rag.db}
     volumes:
-      - .:/app
+      - relational_data:/data
     depends_on:
-      - vectordb
+      migrate:
+        condition: service_completed_successfully
+      vectordb:
+        condition: service_healthy
+    restart: unless-stopped
   vectordb:
-    image: chromadb/chroma:latest
+    image: chromadb/chroma:1.5.9
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
     volumes:
       - chroma_data:/data
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/8000"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
 volumes:
   chroma_data:
+  relational_data:
