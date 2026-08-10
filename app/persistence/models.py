@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Column,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import relationship
 
@@ -53,6 +56,7 @@ class Chunk(Base):
     start_offset = Column(Integer, nullable=False)
     end_offset = Column(Integer, nullable=False)
     vector_id = Column(String(255), nullable=True, unique=True, index=True)
+    media_type = Column(String(100), nullable=False, default="text/plain", server_default="text/plain")
 
     document = relationship("Document", back_populates="chunks")
     graph_extractions = relationship(
@@ -104,8 +108,31 @@ class GraphExtraction(Base):
     __tablename__ = "graph_extractions"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'succeeded', 'failed', 'empty')",
+            "status IN ('pending', 'succeeded', 'failed', 'empty', 'skipped')",
             name="ck_graph_extractions_status",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_graph_extractions_attempt_count",
+        ),
+        CheckConstraint(
+            "is_identity_owner IN (0, 1)",
+            name="ck_graph_extractions_is_identity_owner",
+        ),
+        CheckConstraint(
+            "length(input_sha256) = 64 AND input_sha256 NOT GLOB '*[^0-9a-f]*'",
+            name="ck_graph_extractions_input_sha256_hex",
+        ),
+        Index(
+            "uq_graph_extractions_identity_owner",
+            "chunk_id",
+            "provider",
+            "model",
+            "prompt_version",
+            "schema_version",
+            "input_sha256",
+            unique=True,
+            sqlite_where=text("is_identity_owner = 1"),
         ),
     )
 
@@ -119,6 +146,14 @@ class GraphExtraction(Base):
     error_code = Column(String(100), nullable=True)
     error_detail = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    # 10A.3 lifecycle/identity columns.
+    input_sha256 = Column(String(64), nullable=False)
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    attempt_started_at = Column(DateTime(timezone=True), nullable=True)
+    is_identity_owner = Column(
+        Boolean, nullable=False, default=True, server_default="1"
+    )
 
     chunk = relationship("Chunk", back_populates="graph_extractions")
     mentions = relationship(

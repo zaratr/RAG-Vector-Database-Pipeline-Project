@@ -15,7 +15,7 @@ from app.core.db import get_db
 from app.core.models import DocumentDetail, DocumentSummary
 from app.persistence import models, repositories
 from app.services.embeddings import get_embedding_provider
-from app.services.ingestion import chunks_for_document, ingest_text, ingest_image
+from app.services.ingestion import chunks_for_document, ingest_text, ingest_image, VectorIndexIncomplete
 from app.services.graph_extraction import (
     DisabledGraphExtractor,
     GraphExtractionError,
@@ -129,6 +129,10 @@ async def create_document(
     except GraphProviderUnavailable as exc:
         raise HTTPException(
             status_code=503, detail="Graph extraction provider unavailable"
+        ) from exc
+    except VectorIndexIncomplete as exc:
+        raise HTTPException(
+            status_code=503, detail="Vector index unavailable"
         ) from exc
     except GraphExtractionError as exc:
         raise HTTPException(

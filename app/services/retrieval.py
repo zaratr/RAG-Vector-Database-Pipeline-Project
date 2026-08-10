@@ -8,7 +8,11 @@ from sqlalchemy.orm import Session
 from app.persistence import models
 from app.services.embeddings import EmbeddingProvider
 from app.services.vector_store import VectorStore
-from app.services.graph_retrieval import retrieve_graph_contexts
+from app.services.graph_retrieval import (
+    GraphTraversalLimitError,
+    retrieve_graph_contexts,
+    retrieve_graph_paths,
+)
 
 
 async def retrieve(
@@ -78,6 +82,90 @@ def _ready_vector_contexts(session: Session, contexts: list[dict]) -> list[dict]
     return hydrated
 
 
+def _graph_contexts_from_paths(
+    session: Session,
+    *,
+    query: str,
+    max_hops: int,
+    limit: int,
+    filters: dict | None,
+    seed_chunk_ids: list[int],
+) -> list[dict]:
+    """Build graph candidate contexts from complete ``GraphPath`` objects.
+
+    Each distinct ``chunk_id`` referenced by a path step becomes a candidate.
+    A chunk's ``graph_score`` is the maximum score among paths containing it;
+    ``graph_paths`` carries the full path objects (deduplicated by ordered
+    evidence-ID sequence, capped at 10 per chunk).
+    """
+    paths = retrieve_graph_paths(
+        session,
+        query=query,
+        max_hops=max_hops,
+        direction="outbound",
+        limit=limit,
+        filters=filters,
+        seed_chunk_ids=seed_chunk_ids or None,
+    )
+    # Map chunk_id -> (paths containing it, ready chunk).
+    chunk_to_paths: dict[int, list] = {}
+    for path in paths:
+        for step in path.steps:
+            chunk_to_paths.setdefault(step.chunk_id, []).append(path)
+
+    if not chunk_to_paths:
+        return []
+    ready_chunks = (
+        session.query(models.Chunk)
+        .join(models.Chunk.document)
+        .filter(
+            models.Chunk.id.in_(list(chunk_to_paths)),
+            models.Document.ingestion_status == "ready",
+        )
+        .all()
+    )
+    by_id = {chunk.id: chunk for chunk in ready_chunks}
+
+    contexts: list[dict] = []
+    for chunk_id, containing in chunk_to_paths.items():
+        chunk = by_id.get(chunk_id)
+        if chunk is None:
+            continue
+        # Dedup paths by ordered evidence-ID sequence; sort by score then hops.
+        unique_paths: dict[tuple, object] = {}
+        for path in containing:
+            key = tuple(s.evidence_id for s in path.steps)
+            if key not in unique_paths:
+                unique_paths[key] = path
+        sorted_paths = sorted(
+            unique_paths.values(),
+            key=lambda p: (-p.score, p.hop_count, tuple(s.evidence_id for s in p.steps)),
+        )[:10]
+        graph_score = max(p.score for p in sorted_paths)
+        min_hop = min(
+            (i for p in sorted_paths for i, s in enumerate(p.steps, start=1) if s.chunk_id == chunk_id),
+            default=max_hops,
+        )
+        contexts.append(
+            {
+                "text": chunk.text,
+                "score": graph_score,
+                "metadata": {
+                    **chunk.get_chunk_metadata(),
+                    "retrieval_sources": ["graph"],
+                    "graph_paths": [p.model_dump() for p in sorted_paths],
+                    "graph_score": graph_score,
+                    "score_type": "graph_path_score",
+                    "min_hop": min_hop,
+                    "chunk_id": chunk.id,
+                },
+            }
+        )
+    # Graph candidate order: (-graph_score, minimum hop, chunk_id).
+    contexts.sort(key=lambda c: (-c["metadata"]["graph_score"], c["metadata"]["min_hop"], c["metadata"]["chunk_id"]))
+    return contexts
+
+
 async def retrieve_contexts(
     *,
     query: str,
@@ -104,42 +192,27 @@ async def retrieve_contexts(
         for context in vector_contexts:
             metadata = context.setdefault("metadata", {})
             metadata["retrieval_sources"] = ["vector"]
+            metadata["score_type"] = "vector_distance"
     if mode in {"graph", "hybrid"}:
-        graph_contexts = retrieve_graph_contexts(
+        seed_chunk_ids = [
+            int(context["metadata"]["chunk_id"])
+            for context in vector_contexts
+            if (context.get("metadata") or {}).get("chunk_id") is not None
+        ]
+        graph_contexts = _graph_contexts_from_paths(
             session,
             query=query,
             max_hops=graph_max_hops,
             limit=max(top_k * 3, top_k),
             filters=filters,
-            seed_chunk_ids=[
-                int(context["metadata"]["chunk_id"])
-                for context in vector_contexts
-                if (context.get("metadata") or {}).get("chunk_id") is not None
-            ],
+            seed_chunk_ids=seed_chunk_ids,
         )
 
     if mode == "vector":
         return vector_contexts[:top_k]
     if mode == "graph":
-        merged_graph: dict[tuple, dict] = {}
-        for context in graph_contexts:
-            key = _context_key(context)
-            graph_path = context["metadata"]["graph"]
-            if key not in merged_graph:
-                metadata = dict(context["metadata"])
-                metadata.pop("graph")
-                metadata["graph_paths"] = [graph_path]
-                merged_graph[key] = {
-                    "text": context["text"],
-                    "score": context["score"],
-                    "metadata": metadata,
-                }
-            else:
-                merged_graph[key]["metadata"]["graph_paths"].append(graph_path)
-                merged_graph[key]["score"] = max(
-                    merged_graph[key]["score"], context["score"]
-                )
-        return list(merged_graph.values())[:top_k]
+        # Graph contexts already carry full graph_paths + graph_score metadata.
+        return graph_contexts[:top_k]
 
     fused: dict[tuple, dict] = {}
     rrf_scores: dict[tuple, float] = {}
@@ -150,13 +223,13 @@ async def retrieve_contexts(
         for rank, context in enumerate(contexts, start=1):
             key = _context_key(context)
             rrf_scores[key] = rrf_scores.get(key, 0.0) + 1.0 / (60 + rank)
-            graph_path = (context.get("metadata") or {}).get("graph")
+            graph_paths = (context.get("metadata") or {}).get("graph_paths")
+            graph_score = (context.get("metadata") or {}).get("graph_score")
             if key not in fused:
                 metadata = dict(context.get("metadata") or {})
-                metadata.pop("graph", None)
                 metadata["retrieval_sources"] = [source_name]
-                if graph_path is not None:
-                    metadata["graph_paths"] = [graph_path]
+                if source_name == "graph":
+                    metadata["score_type"] = "graph_path_score"
                 fused[key] = {
                     "text": context["text"],
                     "score": context["score"],
@@ -166,11 +239,21 @@ async def retrieve_contexts(
             metadata = fused[key]["metadata"]
             if source_name not in metadata["retrieval_sources"]:
                 metadata["retrieval_sources"].append(source_name)
-            if graph_path is not None:
-                metadata.setdefault("graph_paths", []).append(graph_path)
+            # Hybrid chunk from both: preserve native vector distance in score,
+            # add graph_score + hybrid_score separately.
+            if source_name == "vector":
+                metadata["score"] = context["score"]
+                metadata["score_type"] = "vector_distance"
+            if graph_paths:
+                existing = metadata.setdefault("graph_paths", [])
+                for gp in graph_paths:
+                    if gp not in existing:
+                        existing.append(gp)
+            if graph_score is not None:
+                metadata["graph_score"] = graph_score
 
     for key, context in fused.items():
-        context["metadata"]["hybrid_score"] = rrf_scores[key]
+        context["metadata"]["hybrid_score"] = round(rrf_scores[key], 6)
     return sorted(
         fused.values(),
         key=lambda item: (

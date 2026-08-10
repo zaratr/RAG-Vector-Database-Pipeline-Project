@@ -21,6 +21,9 @@ data/processed/
 # Validation artifacts
 query*.json
 
+# Phase 10 gate evidence / recorded reports (ignored while the plan remains visible)
+.hermes/reports/
+
 # Editor junk
 *~
 *.un~

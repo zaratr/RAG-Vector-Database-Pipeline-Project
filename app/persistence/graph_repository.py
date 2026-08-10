@@ -1,8 +1,21 @@
-"""Persistence operations for normalized graph extraction provenance."""
+"""Persistence operations for normalized graph extraction provenance.
+
+Task 10A.3 introduces an idempotent extraction lifecycle: every eligible
+chunk/version has exactly one durable extraction identity, and the repository
+exposes a begin/complete/fail/skip API that returns an :class:`ExtractionLease`
+telling the caller whether to call the provider.
+"""
 from __future__ import annotations
 
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Callable, Optional
+
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.persistence import models
 from app.services.graph_extraction import (
     PROMPT_VERSION,
@@ -10,6 +23,287 @@ from app.services.graph_extraction import (
     ExtractedEntity,
     ExtractedRelation,
 )
+
+_LEASE_DEFAULT_SECONDS = 600
+
+
+class InvalidExtractionTransition(RuntimeError):
+    """Raised when a terminal extraction is mutated or terminalized again."""
+
+
+@dataclass(frozen=True)
+class ExtractionIdentity:
+    chunk_id: int
+    provider: str
+    model: str
+    prompt_version: str
+    schema_version: str
+    input_sha256: str
+
+
+@dataclass(frozen=True)
+class ExtractionLease:
+    extraction: models.GraphExtraction
+    identity: ExtractionIdentity
+    should_call_provider: bool
+
+
+def _default_now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _normalize_dt(value: datetime) -> datetime:
+    """Return a naive UTC datetime at second precision for storage/comparison."""
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value.replace(microsecond=0)
+
+
+def derive_extraction_identity(
+    *,
+    chunk: models.Chunk,
+    provider: str,
+    model: str,
+    prompt_version: str,
+    schema_version: str,
+) -> ExtractionIdentity:
+    """Compute the durable extraction identity for a chunk/version.
+
+    ``input_sha256`` is lowercase SHA-256 of the exact UTF-8 bytes of the
+    authoritative persisted ``chunk.text``; callers cannot supply or override it.
+    """
+    payload = (chunk.text or "").encode("utf-8")
+    input_sha = hashlib.sha256(payload).hexdigest()
+    return ExtractionIdentity(
+        chunk_id=chunk.id,
+        provider=provider,
+        model=model,
+        prompt_version=prompt_version,
+        schema_version=schema_version,
+        input_sha256=input_sha,
+    )
+
+
+def _find_owner(
+    session: Session, identity: ExtractionIdentity
+) -> Optional[models.GraphExtraction]:
+    """Return the identity-owner extraction row, if any."""
+    stmt = select(models.GraphExtraction).where(
+        models.GraphExtraction.chunk_id == identity.chunk_id,
+        models.GraphExtraction.provider == identity.provider,
+        models.GraphExtraction.model == identity.model,
+        models.GraphExtraction.prompt_version == identity.prompt_version,
+        models.GraphExtraction.schema_version == identity.schema_version,
+        models.GraphExtraction.input_sha256 == identity.input_sha256,
+        models.GraphExtraction.is_identity_owner.is_(True),
+    )
+    return session.execute(stmt).scalars().first()
+
+
+def _lease_seconds() -> int:
+    try:
+        return int(get_settings().extraction_lease_seconds)
+    except Exception:  # pragma: no cover - defensive
+        return _LEASE_DEFAULT_SECONDS
+
+
+def begin_chunk_extraction(
+    session: Session,
+    *,
+    chunk: models.Chunk,
+    provider: str,
+    model: str,
+    prompt_version: str,
+    schema_version: str,
+    retry_failed: bool = False,
+    now_utc: Callable[[], datetime] | None = None,
+) -> ExtractionLease:
+    """Begin (or resume) extraction for a chunk/version.
+
+    Returns an :class:`ExtractionLease`. The caller branches only on
+    ``should_call_provider``. See the state-transition table in the plan.
+    """
+    now = _normalize_dt((now_utc or _default_now_utc)())
+    identity = derive_extraction_identity(
+        chunk=chunk,
+        provider=provider,
+        model=model,
+        prompt_version=prompt_version,
+        schema_version=schema_version,
+    )
+    existing = _find_owner(session, identity)
+
+    if existing is None:
+        extraction = models.GraphExtraction(
+            chunk_id=identity.chunk_id,
+            provider=identity.provider,
+            model=identity.model,
+            prompt_version=identity.prompt_version,
+            schema_version=identity.schema_version,
+            input_sha256=identity.input_sha256,
+            status="pending",
+            attempt_count=1,
+            attempt_started_at=now,
+            completed_at=None,
+            error_code=None,
+            error_detail=None,
+            is_identity_owner=True,
+        )
+        session.add(extraction)
+        session.flush()
+        return ExtractionLease(extraction, identity, should_call_provider=True)
+
+    status = existing.status
+
+    # Terminal successful/empty/skipped: return unchanged.
+    if status in ("succeeded", "empty", "skipped"):
+        return ExtractionLease(existing, identity, should_call_provider=False)
+
+    # Pending: never start a second provider call. Only an expired lease plus
+    # retry_failed reclaims it.
+    if status == "pending":
+        if retry_failed and existing.attempt_started_at is not None:
+            lease_seconds = _lease_seconds()
+            started = _normalize_dt(existing.attempt_started_at).timestamp()
+            # Expiry is strictly started < now - lease_seconds; boundary equality
+            # (started == now - lease_seconds) retains the lease.
+            if now.timestamp() - lease_seconds <= started:
+                return ExtractionLease(existing, identity, should_call_provider=False)
+            # Expired: reclaim.
+            existing.attempt_count = (existing.attempt_count or 0) + 1
+            existing.attempt_started_at = now
+            existing.completed_at = None
+            existing.error_code = None
+            existing.error_detail = None
+            session.flush()
+            return ExtractionLease(existing, identity, should_call_provider=True)
+        return ExtractionLease(existing, identity, should_call_provider=False)
+
+    # Failed: only retry_failed reclaims it.
+    if status == "failed":
+        if not retry_failed:
+            return ExtractionLease(existing, identity, should_call_provider=False)
+        existing.status = "pending"
+        existing.attempt_count = (existing.attempt_count or 0) + 1
+        existing.attempt_started_at = now
+        existing.completed_at = None
+        existing.error_code = None
+        existing.error_detail = None
+        session.flush()
+        return ExtractionLease(existing, identity, should_call_provider=True)
+
+    # Defensive: any other status returns unchanged.
+    return ExtractionLease(existing, identity, should_call_provider=False)
+
+
+def _require_pending(extraction: models.GraphExtraction) -> None:
+    if extraction.status != "pending":
+        raise InvalidExtractionTransition(
+            f"extraction {extraction.id} is terminal ({extraction.status}); "
+            "complete/fail require status pending"
+        )
+
+
+def complete_chunk_extraction(
+    session: Session,
+    *,
+    extraction: models.GraphExtraction,
+    relations: list[ExtractedRelation],
+    now_utc: Callable[[], datetime] | None = None,
+) -> models.GraphExtraction:
+    """Atomically transition pending → succeeded/empty and replace evidence."""
+    _require_pending(extraction)
+    now = _normalize_dt((now_utc or _default_now_utc)())
+
+    # Replace evidence owned by this extraction identity: delete old mentions and
+    # evidence created by this extraction, then write the new ones.
+    session.query(models.EntityMention).filter(
+        models.EntityMention.extraction_id == extraction.id
+    ).delete(synchronize_session=False)
+    session.query(models.GraphEdgeEvidence).filter(
+        models.GraphEdgeEvidence.extraction_id == extraction.id
+    ).delete(synchronize_session=False)
+
+    chunk = session.get(models.Chunk, extraction.chunk_id)
+    for relation in relations:
+        _persist_relation(session, extraction=extraction, chunk=chunk, relation=relation)
+
+    extraction.status = "empty" if not relations else "succeeded"
+    extraction.completed_at = now
+    extraction.error_code = None
+    extraction.error_detail = None
+    session.flush()
+    return extraction
+
+
+def fail_chunk_extraction(
+    session: Session,
+    *,
+    extraction: models.GraphExtraction,
+    error_code: str,
+    error_detail: str,
+    now_utc: Callable[[], datetime] | None = None,
+) -> models.GraphExtraction:
+    """Transition pending → failed with a bounded, sanitized error record."""
+    _require_pending(extraction)
+    now = _normalize_dt((now_utc or _default_now_utc)())
+    bounded_code = (error_code or "")[:100]
+    bounded_detail = (error_detail or "")[:1000]
+    extraction.status = "failed"
+    extraction.completed_at = now
+    extraction.error_code = bounded_code
+    extraction.error_detail = bounded_detail
+    session.flush()
+    return extraction
+
+
+def skip_chunk_extraction(
+    session: Session,
+    *,
+    chunk: models.Chunk,
+    provider: str,
+    model: str,
+    prompt_version: str,
+    schema_version: str,
+    reason_code: str,
+    now_utc: Callable[[], datetime] | None = None,
+) -> ExtractionLease:
+    """Create or reload the complete skipped identity; never calls the provider."""
+    now = _normalize_dt((now_utc or _default_now_utc)())
+    identity = derive_extraction_identity(
+        chunk=chunk,
+        provider=provider,
+        model=model,
+        prompt_version=prompt_version,
+        schema_version=schema_version,
+    )
+    existing = _find_owner(session, identity)
+    if existing is None:
+        extraction = models.GraphExtraction(
+            chunk_id=identity.chunk_id,
+            provider=identity.provider,
+            model=identity.model,
+            prompt_version=identity.prompt_version,
+            schema_version=identity.schema_version,
+            input_sha256=identity.input_sha256,
+            status="skipped",
+            attempt_count=0,
+            attempt_started_at=now,
+            completed_at=now,
+            error_code=reason_code,
+            error_detail=None,
+            is_identity_owner=True,
+        )
+        session.add(extraction)
+        session.flush()
+        return ExtractionLease(extraction, identity, should_call_provider=False)
+    # Identity unchanged: return the existing terminal row unchanged.
+    return ExtractionLease(existing, identity, should_call_provider=False)
+
+
+# ---------------------------------------------------------------------------
+# Internal relation persistence (shared with the legacy convenience helper)
+# ---------------------------------------------------------------------------
 
 
 def _get_or_create_entity(
@@ -97,6 +391,57 @@ def _get_or_create_edge(
     return edge
 
 
+def _persist_relation(
+    session: Session,
+    *,
+    extraction: models.GraphExtraction,
+    chunk: models.Chunk,
+    relation: ExtractedRelation,
+) -> None:
+    source = _get_or_create_entity(session, relation.source)
+    target = _get_or_create_entity(session, relation.target)
+    _get_or_create_mention(
+        session,
+        entity=source,
+        extraction=extraction,
+        surface_form=relation.source.name,
+        chunk_text=chunk.text,
+    )
+    _get_or_create_mention(
+        session,
+        entity=target,
+        extraction=extraction,
+        surface_form=relation.target.name,
+        chunk_text=chunk.text,
+    )
+    edge = _get_or_create_edge(
+        session, source=source, predicate=relation.predicate, target=target
+    )
+    existing_evidence = (
+        session.query(models.GraphEdgeEvidence)
+        .filter(
+            models.GraphEdgeEvidence.edge_id == edge.id,
+            models.GraphEdgeEvidence.extraction_id == extraction.id,
+            models.GraphEdgeEvidence.evidence_start == relation.evidence_start,
+            models.GraphEdgeEvidence.evidence_end == relation.evidence_end,
+        )
+        .one_or_none()
+    )
+    if existing_evidence is None:
+        session.add(
+            models.GraphEdgeEvidence(
+                edge_id=edge.id,
+                extraction_id=extraction.id,
+                evidence_text=relation.evidence,
+                evidence_start=relation.evidence_start,
+                evidence_end=relation.evidence_end,
+                confidence=relation.confidence,
+            )
+        )
+    elif relation.confidence > existing_evidence.confidence:
+        existing_evidence.confidence = relation.confidence
+
+
 def persist_chunk_extraction(
     session: Session,
     *,
@@ -107,63 +452,22 @@ def persist_chunk_extraction(
     prompt_version: str = PROMPT_VERSION,
     schema_version: str = SCHEMA_VERSION,
 ) -> models.GraphExtraction:
-    """Persist one successful extraction run and its normalized provenance."""
-    extraction = models.GraphExtraction(
-        chunk_id=chunk.id,
+    """Convenience helper: begin + complete in one call.
+
+    Kept for the operator CLI and tests that seed a graph in one step. Uses the
+    idempotent lifecycle: an existing terminal owner is left unchanged; otherwise
+    a pending row is created and immediately completed.
+    """
+    lease = begin_chunk_extraction(
+        session,
+        chunk=chunk,
         provider=provider,
         model=model,
         prompt_version=prompt_version,
         schema_version=schema_version,
-        status="empty" if not relations else "succeeded",
     )
-    session.add(extraction)
-    session.flush()
-
-    for relation in relations:
-        source = _get_or_create_entity(session, relation.source)
-        target = _get_or_create_entity(session, relation.target)
-        _get_or_create_mention(
-            session,
-            entity=source,
-            extraction=extraction,
-            surface_form=relation.source.name,
-            chunk_text=chunk.text,
-        )
-        _get_or_create_mention(
-            session,
-            entity=target,
-            extraction=extraction,
-            surface_form=relation.target.name,
-            chunk_text=chunk.text,
-        )
-        edge = _get_or_create_edge(
-            session,
-            source=source,
-            predicate=relation.predicate,
-            target=target,
-        )
-        existing_evidence = (
-            session.query(models.GraphEdgeEvidence)
-            .filter(
-                models.GraphEdgeEvidence.edge_id == edge.id,
-                models.GraphEdgeEvidence.extraction_id == extraction.id,
-                models.GraphEdgeEvidence.evidence_start == relation.evidence_start,
-                models.GraphEdgeEvidence.evidence_end == relation.evidence_end,
-            )
-            .one_or_none()
-        )
-        if existing_evidence is None:
-            session.add(
-                models.GraphEdgeEvidence(
-                    edge_id=edge.id,
-                    extraction_id=extraction.id,
-                    evidence_text=relation.evidence,
-                    evidence_start=relation.evidence_start,
-                    evidence_end=relation.evidence_end,
-                    confidence=relation.confidence,
-                )
-            )
-        elif relation.confidence > existing_evidence.confidence:
-            existing_evidence.confidence = relation.confidence
-    session.flush()
-    return extraction
+    if not lease.should_call_provider:
+        return lease.extraction
+    return complete_chunk_extraction(
+        session, extraction=lease.extraction, relations=relations
+    )

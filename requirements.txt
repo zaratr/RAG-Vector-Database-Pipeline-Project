@@ -28,8 +28,10 @@ pillow==12.3.0
 # --- HTTP client (Ollama API calls) ---
 httpx==0.28.1
 
-# --- Graph (knowledge graph layer) ---
-networkx==3.6.1
+# --- JSON Schema validation (Phase 10 gate/safety contracts; Draft 2020-12) ---
+# Owned by Task 10.0; pinned exact. Every later phase reuses this without
+# adding or deferring another owner.
+jsonschema==4.25.1
 
 # --- Document parsing ---
 pypdf==6.14.2

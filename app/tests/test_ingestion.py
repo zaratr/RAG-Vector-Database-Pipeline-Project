@@ -40,9 +40,18 @@ class FailingGraphExtractor:
 class RecordingVectorStore:
     def __init__(self):
         self.calls = []
+        self._ids: set[str] = set()
 
     async def upsert_embeddings(self, embeddings, metadatas, ids, documents=None):
         self.calls.append((embeddings, metadatas, ids, documents))
+        self._ids.update(ids)
+
+    async def list_ids(self):
+        return sorted(self._ids)
+
+    async def delete(self, ids):
+        for vector_id in ids:
+            self._ids.discard(vector_id)
 
 
 class FailingVectorStore(RecordingVectorStore):
@@ -146,8 +155,10 @@ async def test_graph_extraction_failure_prevents_vector_indexing():
         )
 
     assert store.calls == []
-    session.rollback()
-    assert session.query(models.Document).filter_by(title="Failed Graph Doc").count() == 0
+    # 10A.4: the failed document persists as operator-visible evidence (it is
+    # not query-visible), and its extraction row records the failure.
+    doc = session.query(models.Document).filter_by(title="Failed Graph Doc").one()
+    assert doc.ingestion_status == "failed"
     session.close()
 
 
