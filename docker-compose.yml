@@ -1,8 +1,11 @@
 services:
   migrate:
-    build: .
-    env_file:
-      - .env
+    build:
+      context: .
+      args:
+        SOURCE_REVISION: ${SOURCE_REVISION:-unknown}
+        SOURCE_CONTEXT_SHA256: ${SOURCE_CONTEXT_SHA256:-unknown}
+        SOURCE_DIRTY: ${SOURCE_DIRTY:-unknown}
     environment:
       RAG_DATABASE_URL: ${RAG_DATABASE_URL:-sqlite:////data/rag.db}
     volumes:
@@ -10,13 +13,19 @@ services:
     command: ["python", "-m", "app.core.migrations"]
     restart: "no"
   api:
-    build: .
+    build:
+      context: .
+      args:
+        SOURCE_REVISION: ${SOURCE_REVISION:-unknown}
+        SOURCE_CONTEXT_SHA256: ${SOURCE_CONTEXT_SHA256:-unknown}
+        SOURCE_DIRTY: ${SOURCE_DIRTY:-unknown}
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
       RAG_DATABASE_URL: ${RAG_DATABASE_URL:-sqlite:////data/rag.db}
+      RAG_EXTRACTION_LEASE_SECONDS: ${RAG_EXTRACTION_LEASE_SECONDS:-600}
     volumes:
       - relational_data:/data
     depends_on:

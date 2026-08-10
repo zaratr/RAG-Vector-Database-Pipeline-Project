@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import re
 from collections import deque
+from typing import Literal
 
+from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
 
 from app.persistence import models
@@ -12,6 +14,9 @@ from app.services.graph_extraction import canonicalize_entity_name
 MAX_GRAPH_HOPS = 3
 MAX_SEEDS = 20
 MAX_EVIDENCE_ROWS = 5000
+MAX_RETURNED_PATHS = 50
+
+TraversalDirection = Literal["outbound", "inbound", "both"]
 
 
 class GraphTraversalError(RuntimeError):
@@ -24,6 +29,32 @@ class GraphTraversalLimitError(GraphTraversalError):
 
 class UnsupportedGraphFilter(GraphTraversalError):
     """A filter cannot be applied consistently to vector and graph evidence."""
+
+
+class GraphPathStep(BaseModel):
+    edge_id: int
+    evidence_id: int
+    source_entity_id: int
+    source: str
+    source_type: str
+    predicate: str
+    target_entity_id: int
+    target: str
+    target_type: str
+    chunk_id: int
+    document_id: int
+    evidence: str
+    confidence: float
+    extraction_id: int
+    extraction_model: str
+
+
+class GraphPath(BaseModel):
+    seed_entity_id: int
+    terminal_entity_id: int
+    hop_count: int
+    steps: list[GraphPathStep]
+    score: float
 
 
 def _query_mentions_entity(query: str, canonical_name: str) -> bool:
@@ -191,3 +222,244 @@ def retrieve_graph_contexts(
             }
         )
     return contexts
+
+
+# ---------------------------------------------------------------------------
+# 10A.5 — directional path traversal returning complete GraphPath objects
+# ---------------------------------------------------------------------------
+
+
+def _apply_path_filters(query, filters: dict | None):
+    """Apply the scalar document filters to a ready-document evidence query."""
+    if "document_id" in filters:
+        try:
+            document_id = int(filters["document_id"])
+        except (TypeError, ValueError) as exc:
+            raise UnsupportedGraphFilter("document_id filter must be an integer") from exc
+        if isinstance(filters["document_id"], bool):
+            raise UnsupportedGraphFilter("document_id filter rejects booleans")
+        query = query.filter(models.Document.id == document_id)
+    if "title" in filters:
+        query = query.filter(models.Document.title == str(filters["title"]))
+    if "source" in filters:
+        query = query.filter(models.Document.source == str(filters["source"]))
+    if "tags" in filters:
+        query = query.filter(models.Document.tags == str(filters["tags"]))
+    return query
+
+
+def _ready_evidence_rows(session: Session, filters: dict):
+    query = (
+        session.query(models.GraphEdgeEvidence)
+        .join(models.GraphEdgeEvidence.extraction)
+        .join(models.GraphExtraction.chunk)
+        .join(models.Chunk.document)
+        .options(
+            joinedload(models.GraphEdgeEvidence.edge).joinedload(models.GraphEdge.source),
+            joinedload(models.GraphEdgeEvidence.edge).joinedload(models.GraphEdge.target),
+            joinedload(models.GraphEdgeEvidence.extraction)
+            .joinedload(models.GraphExtraction.chunk)
+            .joinedload(models.Chunk.document),
+        )
+        .filter(models.Document.ingestion_status == "ready")
+    )
+    query = _apply_path_filters(query, filters)
+    return query.all()
+
+
+def resolve_graph_seeds(
+    session: Session,
+    *,
+    query: str,
+    seed_chunk_ids: list[int] | None,
+    filters: dict | None,
+) -> list[int]:
+    """Resolve seed entity IDs: lexical matches in the query + ready seed-chunk mentions.
+
+    Apply document filters before accepting chunk-derived seeds. More than 20
+    distinct seeds raises ``GraphTraversalLimitError``; no seeds returns ``[]``.
+    """
+    canonical_query = canonicalize_entity_name(query)
+    seeds: set[int] = set()
+    for entity in session.query(models.GraphEntity).all():
+        if re.search(rf"(?<!\w){re.escape(entity.canonical_name)}(?!\w)", canonical_query):
+            seeds.add(entity.id)
+    if seed_chunk_ids:
+        mentioned = (
+            session.query(models.EntityMention.entity_id)
+            .join(models.GraphExtraction)
+            .join(models.Chunk)
+            .join(models.Document)
+            .filter(models.GraphExtraction.chunk_id.in_(seed_chunk_ids))
+            .filter(models.Document.ingestion_status == "ready")
+        )
+        mentioned = _apply_path_filters(mentioned, filters or {})
+        seeds.update(entity_id for (entity_id,) in mentioned.distinct().all())
+    if len(seeds) > MAX_SEEDS:
+        raise GraphTraversalLimitError(
+            f"Graph seed count exceeds safety cap of {MAX_SEEDS}"
+        )
+    return sorted(seeds)
+
+
+def _step_from_evidence(evidence: models.GraphEdgeEvidence) -> GraphPathStep:
+    edge = evidence.edge
+    chunk = evidence.extraction.chunk
+    document = chunk.document
+    return GraphPathStep(
+        edge_id=edge.id,
+        evidence_id=evidence.id,
+        source_entity_id=edge.source_entity_id,
+        source=edge.source.display_name,
+        source_type=edge.source.entity_type,
+        predicate=edge.predicate,
+        target_entity_id=edge.target_entity_id,
+        target=edge.target.display_name,
+        target_type=edge.target.entity_type,
+        chunk_id=chunk.id,
+        document_id=document.id,
+        evidence=evidence.evidence_text,
+        confidence=evidence.confidence,
+        extraction_id=evidence.extraction_id,
+        extraction_model=evidence.extraction.model,
+    )
+
+
+def _direction_neighbors(edge: models.GraphEdge, direction: TraversalDirection):
+    """Return the (from_entity, to_entity) pair honoring direction semantics.
+
+    Stored edge orientation is always preserved in the returned step; direction
+    only controls which entity is the traversal source for BFS expansion.
+    """
+    if direction == "outbound":
+        return [(edge.source_entity_id, edge.target_entity_id)]
+    if direction == "inbound":
+        return [(edge.target_entity_id, edge.source_entity_id)]
+    return [
+        (edge.source_entity_id, edge.target_entity_id),
+        (edge.target_entity_id, edge.source_entity_id),
+    ]
+
+
+def retrieve_graph_paths(
+    session: Session,
+    *,
+    query: str,
+    max_hops: int,
+    direction: TraversalDirection,
+    limit: int,
+    filters: dict | None = None,
+    seed_chunk_ids: list[int] | None = None,
+) -> list[GraphPath]:
+    """Return deterministic directional paths over ready evidence only.
+
+    Paths cannot repeat an edge or entity except a one-step self-loop. Sort by
+    ``(hop_count, canonical entity/edge sequence, evidence IDs)``. Score is
+    ``min(confidence across steps) / hop_count``.
+    """
+    if max_hops < 1 or max_hops > MAX_GRAPH_HOPS:
+        raise ValueError(f"max_hops must be between 1 and {MAX_GRAPH_HOPS}")
+    if limit < 1:
+        return []
+    validated = _validate_filters(filters)
+    seeds = resolve_graph_seeds(
+        session, query=query, seed_chunk_ids=seed_chunk_ids, filters=validated
+    )
+    if not seeds:
+        return []
+
+    rows = _ready_evidence_rows(session, validated)
+    if len(rows) > MAX_EVIDENCE_ROWS:
+        raise GraphTraversalLimitError(
+            f"Graph evidence exceeds safety cap of {MAX_EVIDENCE_ROWS}"
+        )
+    if not rows:
+        return []
+
+    # Index evidence rows by traversal-source entity for directed BFS.
+    evidence_by_source: dict[int, list[models.GraphEdgeEvidence]] = {}
+    for evidence in rows:
+        for src, _dst in _direction_neighbors(evidence.edge, direction):
+            evidence_by_source.setdefault(src, []).append(evidence)
+    for key in evidence_by_source:
+        evidence_by_source[key].sort(
+            key=lambda e: (
+                e.edge.target.canonical_name if direction != "inbound" else e.edge.source.canonical_name,
+                e.edge.predicate,
+                e.edge_id,
+                e.id,
+            )
+        )
+
+    paths: list[GraphPath] = []
+    for seed in seeds:
+        paths.extend(_bfs_paths(seed, max_hops, direction, evidence_by_source))
+        if len(paths) > MAX_RETURNED_PATHS * 4:
+            break
+
+    # Deduplicate by ordered evidence-ID sequence.
+    seen: set[tuple[int, ...]] = set()
+    unique: list[GraphPath] = []
+    for path in paths:
+        key = tuple(step.evidence_id for step in path.steps)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+
+    unique.sort(
+        key=lambda p: (
+            p.hop_count,
+            tuple(s.source for s in p.steps),
+            tuple(s.predicate for s in p.steps),
+            tuple(s.target for s in p.steps),
+            tuple(s.evidence_id for s in p.steps),
+        )
+    )
+    return unique[: min(limit, MAX_RETURNED_PATHS)]
+
+
+def _bfs_paths(
+    seed: int,
+    max_hops: int,
+    direction: TraversalDirection,
+    evidence_by_source: dict[int, list[models.GraphEdgeEvidence]],
+) -> list[GraphPath]:
+    """Breadth-first expansion from ``seed`` yielding complete GraphPath objects."""
+    results: list[GraphPath] = []
+    # Each frontier item: (current_entity, steps_so_far, visited_edges, visited_entities)
+    initial = (seed, [], set(), {seed})
+    queue: deque = deque([initial])
+    while queue:
+        current, steps, visited_edges, visited_entities = queue.popleft()
+        if len(steps) >= max_hops:
+            continue
+        for evidence in evidence_by_source.get(current, []):
+            if evidence.id in visited_edges:
+                continue
+            edge = evidence.edge
+            for src, dst in _direction_neighbors(edge, direction):
+                if src != current:
+                    continue
+                # Self-loop: a one-step path may revisit the same entity once.
+                if dst in visited_entities and dst != current:
+                    continue
+                step = _step_from_evidence(evidence)
+                new_steps = steps + [step]
+                new_visited_edges = visited_edges | {evidence.id}
+                new_visited_entities = visited_entities | {dst}
+                min_conf = min(s.confidence for s in new_steps)
+                path = GraphPath(
+                    seed_entity_id=seed,
+                    terminal_entity_id=dst,
+                    hop_count=len(new_steps),
+                    steps=new_steps,
+                    score=min_conf / len(new_steps),
+                )
+                results.append(path)
+                if dst != current:
+                    queue.append(
+                        (dst, new_steps, new_visited_edges, new_visited_entities)
+                    )
+    return results
+

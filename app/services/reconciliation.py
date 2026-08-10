@@ -15,7 +15,12 @@ async def reconcile_ingestion(
     vector_store: VectorStore,
     batch_size: int = 64,
 ) -> dict[str, int]:
-    """Make vector visibility converge to relational document readiness."""
+    """Make vector visibility converge to relational document readiness.
+
+    Never promotes ``staged`` to ``ready`` and never re-runs graph extraction.
+    Staged documents are terminalized to ``failed``; their still-pending
+    extraction runs are terminalized to ``failed`` (``reconciled_incomplete``).
+    """
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
 
@@ -34,11 +39,20 @@ async def reconcile_ingestion(
     }
 
     staged_count = 0
+    pending_failed = 0
     for document in nonready:
         if document.ingestion_status == "staged":
             document.ingestion_status = "failed"
             document.failure_code = "reconciled_incomplete"
             staged_count += 1
+            # Terminalize any still-pending extraction rows for this document.
+            for chunk in document.chunks:
+                for extraction in chunk.graph_extractions:
+                    if extraction.status == "pending":
+                        extraction.status = "failed"
+                        extraction.error_code = "reconciled_incomplete"
+                        extraction.error_detail = "aborted by reconciliation"
+                        pending_failed += 1
     session.commit()
 
     ready_chunks = (
@@ -79,5 +93,6 @@ async def reconcile_ingestion(
         "nonready_vectors_deleted": deleted_nonready,
         "orphan_vectors_deleted": deleted_orphans,
         "staged_documents_failed": staged_count,
+        "pending_extractions_failed": pending_failed,
         "ready_chunks_upserted": repaired,
     }

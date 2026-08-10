@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rag-pipeline.local/phase10-independent-gate-v1.schema.json",
+  "title": "Phase 10 independent gate approval (phase10-independent-gate-v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "gate_id",
+    "owner",
+    "verdict",
+    "current_plan_sha256",
+    "source_manifest_sha256",
+    "branch",
+    "commit",
+    "dirty",
+    "api_image_id",
+    "migrate_image_id",
+    "command_ledger",
+    "blockers",
+    "utc_timestamp",
+    "markdown_sha256"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "phase10-independent-gate-v1" },
+    "gate_id": {
+      "type": "string",
+      "enum": ["phase10a", "phase10b", "phase10c", "phase10d", "documentation", "final"]
+    },
+    "owner": { "type": "string", "minLength": 1 },
+    "verdict": { "type": "string", "enum": ["APPROVED", "NOT APPROVED"] },
+    "current_plan_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "source_manifest_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "branch": { "type": "string" },
+    "commit": { "type": "string" },
+    "dirty": { "type": "boolean" },
+    "api_image_id": { "type": "string", "minLength": 1 },
+    "migrate_image_id": { "type": "string", "minLength": 1 },
+    "command_ledger": {
+      "type": "object",
+      "required": ["steps"],
+      "properties": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["ordinal", "argv", "exit_code"],
+            "properties": {
+              "ordinal": { "type": "integer", "minimum": 0 },
+              "argv": { "type": "array", "items": { "type": "string" } },
+              "exit_code": { "type": "integer" },
+              "stdout_sha256": { "type": "string" },
+              "stderr_sha256": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "message"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["PASS", "WARN", "FAIL"] },
+          "message": { "type": "string" }
+        }
+      }
+    },
+    "utc_timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    },
+    "markdown_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  },
+  "allOf": [
+    {
+      "description": "An APPROVED verdict must have zero FAIL blockers.",
+      "if": { "properties": { "verdict": { "const": "APPROVED" } }, "required": ["verdict"] },
+      "then": {
+        "properties": {
+          "blockers": {
+            "items": {
+              "not": { "properties": { "severity": { "const": "FAIL" } }, "required": ["severity"] }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

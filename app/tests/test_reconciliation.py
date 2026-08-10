@@ -91,6 +91,7 @@ async def test_reconciliation_hides_nonready_and_idempotently_repairs_ready_vect
         "nonready_vectors_deleted": 2,
         "orphan_vectors_deleted": 2,
         "staged_documents_failed": 1,
+        "pending_extractions_failed": 0,
         "ready_chunks_upserted": 1,
     }
     assert second["staged_documents_failed"] == 0
