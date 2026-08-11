@@ -23,7 +23,7 @@ from app.persistence import models
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
 BASELINE_REVISION = "dee48bc24a7f"
-REVISION = "a6e2c4f8b1d9"
+REVISION = "b7f3d5a9c2e1"
 HEAD_TABLES = {
     "alembic_version",
     "chunks",
@@ -142,6 +142,7 @@ def test_baseline_creates_exact_schema_on_empty_db(tmp_path):
         "start_offset": ("INTEGER", False, 0),
         "end_offset": ("INTEGER", False, 0),
         "vector_id": ("VARCHAR(255)", True, 0),
+        "media_type": ("VARCHAR(100)", False, 0),
     }
     assert {
         name: (str(column["type"]), column["nullable"], column["primary_key"])

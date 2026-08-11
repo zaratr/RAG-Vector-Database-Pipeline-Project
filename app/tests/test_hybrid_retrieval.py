@@ -128,7 +128,9 @@ async def test_hybrid_rrf_deduplicates_chunk_and_preserves_native_score_and_path
     assert merged["metadata"]["title"] == "Graph doc"
     assert merged["score"] == 0.1
     assert merged["metadata"]["retrieval_sources"] == ["vector", "graph"]
-    assert merged["metadata"]["graph_paths"][0]["predicate"] == "purchases"
+    # 10A.6: graph_paths is a list of complete GraphPath objects; the predicate
+    # is on the first step of the path.
+    assert merged["metadata"]["graph_paths"][0]["steps"][0]["predicate"] == "purchases"
     assert merged["metadata"]["hybrid_score"] > vector_only["metadata"]["hybrid_score"]
     session.close()
     engine.dispose()
@@ -151,7 +153,7 @@ async def test_graph_only_mode_does_not_embed_or_query_vector_store():
 
     assert len(contexts) == 1
     assert contexts[0]["metadata"]["retrieval_sources"] == ["graph"]
-    assert contexts[0]["metadata"]["graph_paths"][0]["predicate"] == "purchases"
+    assert contexts[0]["metadata"]["graph_paths"][0]["steps"][0]["predicate"] == "purchases"
     assert embedding.calls == []
     assert vector.calls == []
     session.close()

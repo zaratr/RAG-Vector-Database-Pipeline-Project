@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     graph_extraction_enabled: bool = Field(default=True)
     graph_extraction_model: Optional[str] = Field(default=None)
     graph_max_hops: int = Field(default=2, ge=1, le=3)
+    # 10A.3 extraction lease duration (seconds). Default 600 (10 min); 60–3600.
+    extraction_lease_seconds: int = Field(default=600, ge=60, le=3600)
 
     openai_api_key: Optional[str] = Field(default=None)
     chroma_host: Optional[str] = Field(default=None)

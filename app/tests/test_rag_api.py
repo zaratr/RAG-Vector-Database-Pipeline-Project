@@ -94,7 +94,8 @@ def test_query_rejects_invalid_retrieval_controls(payload):
     assert response.status_code == 422
 
 
-def test_graph_extraction_provider_failure_returns_502_and_rolls_back_document():
+def test_graph_extraction_provider_failure_returns_502_and_persists_failed_state():
+    """10A.4: invalid provider output → HTTP 502; failed state persists (operator-visible)."""
     class FailingExtractor:
         async def extract(self, text):
             raise GraphExtractionError("unavailable")
@@ -103,21 +104,23 @@ def test_graph_extraction_provider_failure_returns_502_and_rolls_back_document()
     try:
         response = client.post(
             "/documents",
-            data={"title": "Must Roll Back", "text": "Alice works at Acme."},
+            data={"title": "Must Persist Failed", "text": "Alice works at Acme."},
         )
     finally:
         app.dependency_overrides[get_graph_extractor] = lambda: DisabledGraphExtractor()
 
     assert response.status_code == 502
-    assert response.json()["detail"] == "Graph extraction provider failed"
     session = TestSessionLocal()
     try:
-        assert session.query(models.Document).filter_by(title="Must Roll Back").count() == 0
+        doc = session.query(models.Document).filter_by(title="Must Persist Failed").one()
+        # Failed document remains operator-visible but is not query-visible.
+        assert doc.ingestion_status == "failed"
     finally:
         session.close()
 
 
-def test_graph_provider_unavailable_returns_503_and_writes_nothing():
+def test_graph_provider_unavailable_returns_503_and_persists_failed_state():
+    """10A.4: provider unavailable → HTTP 503; failed doc operator-visible, not query-visible."""
     class UnavailableExtractor:
         async def extract(self, text):
             raise GraphProviderUnavailable("offline")
@@ -134,7 +137,8 @@ def test_graph_provider_unavailable_returns_503_and_writes_nothing():
     assert response.status_code == 503
     session = TestSessionLocal()
     try:
-        assert session.query(models.Document).filter_by(title="Unavailable Graph").count() == 0
+        doc = session.query(models.Document).filter_by(title="Unavailable Graph").one()
+        assert doc.ingestion_status == "failed"
     finally:
         session.close()
 

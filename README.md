@@ -13,6 +13,11 @@ The supported runtime uses:
 
 ## How It Works
 
+![Ingestion Flow](public/Diagram_GraphRag%20(2).png)
+![Extraction Lifecycle](public/Diagram_GraphRag%20(1).png)
+![Document LIfecycle](public/Diagram_GraphRag%20(3).png)
+
+
 ```text
 Text / Markdown / PDF
         │
@@ -230,7 +235,7 @@ Reconciliation treats ready SQL chunks as authoritative. It:
 docker compose exec api python src/graph_rag.py "Aria" --hops 3 --limit 10
 ```
 
-This command traverses persisted relational evidence. It is not the former mock-triplet NetworkX spike.
+It is mock-triplet NetworkX.
 
 ### 8. Run tests
 
@@ -380,26 +385,3 @@ All application settings use the `RAG_` prefix and load from `.env`.
 ├── requirements.txt
 └── README.md
 ```
-
-## Validation Status
-
-### GraphRag Multi-hop
-
-The demonstrated:
-
-- Real structured Gemma extraction against Ollama
-- Successful-empty versus failed extraction semantics
-- Grounded relationship evidence and exact offsets
-- Typed entity canonicalization and alias convergence
-- Durable normalized graph provenance
-- Fresh, legacy, versioned, downgrade, and re-upgrade migrations
-- Database-enforced document lifecycle states
-- Recoverable staged SQL/Chroma ingestion
-- Full-collection orphan-vector reconciliation and idempotency
-- Ready-only vector and graph visibility
-- Chroma result-ID validation and SQL-authoritative provenance
-- Cycle-safe directional multi-hop traversal
-- Deterministic vector/graph fusion and chunk deduplication
-- Persistence across API and Chroma container replacement
-- Immutable-image and forbidden-artifact checks
-

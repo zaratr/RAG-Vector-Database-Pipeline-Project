@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import routes_documents, routes_query
+from app.api import routes_documents, routes_graph, routes_query
 from app.config import get_settings
 from app.core.logging import logger
 
@@ -22,6 +22,7 @@ app.add_middleware(
 
 app.include_router(routes_documents.router)
 app.include_router(routes_query.router)
+app.include_router(routes_graph.router)
 
 
 @app.get("/")

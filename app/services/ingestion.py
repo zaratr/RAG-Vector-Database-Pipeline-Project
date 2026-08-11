@@ -1,4 +1,23 @@
-"""Document ingestion pipeline."""
+"""Document ingestion pipeline.
+
+Phase 10A.4 aligns ingestion with the durable extraction lifecycle. The text
+ingestion state machine is:
+
+1. Normalize/chunk input.
+2. Insert document as ``staged``, chunks with deterministic vector IDs and text
+   media type, and extraction identities as ``pending`` or ``skipped``; commit.
+3. Compute embeddings and run eligible extraction outside the SQL transaction.
+4. Persist ``succeeded``/``empty`` or ``failed`` extraction status.
+5. Upsert deterministic Chroma records.
+6. Set document ``ready`` only after every required vector exists and every
+   eligible extraction is ``succeeded`` or ``empty``.
+7. On any exception, mark document ``failed``; attempt vector deletion for all
+   document vector IDs; preserve the extraction failure audit row; re-raise.
+
+Provider/vector failures leave a truthful, operator-visible (never
+query-visible) failed state. No pending extraction may remain after a handled
+request failure.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,8 +27,26 @@ from app.core.logging import logger
 from app.persistence import graph_repository, models, repositories
 from app.services.chunking import chunk_text
 from app.services.embeddings import EmbeddingProvider, ImageEmbeddingProvider
-from app.services.graph_extraction import GraphExtractor
+from app.services.graph_extraction import (
+    PROMPT_VERSION,
+    SCHEMA_VERSION,
+    GraphExtractionError,
+    GraphExtractor,
+)
 from app.services.vector_store import VectorStore
+
+EXTRACTION_PROVIDER = "ollama"
+FAILED_AFTER_CHUNK = "aborted_after_chunk_failure"
+EMBEDDING_FAILED = "embedding_failed"
+
+
+class VectorIndexIncomplete(RuntimeError):
+    """Raised when required vectors are absent after upsert (compensation trigger).
+
+    Maps to HTTP 503 with the stable public detail ``Vector index unavailable``;
+    distinct from graph-provider failures so the route handler can produce the
+    exact 10A.4 status/detail.
+    """
 
 
 async def ingest_text(
@@ -22,43 +59,101 @@ async def ingest_text(
     vector_store: VectorStore,
     session,
     graph_extractor: GraphExtractor | None = None,
-    graph_extraction_provider: str = "ollama",
+    graph_extraction_provider: str = EXTRACTION_PROVIDER,
     graph_extraction_model: str = "unknown",
 ) -> dict:
-    """Ingest raw text into the system."""
-
+    """Ingest raw text into the system following the 10A.4 state machine."""
     normalized = " ".join(text.split())
     logger.info("Chunking document '%s'", title)
     chunk_payloads = chunk_text(normalized)
     chunk_texts = [chunk["text"] for chunk in chunk_payloads]
 
-    # External work happens before any relational write. Provider failures leave
-    # neither staged rows nor partially indexed vectors.
-    embeddings = await embedding_provider.embed_texts(chunk_texts)
-    extracted_by_chunk = []
-    if graph_extractor is not None:
-        for text_value in chunk_texts:
-            extracted_by_chunk.append(await graph_extractor.extract(text_value))
-    else:
-        extracted_by_chunk = [[] for _ in chunk_texts]
+    # Step 2: staged commit first. Provider/vector failures during external work
+    # leave a truthful staged state rather than vanishing.
+    document = repositories.create_document(session, title=title, source=source, tags=tags)
+    document.ingestion_status = "staged"
+    chunk_models: List[models.Chunk] = repositories.create_chunks(
+        session, document=document, chunks=chunk_payloads
+    )
+    for chunk_model in chunk_models:
+        chunk_model.vector_id = f"chunk:{chunk_model.id}"
+        chunk_model.media_type = "text/plain"
+    session.flush()
+    # Establish extraction identities as pending/skipped before external work.
+    lease_by_index: dict[int, object] = {}
+    for idx, chunk_model in enumerate(chunk_models):
+        if graph_extractor is not None:
+            lease = graph_repository.begin_chunk_extraction(
+                session,
+                chunk=chunk_model,
+                provider=graph_extraction_provider,
+                model=graph_extraction_model,
+                prompt_version=PROMPT_VERSION,
+                schema_version=SCHEMA_VERSION,
+            )
+            lease_by_index[idx] = lease
+        else:
+            lease = graph_repository.skip_chunk_extraction(
+                session,
+                chunk=chunk_model,
+                provider=graph_extraction_provider,
+                model=graph_extraction_model,
+                prompt_version=PROMPT_VERSION,
+                schema_version=SCHEMA_VERSION,
+                reason_code="extraction_disabled",
+            )
+            lease_by_index[idx] = lease
+    session.commit()
 
-    document_id: int | None = None
-    vector_ids: list[str] = []
+    document_id = document.id
+    vector_ids = [chunk.vector_id for chunk in chunk_models]
+    relation_count = 0
+
     try:
-        document = repositories.create_document(
-            session, title=title, source=source, tags=tags
-        )
-        document.ingestion_status = "staged"
-        chunk_models: List[models.Chunk] = repositories.create_chunks(
-            session, document=document, chunks=chunk_payloads
-        )
-        for chunk_model in chunk_models:
-            chunk_model.vector_id = f"chunk:{chunk_model.id}"
-        session.flush()
-        document_id = document.id
-        vector_ids = [chunk.vector_id for chunk in chunk_models]
+        # Step 3: external work (embeddings + extraction) outside the SQL txn.
+        try:
+            embeddings = await embedding_provider.embed_texts(chunk_texts)
+        except Exception as embed_exc:
+            # Embedding failed before/independent of extraction: fail every
+            # pending run so none remains pending.
+            _fail_pending_leases(
+                session, lease_by_index, only_pending=True, code=EMBEDDING_FAILED
+            )
+            session.commit()
+            raise embed_exc
+
+        extracted_by_chunk: list[list] = []
+        for idx, text_value in enumerate(chunk_texts):
+            lease = lease_by_index.get(idx)
+            if graph_extractor is not None and lease is not None and lease.should_call_provider:
+                try:
+                    relations = await graph_extractor.extract(text_value)
+                except Exception as extract_exc:
+                    graph_repository.fail_chunk_extraction(
+                        session,
+                        extraction=lease.extraction,
+                        error_code=type(extract_exc).__name__[:100],
+                        error_detail=str(extract_exc)[:1000],
+                    )
+                    session.commit()
+                    # Remaining pending runs become failed/aborted.
+                    _fail_pending_leases(
+                        session, lease_by_index, only_pending=True, code=FAILED_AFTER_CHUNK
+                    )
+                    session.commit()
+                    raise extract_exc
+                graph_repository.complete_chunk_extraction(
+                    session, extraction=lease.extraction, relations=relations
+                )
+                extracted_by_chunk.append(relations)
+            else:
+                extracted_by_chunk.append([])
+
+        for relations in extracted_by_chunk:
+            relation_count += len(relations)
         session.commit()
 
+        # Step 5: upsert deterministic Chroma records.
         metadata_entries = [chunk.get_chunk_metadata() for chunk in chunk_models]
         await vector_store.upsert_embeddings(
             embeddings,
@@ -67,27 +162,25 @@ async def ingest_text(
             documents=chunk_texts,
         )
 
-        relation_count = 0
-        for chunk_model, relations in zip(chunk_models, extracted_by_chunk):
-            graph_repository.persist_chunk_extraction(
-                session,
-                chunk=chunk_model,
-                relations=relations,
-                provider=graph_extraction_provider,
-                model=graph_extraction_model,
-            )
-            relation_count += len(relations)
+        # Step 6: readiness requires every expected vector to exist.
+        existing_ids = set(await vector_store.list_ids())
+        missing = [vid for vid in vector_ids if vid not in existing_ids]
+        if missing:
+            raise VectorIndexIncomplete(f"vector index missing {len(missing)} required ids")
+
+        # Step 6b: every eligible extraction must be terminal succeeded/empty.
+        terminal = all(
+            lease.extraction.status in ("succeeded", "empty", "skipped")
+            for lease in lease_by_index.values()
+        )
+        if not terminal:
+            raise VectorIndexIncomplete("extraction left non-terminal runs")
+
         document.ingestion_status = "ready"
         document.failure_code = None
         session.commit()
     except Exception as exc:
-        session.rollback()
-        if document_id is not None:
-            failed_document = session.get(models.Document, document_id)
-            if failed_document is not None:
-                failed_document.ingestion_status = "failed"
-                failed_document.failure_code = type(exc).__name__[:100]
-                session.commit()
+        await _handle_ingestion_failure(session, document_id, vector_ids, vector_store, exc)
         raise
 
     logger.info("Ingested document %s with %s chunks", document_id, len(chunk_models))
@@ -96,6 +189,40 @@ async def ingest_text(
         "chunks": len(chunk_models),
         "relations": relation_count,
     }
+
+
+def _fail_pending_leases(
+    session, lease_by_index: dict[int, object], *, only_pending: bool, code: str
+) -> None:
+    """Transition every still-pending leased extraction to failed."""
+    for lease in lease_by_index.values():
+        extraction = lease.extraction
+        if extraction.status == "pending":
+            graph_repository.fail_chunk_extraction(
+                session,
+                extraction=extraction,
+                error_code=code,
+                error_detail="aborted during ingestion",
+            )
+
+
+async def _handle_ingestion_failure(
+    session, document_id: int, vector_ids: list[str], vector_store: VectorStore, exc: Exception
+) -> None:
+    """Mark the document failed, attempt vector cleanup, preserve audit rows."""
+    try:
+        failed_document = session.get(models.Document, document_id)
+        if failed_document is not None:
+            failed_document.ingestion_status = "failed"
+            failed_document.failure_code = type(exc).__name__[:100]
+        session.commit()
+    except Exception:  # pragma: no cover - best-effort failure marking
+        session.rollback()
+    # Attempt vector deletion for all document vector IDs (compensation).
+    try:
+        await vector_store.delete(vector_ids)
+    except Exception:  # pragma: no cover - compensation best-effort
+        logger.warning("compensation vector delete failed for document %s", document_id)
 
 
 async def ingest_image(
@@ -108,61 +235,68 @@ async def ingest_image(
     embedding_provider: ImageEmbeddingProvider,
     vector_store: VectorStore,
     session,
+    graph_extraction_provider: str = EXTRACTION_PROVIDER,
+    graph_extraction_model: str = "unknown",
 ) -> dict:
-    """Ingest an image into the vector store.
+    """Ingest an image: actual image media type, graph extraction skipped.
 
-    The image is embedded and stored as a single vector entry.
-    A placeholder chunk is created in the relational DB for tracking.
+    Never sends placeholder image text to the extraction provider.
     """
     path = Path(image_path)
     logger.info("Embedding image '%s' (%s)", title, media_type)
 
-    embeddings = await embedding_provider.embed_images([path])
-    embedding = embeddings[0]
+    document = repositories.create_document(session, title=title, source=source, tags=tags)
+    document.ingestion_status = "staged"
+    chunk_text_value = f"[image:{media_type}] {path.name}"
+    chunk = repositories.create_chunks(
+        session,
+        document=document,
+        chunks=[
+            {
+                "index": 0,
+                "text": chunk_text_value,
+                "start_offset": 0,
+                "end_offset": len(chunk_text_value),
+            }
+        ],
+    )[0]
+    chunk.vector_id = f"chunk:{chunk.id}"
+    chunk.media_type = media_type
+    # Image ingestion records graph extraction as skipped (unsupported media).
+    skip_lease = graph_repository.skip_chunk_extraction(
+        session,
+        chunk=chunk,
+        provider=graph_extraction_provider,
+        model=graph_extraction_model,
+        prompt_version=PROMPT_VERSION,
+        schema_version=SCHEMA_VERSION,
+        reason_code="unsupported_media_type",
+    )
+    session.flush()
+    document_id = document.id
+    session.commit()
 
-    document_id: int | None = None
+    vector_id = chunk.vector_id
     try:
-        document = repositories.create_document(
-            session, title=title, source=source, tags=tags
-        )
-        document.ingestion_status = "staged"
-        chunk_text_value = f"[image:{media_type}] {path.name}"
-        chunk = repositories.create_chunks(
-            session,
-            document=document,
-            chunks=[
-                {
-                    "index": 0,
-                    "text": chunk_text_value,
-                    "start_offset": 0,
-                    "end_offset": len(chunk_text_value),
-                }
-            ],
-        )[0]
-        chunk.vector_id = f"chunk:{chunk.id}"
-        session.flush()
-        document_id = document.id
-        session.commit()
-
+        embeddings = await embedding_provider.embed_images([path])
+        embedding = embeddings[0]
         metadata = chunk.get_chunk_metadata()
         metadata["media_type"] = media_type
         metadata["image_name"] = path.name
         await vector_store.upsert_embeddings(
             [embedding],
             [metadata],
-            [chunk.vector_id],
+            [vector_id],
             documents=[chunk_text_value],
         )
+        existing_ids = set(await vector_store.list_ids())
+        if vector_id not in existing_ids:
+            raise VectorIndexIncomplete("vector index missing image vector id")
         document.ingestion_status = "ready"
+        document.failure_code = None
         session.commit()
     except Exception as exc:
-        session.rollback()
-        if document_id is not None:
-            failed_document = session.get(models.Document, document_id)
-            if failed_document is not None:
-                failed_document.ingestion_status = "failed"
-                failed_document.failure_code = type(exc).__name__[:100]
-                session.commit()
+        await _handle_ingestion_failure(session, document_id, [vector_id], vector_store, exc)
         raise
 
     logger.info("Ingested image document %s", document_id)

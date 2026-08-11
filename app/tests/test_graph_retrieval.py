@@ -9,7 +9,13 @@ from app.core.db import Base
 from app.persistence import models
 from app.persistence.graph_repository import persist_chunk_extraction
 from app.services.graph_extraction import ExtractedEntity, ExtractedRelation
-from app.services.graph_retrieval import UnsupportedGraphFilter, retrieve_graph_contexts
+from app.services.graph_retrieval import (
+    GraphTraversalLimitError,
+    UnsupportedGraphFilter,
+    retrieve_graph_contexts,
+    retrieve_graph_paths,
+    resolve_graph_seeds,
+)
 
 
 def _entity(name):
@@ -206,3 +212,155 @@ def test_graph_hops_outside_documented_range_are_rejected(hops):
         retrieve_graph_contexts(session, query="User", max_hops=hops, limit=10)
     session.close()
     engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 10A.5 — directional path traversal (retrieve_graph_paths)
+# ---------------------------------------------------------------------------
+
+
+def test_retrieve_graph_paths_outbound_returns_complete_one_two_three_hop_chains():
+    session, engine, document, chunks = _session_with_chain()
+    try:
+        one_hop = retrieve_graph_paths(
+            session, query="Explain User", max_hops=1,
+            direction="outbound", limit=10)
+        two_hop = retrieve_graph_paths(
+            session, query="Explain User", max_hops=2,
+            direction="outbound", limit=10)
+        three_hop = retrieve_graph_paths(
+            session, query="Explain User", max_hops=3,
+            direction="outbound", limit=10)
+
+        # hop 1: only User->Subscription
+        assert len(one_hop) == 1
+        assert one_hop[0].hop_count == 1
+        assert one_hop[0].seed_entity_id == one_hop[0].steps[0].source_entity_id
+        assert one_hop[0].steps[0].predicate == "purchases"
+        assert one_hop[0].steps[0].source == "User"
+        assert one_hop[0].steps[0].target == "Subscription"
+        assert len(one_hop[0].steps) == 1
+
+        # hop 2: one 2-hop path User->Sub->PremiumAccess
+        assert any(p.hop_count == 2 for p in two_hop)
+        two_step = next(p for p in two_hop if p.hop_count == 2)
+        assert [s.predicate for s in two_step.steps] == ["purchases", "grants"]
+        assert two_step.steps[0].source == "User"
+        assert two_step.steps[1].target == "PremiumAccess"
+        assert two_step.seed_entity_id == two_step.steps[0].source_entity_id
+        assert two_step.terminal_entity_id == two_step.steps[-1].target_entity_id
+
+        # hop 3: User->Sub->PremiumAccess->Dashboard
+        three_step = next(p for p in three_hop if p.hop_count == 3)
+        assert [s.predicate for s in three_step.steps] == [
+            "purchases", "grants", "unlocks"]
+        assert three_step.hop_count == 3
+        first = three_step.steps[0]
+        assert {f for f in ("edge_id", "evidence_id", "source_entity_id", "source",
+                            "source_type", "predicate", "target_entity_id", "target",
+                            "target_type", "chunk_id", "document_id", "evidence",
+                            "confidence", "extraction_id", "extraction_model")
+               }.issubset(first.model_fields.keys())
+        assert first.document_id == document.id
+        assert first.evidence == "User purchases Subscription."
+        assert first.extraction_model == "gemma4:latest"
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_retrieve_graph_paths_path_score_is_min_confidence_over_hop_count():
+    session, engine, document, chunks = _session_with_chain()
+    try:
+        paths = retrieve_graph_paths(session, query="Explain User", max_hops=3,
+                                     direction="outbound", limit=10)
+        for path in paths:
+            min_conf = min(step.confidence for step in path.steps)
+            assert path.score == min_conf / path.hop_count
+        by_hop = {p.hop_count: p.score for p in paths}
+        assert by_hop[1] == 0.9
+        assert by_hop[2] == 0.45
+        assert by_hop[3] == 0.3
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_retrieve_graph_paths_inbound_preserves_stored_edge_orientation():
+    session, engine, document, chunks = _session_with_chain()
+    try:
+        paths = retrieve_graph_paths(session, query="Explain Dashboard",
+                                     max_hops=3, direction="inbound", limit=10)
+        # Inbound from Dashboard follows target->source but preserves orientation.
+        assert len(paths) >= 1
+        first = paths[0]
+        # Stored orientation: PremiumAccess unlocks Dashboard.
+        assert first.steps[0].predicate == "unlocks"
+        assert first.steps[0].source == "PremiumAccess"
+        assert first.steps[0].target == "Dashboard"
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_retrieve_graph_paths_both_direction_traverses_either_way():
+    session, engine, document, chunks = _session_with_chain()
+    try:
+        outbound = retrieve_graph_paths(session, query="Explain User",
+                                        max_hops=1, direction="outbound", limit=10)
+        both = retrieve_graph_paths(session, query="Explain User",
+                                    max_hops=1, direction="both", limit=10)
+        assert len(both) >= len(outbound)
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_retrieve_graph_paths_deterministic_order_across_calls():
+    session, engine, document, chunks = _session_with_chain()
+    try:
+        first = retrieve_graph_paths(session, query="Explain User", max_hops=3,
+                                     direction="outbound", limit=10)
+        second = retrieve_graph_paths(session, query="Explain User", max_hops=3,
+                                      direction="outbound", limit=10)
+        assert [p.model_dump() for p in first] == [p.model_dump() for p in second]
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_retrieve_graph_paths_scalar_document_id_filter():
+    session, engine, document, chunks = _session_with_chain()
+    try:
+        paths = retrieve_graph_paths(session, query="Explain User", max_hops=2,
+                                     direction="outbound", limit=10,
+                                     filters={"document_id": document.id})
+        assert all(s.document_id == document.id for p in paths for s in p.steps)
+        assert retrieve_graph_paths(session, query="Explain User", max_hops=2,
+                                    direction="outbound", limit=10,
+                                    filters={"document_id": 999999}) == []
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_retrieve_graph_paths_unsupported_filter_raises():
+    session, engine, document, chunks = _session_with_chain()
+    try:
+        with pytest.raises(UnsupportedGraphFilter):
+            retrieve_graph_paths(session, query="Explain User", max_hops=2,
+                                 direction="outbound", limit=10,
+                                 filters={"$or": [{"document_id": 1}]})
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_retrieve_graph_paths_no_seeds_returns_empty():
+    session, engine, document, chunks = _session_with_chain()
+    try:
+        assert retrieve_graph_paths(session, query="zzznoentzzz", max_hops=2,
+                                    direction="outbound", limit=10) == []
+    finally:
+        session.close()
+        engine.dispose()
