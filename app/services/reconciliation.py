@@ -1,6 +1,7 @@
 """Repair SQL/Chroma ingestion drift after retries or process crashes."""
 from __future__ import annotations
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.persistence import models
@@ -52,6 +53,7 @@ async def reconcile_ingestion(
                         extraction.status = "failed"
                         extraction.error_code = "reconciled_incomplete"
                         extraction.error_detail = "aborted by reconciliation"
+                        extraction.completed_at = func.now()
                         pending_failed += 1
     session.commit()
 

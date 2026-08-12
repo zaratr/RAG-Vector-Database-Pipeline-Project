@@ -18,6 +18,7 @@ from sqlalchemy.orm import sessionmaker
 from app.core.db import Base
 from app.persistence import models
 from app.persistence.graph_repository import (
+    ExtractionLeaseLost,
     InvalidExtractionTransition,
     begin_chunk_extraction,
     complete_chunk_extraction,
@@ -186,7 +187,7 @@ def test_complete_chunk_extraction_replaces_evidence_atomically():
         prompt_version="graph-v1", schema_version="graph-relations-v1",
     )
     relations = [_valid_relation(chunk.text)]
-    extraction = complete_chunk_extraction(session, extraction=lease.extraction, relations=relations)
+    extraction = complete_chunk_extraction(session, extraction=lease.extraction, relations=relations, expected_attempt_count=lease.lease_attempt_count)
     session.commit()
 
     assert extraction.status == "succeeded"
@@ -206,7 +207,7 @@ def test_complete_on_empty_relations_sets_status_empty():
         session, chunk=chunk, provider="ollama", model="gemma4:latest",
         prompt_version="graph-v1", schema_version="graph-relations-v1",
     )
-    extraction = complete_chunk_extraction(session, extraction=lease.extraction, relations=[])
+    extraction = complete_chunk_extraction(session, extraction=lease.extraction, relations=[], expected_attempt_count=lease.lease_attempt_count)
     session.commit()
 
     assert extraction.status == "empty"
@@ -225,11 +226,11 @@ def test_complete_on_already_succeeded_raises_invalid_extraction_transition():
         session, chunk=chunk, provider="ollama", model="gemma4:latest",
         prompt_version="graph-v1", schema_version="graph-relations-v1",
     )
-    complete_chunk_extraction(session, extraction=lease.extraction, relations=[_valid_relation(chunk.text)])
+    complete_chunk_extraction(session, extraction=lease.extraction, relations=[_valid_relation(chunk.text)], expected_attempt_count=lease.lease_attempt_count)
     session.commit()
 
     with pytest.raises(InvalidExtractionTransition):
-        complete_chunk_extraction(session, extraction=lease.extraction, relations=[_valid_relation(chunk.text)])
+        complete_chunk_extraction(session, extraction=lease.extraction, relations=[_valid_relation(chunk.text)], expected_attempt_count=lease.lease_attempt_count)
 
     session.close()
     engine.dispose()
@@ -243,11 +244,11 @@ def test_complete_on_already_empty_raises_invalid_extraction_transition():
         session, chunk=chunk, provider="ollama", model="gemma4:latest",
         prompt_version="graph-v1", schema_version="graph-relations-v1",
     )
-    complete_chunk_extraction(session, extraction=lease.extraction, relations=[])
+    complete_chunk_extraction(session, extraction=lease.extraction, relations=[], expected_attempt_count=lease.lease_attempt_count)
     session.commit()
 
     with pytest.raises(InvalidExtractionTransition):
-        complete_chunk_extraction(session, extraction=lease.extraction, relations=[])
+        complete_chunk_extraction(session, extraction=lease.extraction, relations=[], expected_attempt_count=lease.lease_attempt_count)
 
     session.close()
     engine.dispose()
@@ -261,13 +262,14 @@ def test_fail_on_succeeded_raises_invalid_extraction_transition():
         session, chunk=chunk, provider="ollama", model="gemma4:latest",
         prompt_version="graph-v1", schema_version="graph-relations-v1",
     )
-    complete_chunk_extraction(session, extraction=lease.extraction, relations=[_valid_relation(chunk.text)])
+    complete_chunk_extraction(session, extraction=lease.extraction, relations=[_valid_relation(chunk.text)], expected_attempt_count=lease.lease_attempt_count)
     session.commit()
 
     with pytest.raises(InvalidExtractionTransition):
         fail_chunk_extraction(
             session, extraction=lease.extraction,
             error_code="some_error", error_detail="detail",
+            expected_attempt_count=lease.lease_attempt_count,
         )
 
     session.close()
@@ -286,7 +288,8 @@ def test_fail_chunk_extraction_stores_bounded_error_code_and_sanitized_detail():
         session, extraction=lease.extraction,
         error_code="provider_timeout",
         error_detail="Ollama timed out after 120s",
-    )
+            expected_attempt_count=lease.lease_attempt_count,
+        )
     session.commit()
 
     assert extraction.status == "failed"
@@ -310,7 +313,8 @@ def test_fail_truncates_error_detail_to_1000_characters():
     extraction = fail_chunk_extraction(
         session, extraction=lease.extraction,
         error_code="error", error_detail=long_detail,
-    )
+            expected_attempt_count=lease.lease_attempt_count,
+        )
     session.commit()
 
     assert len(extraction.error_detail) <= 1000
@@ -330,7 +334,8 @@ def test_failed_and_skipped_runs_have_no_mentions_or_evidence():
     fail_chunk_extraction(
         session, extraction=lease.extraction,
         error_code="test", error_detail="detail",
-    )
+            expected_attempt_count=lease.lease_attempt_count,
+        )
     session.commit()
     assert session.query(models.EntityMention).filter_by(
         extraction_id=lease.extraction.id
@@ -362,7 +367,7 @@ def test_successful_empty_differs_from_failed_and_skipped():
         session, chunk=chunk, provider="ollama", model="gemma4:latest",
         prompt_version="graph-v1", schema_version="graph-relations-v1",
     )
-    empty_ext = complete_chunk_extraction(session, extraction=lease.extraction, relations=[])
+    empty_ext = complete_chunk_extraction(session, extraction=lease.extraction, relations=[], expected_attempt_count=lease.lease_attempt_count)
     assert empty_ext.status == "empty"
 
     _, chunk2 = _document_chunk(session, text="Second chunk text.")
@@ -373,7 +378,8 @@ def test_successful_empty_differs_from_failed_and_skipped():
     failed_ext = fail_chunk_extraction(
         session, extraction=lease2.extraction,
         error_code="err", error_detail="d",
-    )
+            expected_attempt_count=lease2.lease_attempt_count,
+        )
     assert failed_ext.status == "failed"
 
     _, chunk3 = _document_chunk(session, text="Third chunk text.")
@@ -424,7 +430,8 @@ def test_begin_on_failed_without_retry_returns_failed_without_provider_call():
     fail_chunk_extraction(
         session, extraction=lease.extraction,
         error_code="err", error_detail="d",
-    )
+            expected_attempt_count=lease.lease_attempt_count,
+        )
     session.commit()
 
     lease2 = begin_chunk_extraction(
@@ -451,7 +458,8 @@ def test_begin_on_failed_with_retry_resets_to_pending_and_increments_attempt():
     fail_chunk_extraction(
         session, extraction=lease.extraction,
         error_code="err", error_detail="d",
-    )
+            expected_attempt_count=lease.lease_attempt_count,
+        )
     session.commit()
 
     lease2 = begin_chunk_extraction(
@@ -480,7 +488,8 @@ def test_begin_on_succeeded_returns_terminal_without_provider_call():
     complete_chunk_extraction(
         session, extraction=lease.extraction,
         relations=[_valid_relation(chunk.text)],
-    )
+            expected_attempt_count=lease.lease_attempt_count,
+        )
     session.commit()
 
     lease2 = begin_chunk_extraction(
@@ -764,7 +773,8 @@ def test_lifecycle_check_succeeded_has_completed_at_and_null_errors():
     complete_chunk_extraction(
         session, extraction=lease.extraction,
         relations=[_valid_relation(chunk.text)],
-    )
+            expected_attempt_count=lease.lease_attempt_count,
+        )
     session.commit()
 
     ext = session.query(models.GraphExtraction).one()
@@ -789,7 +799,8 @@ def test_lifecycle_check_failed_has_completed_at_and_non_null_error_code():
     fail_chunk_extraction(
         session, extraction=lease.extraction,
         error_code="test_error", error_detail="detail",
-    )
+            expected_attempt_count=lease.lease_attempt_count,
+        )
     session.commit()
 
     ext = session.query(models.GraphExtraction).one()
@@ -816,6 +827,109 @@ def test_persist_chunk_extraction_convenience_helper_round_trips():
     assert extraction.status == "succeeded"
     assert session.query(models.GraphEdgeEvidence).count() == 1
     assert session.query(models.GraphExtraction).count() == 1
+
+    session.close()
+    engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# CONC-1: Stale-owner fencing tests (expected_attempt_count compare-and-swap)
+# ---------------------------------------------------------------------------
+
+
+def test_complete_by_stale_owner_after_reclaim_raises_lease_lost():
+    """A worker whose lease was reclaimed cannot complete."""
+    session, engine = _session()
+    _, chunk = _document_chunk(session)
+
+    clock_start = _frozen_clock(offset_seconds=0)
+    lease_a = begin_chunk_extraction(
+        session, chunk=chunk, provider="ollama", model="gemma4:latest",
+        prompt_version="graph-v1", schema_version="graph-relations-v1",
+        now_utc=clock_start,
+    )
+    stale_attempt_count = lease_a.lease_attempt_count
+    session.commit()
+
+    # Worker B reclaims after lease expiry.
+    clock_expired = _frozen_clock(offset_seconds=601)
+    begin_chunk_extraction(
+        session, chunk=chunk, provider="ollama", model="gemma4:latest",
+        prompt_version="graph-v1", schema_version="graph-relations-v1",
+        retry_failed=True, now_utc=clock_expired,
+    )
+    session.commit()
+
+    # Worker A tries to complete with its stale attempt_count.
+    with pytest.raises(ExtractionLeaseLost):
+        complete_chunk_extraction(
+            session, extraction=lease_a.extraction,
+            relations=[_valid_relation(chunk.text)],
+            expected_attempt_count=stale_attempt_count,
+        )
+    session.rollback()
+
+    # Worker B's attempt is still pending; A did not overwrite it.
+    ext = session.query(models.GraphExtraction).one()
+    assert ext.status == "pending"
+    assert ext.attempt_count == stale_attempt_count + 1
+
+    session.close()
+    engine.dispose()
+
+
+def test_fail_by_stale_owner_after_reclaim_raises_lease_lost():
+    """Stale owner cannot fail after reclaim either."""
+    session, engine = _session()
+    _, chunk = _document_chunk(session)
+
+    clock_start = _frozen_clock(offset_seconds=0)
+    lease_a = begin_chunk_extraction(
+        session, chunk=chunk, provider="ollama", model="gemma4:latest",
+        prompt_version="graph-v1", schema_version="graph-relations-v1",
+        now_utc=clock_start,
+    )
+    stale_attempt_count = lease_a.lease_attempt_count
+    session.commit()
+
+    clock_expired = _frozen_clock(offset_seconds=601)
+    begin_chunk_extraction(
+        session, chunk=chunk, provider="ollama", model="gemma4:latest",
+        prompt_version="graph-v1", schema_version="graph-relations-v1",
+        retry_failed=True, now_utc=clock_expired,
+    )
+    session.commit()
+
+    with pytest.raises(ExtractionLeaseLost):
+        fail_chunk_extraction(
+            session, extraction=lease_a.extraction,
+            error_code="stale_error", error_detail="stale",
+            expected_attempt_count=stale_attempt_count,
+        )
+    session.rollback()
+
+    session.close()
+    engine.dispose()
+
+
+def test_complete_with_matching_attempt_count_succeeds():
+    """Sanity: complete with the correct expected_attempt_count succeeds."""
+    session, engine = _session()
+    _, chunk = _document_chunk(session)
+
+    lease = begin_chunk_extraction(
+        session, chunk=chunk, provider="ollama", model="gemma4:latest",
+        prompt_version="graph-v1", schema_version="graph-relations-v1",
+    )
+    extraction = complete_chunk_extraction(
+        session, extraction=lease.extraction,
+        relations=[_valid_relation(chunk.text)],
+        expected_attempt_count=lease.lease_attempt_count,
+    )
+    session.commit()
+
+    assert extraction.status == "succeeded"
+    assert extraction.completed_at is not None
 
     session.close()
     engine.dispose()

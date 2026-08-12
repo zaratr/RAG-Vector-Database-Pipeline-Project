@@ -249,3 +249,171 @@ async def test_backfill_empty_relations_counted_as_empty_not_succeeded():
     assert report.processed == report.succeeded + report.empty + report.failed
     session.close()
     engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# CONC-2: Stale-owner fencing through the backfill path
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_stale_owner_after_reclaim_cannot_complete():
+    """CONC-2: A backfill worker whose lease was reclaimed by another worker
+    cannot overwrite the reclaiming worker's attempt.
+
+    Reproduces: Worker A begins, provider call is slow, lease expires.
+    Worker B reclaims. Worker A attempts to complete with stale attempt_count.
+    Asserts ExtractionLeaseLost is raised; Worker B's attempt survives.
+    """
+    from datetime import datetime, timedelta, timezone
+    from app.persistence.graph_repository import (
+        ExtractionLeaseLost, begin_chunk_extraction,
+        complete_chunk_extraction,
+    )
+
+    engine = create_engine("sqlite:///:memory:")
+
+    @event.listens_for(engine, "connect")
+    def _fk(dbapi_connection, connection_record):
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    document = models.Document(title="Backfill stale", source="unit", ingestion_status="ready")
+    session.add(document); session.flush()
+    text = "Subject describes Object."
+    chunk = models.Chunk(document_id=document.id, index=0, text=text,
+                         start_offset=0, end_offset=len(text),
+                         media_type="text/plain", vector_id=f"chunk:{document.id}:0")
+    session.add(chunk); session.commit()
+
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    clock_start = lambda: base
+    lease_a = begin_chunk_extraction(
+        session, chunk=chunk, provider="ollama", model="gemma4:latest",
+        prompt_version="graph-v1", schema_version="graph-relations-v1",
+        now_utc=clock_start,
+    )
+    stale_attempt = lease_a.lease_attempt_count
+    session.commit()
+
+    clock_expired = lambda: base + timedelta(seconds=601)
+    begin_chunk_extraction(
+        session, chunk=chunk, provider="ollama", model="gemma4:latest",
+        prompt_version="graph-v1", schema_version="graph-relations-v1",
+        retry_failed=True, now_utc=clock_expired,
+    )
+    session.commit()
+
+    with pytest.raises(ExtractionLeaseLost):
+        complete_chunk_extraction(
+            session, extraction=lease_a.extraction,
+            relations=[ExtractedRelation(
+                source=ExtractedEntity(name="Subject", canonical_name="subject", entity_type="concept"),
+                predicate="describes",
+                target=ExtractedEntity(name="Object", canonical_name="object", entity_type="concept"),
+                evidence=text, evidence_start=0, evidence_end=len(text), confidence=0.9,
+            )],
+            expected_attempt_count=stale_attempt,
+        )
+    session.rollback()
+
+    ext = session.query(models.GraphExtraction).one()
+    assert ext.status == "pending"
+    assert ext.attempt_count == stale_attempt + 1
+
+    session.close(); engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# DEFECT-A regression: expired pending lease reclaim via --retry-failed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_expired_pending_lease_is_reclaimed_with_retry_failed():
+    """An expired pending lease + retry_failed → eligible → reclaimed."""
+    from datetime import datetime, timedelta, timezone
+    from app.persistence.graph_repository import begin_chunk_extraction
+
+    engine = create_engine("sqlite:///:memory:")
+
+    @event.listens_for(engine, "connect")
+    def _fk(dbapi_connection, connection_record):
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    document = models.Document(title="Expired lease", source="unit", ingestion_status="ready")
+    session.add(document); session.flush()
+    text = "Subject describes Object."
+    chunk = models.Chunk(document_id=document.id, index=0, text=text,
+                         start_offset=0, end_offset=len(text),
+                         media_type="text/plain", vector_id=f"chunk:{document.id}:0")
+    session.add(chunk); session.commit()
+
+    # Worker A begins at T0, creating a pending lease.
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    begin_chunk_extraction(
+        session, chunk=chunk, provider="ollama", model="gemma4:latest",
+        prompt_version="graph-v1", schema_version="graph-relations-v1",
+        now_utc=lambda: base,
+    )
+    session.commit()
+
+    # Worker B runs backfill with retry_failed AFTER lease expiry (T0+601s).
+    report = await backfill(
+        session, extractor=_StaticExtractor(), provider="ollama", model="gemma4:latest",
+        retry_failed=True,
+    )
+
+    # The expired lease must be reclaimed: processed=1, succeeded=1.
+    assert report.eligible == 1
+    assert report.processed == 1
+    assert report.succeeded == 1
+    assert report.lease_lost == 0
+    assert report.failed == 0
+
+    session.close(); engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_backfill_active_pending_lease_not_reclaimed_without_retry():
+    """An active pending lease without retry_failed → skipped as pending_active."""
+    from datetime import datetime, timezone
+    from app.persistence.graph_repository import begin_chunk_extraction
+
+    engine = create_engine("sqlite:///:memory:")
+
+    @event.listens_for(engine, "connect")
+    def _fk(dbapi_connection, connection_record):
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    document = models.Document(title="Active lease", source="unit", ingestion_status="ready")
+    session.add(document); session.flush()
+    text = "Subject describes Object."
+    chunk = models.Chunk(document_id=document.id, index=0, text=text,
+                         start_offset=0, end_offset=len(text),
+                         media_type="text/plain", vector_id=f"chunk:{document.id}:0")
+    session.add(chunk); session.commit()
+
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    begin_chunk_extraction(
+        session, chunk=chunk, provider="ollama", model="gemma4:latest",
+        prompt_version="graph-v1", schema_version="graph-relations-v1",
+        now_utc=lambda: base,
+    )
+    session.commit()
+
+    # Without retry_failed, the pending lease should be skipped.
+    report = await backfill(
+        session, extractor=_StaticExtractor(), provider="ollama", model="gemma4:latest",
+        retry_failed=False,
+    )
+    assert report.eligible == 0
+    assert report.processed == 0
+    assert report.skipped == 1
+    assert report.skip_reasons == {"pending_active": 1}
+
+    session.close(); engine.dispose()

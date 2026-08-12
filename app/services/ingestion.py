@@ -134,6 +134,7 @@ async def ingest_text(
                         extraction=lease.extraction,
                         error_code=type(extract_exc).__name__[:100],
                         error_detail=str(extract_exc)[:1000],
+                        expected_attempt_count=lease.lease_attempt_count,
                     )
                     session.commit()
                     # Remaining pending runs become failed/aborted.
@@ -143,7 +144,8 @@ async def ingest_text(
                     session.commit()
                     raise extract_exc
                 graph_repository.complete_chunk_extraction(
-                    session, extraction=lease.extraction, relations=relations
+                    session, extraction=lease.extraction, relations=relations,
+                    expected_attempt_count=lease.lease_attempt_count,
                 )
                 extracted_by_chunk.append(relations)
             else:
@@ -203,6 +205,7 @@ def _fail_pending_leases(
                 extraction=extraction,
                 error_code=code,
                 error_detail="aborted during ingestion",
+                expected_attempt_count=lease.lease_attempt_count,
             )
 
 
@@ -301,54 +304,6 @@ async def ingest_image(
 
     logger.info("Ingested image document %s", document_id)
     return {"document_id": document_id, "chunks": 1}
-
-
-async def ingest_image(
-    *,
-    title: str,
-    source: Optional[str],
-    tags: Optional[Sequence[str]],
-    image_path: str | Path,
-    media_type: str,
-    embedding_provider: ImageEmbeddingProvider,
-    vector_store: VectorStore,
-    session,
-) -> dict:
-    """Ingest an image into the vector store.
-
-    The image is embedded and stored as a single vector entry.
-    A placeholder chunk is created in the relational DB for tracking.
-    """
-    path = Path(image_path)
-    logger.info("Embedding image '%s' (%s)", title, media_type)
-
-    embeddings = await embedding_provider.embed_images([path])
-    embedding = embeddings[0]
-
-    # Create a document record for the image
-    document = repositories.create_document(session, title=title, source=source, tags=tags)
-    chunk_text = f"[image:{media_type}] {path.name}"
-    chunk_models: List[models.Chunk] = repositories.create_chunks(
-        session,
-        document=document,
-        chunks=[{"index": 0, "text": chunk_text, "start_offset": 0, "end_offset": 0}],
-    )
-    chunk = chunk_models[0]
-
-    metadata = chunk.get_chunk_metadata()
-    metadata["media_type"] = media_type
-    metadata["image_name"] = path.name
-
-    chunk_id = str(uuid.uuid4())
-    await vector_store.index_embeddings(
-        [embedding],
-        [metadata],
-        [chunk_id],
-        documents=[chunk_text],
-    )
-
-    logger.info("Ingested image document %s", document.id)
-    return {"document_id": document.id, "chunks": 1}
 
 
 def chunks_for_document(chunks: Iterable[models.Chunk]) -> List[dict]:

@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.persistence import models
 from app.persistence.graph_repository import (
+    ExtractionLeaseLost,
     InvalidExtractionTransition,
     begin_chunk_extraction,
     complete_chunk_extraction,
@@ -157,10 +158,12 @@ def classify_chunk(
     if owner.status == "failed" and not retry_failed:
         return ("skipped", "failed_not_retried")
     if owner.status == "pending":
-        # Active pending lease (not expired) is only eligible via retry_failed;
-        # the repository decides lease expiry at begin time.
-        return ("skipped", "pending_active")
-    # failed + retry_failed, or pending + retry_failed: eligible (lease may reclaim).
+        if not retry_failed:
+            return ("skipped", "pending_active")
+        # With retry_failed, defer to begin_chunk_extraction which checks lease
+        # expiry: an expired lease is reclaimed, an active lease retains the hold.
+        return ("eligible", None)
+    # failed + retry_failed: eligible (lease may reclaim).
     return ("eligible", None)
 
 
@@ -234,12 +237,14 @@ async def backfill(
                     extraction=lease.extraction,
                     error_code=type(extract_exc).__name__[:100],
                     error_detail=str(extract_exc)[:1000],
+                    expected_attempt_count=lease.lease_attempt_count,
                 )
                 session.commit()
                 failed += 1
                 continue
             complete_chunk_extraction(
-                session, extraction=lease.extraction, relations=result_relations
+                session, extraction=lease.extraction, relations=result_relations,
+                expected_attempt_count=lease.lease_attempt_count,
             )
             session.commit()
             if result_relations:
@@ -247,8 +252,9 @@ async def backfill(
                 relations += len(result_relations)
             else:
                 empty += 1
-        except InvalidExtractionTransition:
-            # Concurrent winner completed first; this worker loses the lease.
+        except (InvalidExtractionTransition, ExtractionLeaseLost):
+            # Concurrent winner completed first or lease was reclaimed; this
+            # worker loses the lease.
             lease_lost += 1
             session.rollback()
 

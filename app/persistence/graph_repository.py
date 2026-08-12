@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -22,6 +22,7 @@ from app.services.graph_extraction import (
     SCHEMA_VERSION,
     ExtractedEntity,
     ExtractedRelation,
+    GraphExtractionError,
 )
 
 _LEASE_DEFAULT_SECONDS = 600
@@ -29,6 +30,16 @@ _LEASE_DEFAULT_SECONDS = 600
 
 class InvalidExtractionTransition(RuntimeError):
     """Raised when a terminal extraction is mutated or terminalized again."""
+
+
+class ExtractionLeaseLost(GraphExtractionError):
+    """Raised when a stale owner attempts complete/fail after a lease reclaim.
+
+    The caller's ``expected_attempt_count`` no longer matches the row's current
+    ``attempt_count`` because another worker reclaimed the expired lease. The
+    caller must not retry the provider call but may call ``begin`` to obtain a
+    fresh lease.
+    """
 
 
 @dataclass(frozen=True)
@@ -46,6 +57,7 @@ class ExtractionLease:
     extraction: models.GraphExtraction
     identity: ExtractionIdentity
     should_call_provider: bool
+    lease_attempt_count: int
 
 
 def _default_now_utc() -> datetime:
@@ -151,13 +163,15 @@ def begin_chunk_extraction(
         )
         session.add(extraction)
         session.flush()
-        return ExtractionLease(extraction, identity, should_call_provider=True)
+        return ExtractionLease(extraction, identity, should_call_provider=True,
+                               lease_attempt_count=extraction.attempt_count)
 
     status = existing.status
 
     # Terminal successful/empty/skipped: return unchanged.
     if status in ("succeeded", "empty", "skipped"):
-        return ExtractionLease(existing, identity, should_call_provider=False)
+        return ExtractionLease(existing, identity, should_call_provider=False,
+                               lease_attempt_count=existing.attempt_count)
 
     # Pending: never start a second provider call. Only an expired lease plus
     # retry_failed reclaims it.
@@ -168,7 +182,8 @@ def begin_chunk_extraction(
             # Expiry is strictly started < now - lease_seconds; boundary equality
             # (started == now - lease_seconds) retains the lease.
             if now.timestamp() - lease_seconds <= started:
-                return ExtractionLease(existing, identity, should_call_provider=False)
+                return ExtractionLease(existing, identity, should_call_provider=False,
+                                       lease_attempt_count=existing.attempt_count)
             # Expired: reclaim.
             existing.attempt_count = (existing.attempt_count or 0) + 1
             existing.attempt_started_at = now
@@ -176,13 +191,16 @@ def begin_chunk_extraction(
             existing.error_code = None
             existing.error_detail = None
             session.flush()
-            return ExtractionLease(existing, identity, should_call_provider=True)
-        return ExtractionLease(existing, identity, should_call_provider=False)
+            return ExtractionLease(existing, identity, should_call_provider=True,
+                                   lease_attempt_count=existing.attempt_count)
+        return ExtractionLease(existing, identity, should_call_provider=False,
+                               lease_attempt_count=existing.attempt_count)
 
     # Failed: only retry_failed reclaims it.
     if status == "failed":
         if not retry_failed:
-            return ExtractionLease(existing, identity, should_call_provider=False)
+            return ExtractionLease(existing, identity, should_call_provider=False,
+                                   lease_attempt_count=existing.attempt_count)
         existing.status = "pending"
         existing.attempt_count = (existing.attempt_count or 0) + 1
         existing.attempt_started_at = now
@@ -190,18 +208,36 @@ def begin_chunk_extraction(
         existing.error_code = None
         existing.error_detail = None
         session.flush()
-        return ExtractionLease(existing, identity, should_call_provider=True)
+        return ExtractionLease(existing, identity, should_call_provider=True,
+                               lease_attempt_count=existing.attempt_count)
 
     # Defensive: any other status returns unchanged.
-    return ExtractionLease(existing, identity, should_call_provider=False)
+    return ExtractionLease(existing, identity, should_call_provider=False,
+                           lease_attempt_count=existing.attempt_count)
 
 
-def _require_pending(extraction: models.GraphExtraction) -> None:
-    if extraction.status != "pending":
+def _diagnose_update_failure(session: Session, extraction_id: int,
+                             expected_attempt_count: int) -> None:
+    """After a 0-row conditional UPDATE, diagnose whether the row is terminal
+    (InvalidExtractionTransition) or a stale-owner (ExtractionLeaseLost).
+
+    This diagnostic read occurs AFTER the failed atomic UPDATE, so no
+    read-then-write gap exists.
+    """
+    current = session.get(models.GraphExtraction, extraction_id)
+    if current is None:
         raise InvalidExtractionTransition(
-            f"extraction {extraction.id} is terminal ({extraction.status}); "
+            f"extraction {extraction_id} no longer exists"
+        )
+    if current.status != "pending":
+        raise InvalidExtractionTransition(
+            f"extraction {extraction_id} is terminal ({current.status}); "
             "complete/fail require status pending"
         )
+    raise ExtractionLeaseLost(
+        f"extraction {extraction_id} lease lost: expected attempt_count="
+        f"{expected_attempt_count}, actual={current.attempt_count}"
+    )
 
 
 def complete_chunk_extraction(
@@ -209,11 +245,38 @@ def complete_chunk_extraction(
     *,
     extraction: models.GraphExtraction,
     relations: list[ExtractedRelation],
+    expected_attempt_count: int,
     now_utc: Callable[[], datetime] | None = None,
 ) -> models.GraphExtraction:
-    """Atomically transition pending → succeeded/empty and replace evidence."""
-    _require_pending(extraction)
+    """Atomically transition pending → succeeded/empty and replace evidence.
+
+    Uses a conditional UPDATE (compare-and-swap) on ``attempt_count`` to prevent
+    a stale owner from committing after a lease reclaim. If the row's
+    ``attempt_count`` differs from ``expected_attempt_count``, raises
+    ``ExtractionLeaseLost``.
+    """
     now = _normalize_dt((now_utc or _default_now_utc)())
+    new_status = "empty" if not relations else "succeeded"
+
+    result = session.execute(
+        update(models.GraphExtraction)
+        .where(
+            models.GraphExtraction.id == extraction.id,
+            models.GraphExtraction.status == "pending",
+            models.GraphExtraction.attempt_count == expected_attempt_count,
+        )
+        .values(
+            status=new_status,
+            completed_at=now,
+            error_code=None,
+            error_detail=None,
+        )
+    )
+    if result.rowcount == 0:
+        _diagnose_update_failure(session, extraction.id, expected_attempt_count)
+
+    # Refresh the ORM object to reflect the conditional UPDATE.
+    session.refresh(extraction)
 
     # Replace evidence owned by this extraction identity: delete old mentions and
     # evidence created by this extraction, then write the new ones.
@@ -228,10 +291,6 @@ def complete_chunk_extraction(
     for relation in relations:
         _persist_relation(session, extraction=extraction, chunk=chunk, relation=relation)
 
-    extraction.status = "empty" if not relations else "succeeded"
-    extraction.completed_at = now
-    extraction.error_code = None
-    extraction.error_detail = None
     session.flush()
     return extraction
 
@@ -242,18 +301,35 @@ def fail_chunk_extraction(
     extraction: models.GraphExtraction,
     error_code: str,
     error_detail: str,
+    expected_attempt_count: int,
     now_utc: Callable[[], datetime] | None = None,
 ) -> models.GraphExtraction:
-    """Transition pending → failed with a bounded, sanitized error record."""
-    _require_pending(extraction)
+    """Transition pending → failed with a bounded, sanitized error record.
+
+    Uses the same conditional UPDATE (compare-and-swap) fencing as ``complete``.
+    """
     now = _normalize_dt((now_utc or _default_now_utc)())
     bounded_code = (error_code or "")[:100]
     bounded_detail = (error_detail or "")[:1000]
-    extraction.status = "failed"
-    extraction.completed_at = now
-    extraction.error_code = bounded_code
-    extraction.error_detail = bounded_detail
-    session.flush()
+
+    result = session.execute(
+        update(models.GraphExtraction)
+        .where(
+            models.GraphExtraction.id == extraction.id,
+            models.GraphExtraction.status == "pending",
+            models.GraphExtraction.attempt_count == expected_attempt_count,
+        )
+        .values(
+            status="failed",
+            completed_at=now,
+            error_code=bounded_code,
+            error_detail=bounded_detail,
+        )
+    )
+    if result.rowcount == 0:
+        _diagnose_update_failure(session, extraction.id, expected_attempt_count)
+
+    session.refresh(extraction)
     return extraction
 
 
@@ -296,9 +372,11 @@ def skip_chunk_extraction(
         )
         session.add(extraction)
         session.flush()
-        return ExtractionLease(extraction, identity, should_call_provider=False)
+        return ExtractionLease(extraction, identity, should_call_provider=False,
+                               lease_attempt_count=extraction.attempt_count)
     # Identity unchanged: return the existing terminal row unchanged.
-    return ExtractionLease(existing, identity, should_call_provider=False)
+    return ExtractionLease(existing, identity, should_call_provider=False,
+                           lease_attempt_count=existing.attempt_count)
 
 
 # ---------------------------------------------------------------------------
@@ -469,5 +547,6 @@ def persist_chunk_extraction(
     if not lease.should_call_provider:
         return lease.extraction
     return complete_chunk_extraction(
-        session, extraction=lease.extraction, relations=relations
+        session, extraction=lease.extraction, relations=relations,
+        expected_attempt_count=lease.lease_attempt_count,
     )

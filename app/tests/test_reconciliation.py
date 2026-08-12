@@ -109,3 +109,63 @@ async def test_reconciliation_hides_nonready_and_idempotently_repairs_ready_vect
     assert ready_chunk.vector_id == f"chunk:{ready_chunk.id}"
     session.close()
     engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_terminalizes_pending_extractions_with_completed_at():
+    """DEFECT-8 regression: staged doc with pending extraction must be
+    terminalized to failed WITH completed_at set, not crash with NameError."""
+    from app.services.reconciliation import reconcile_ingestion
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+
+    # Create a staged document with a chunk that has a pending extraction.
+    document = models.Document(title="Staged with extraction", ingestion_status="staged")
+    session.add(document)
+    session.flush()
+    chunk = models.Chunk(
+        document_id=document.id,
+        index=0,
+        text="Some text.",
+        start_offset=0,
+        end_offset=10,
+        media_type="text/plain",
+        vector_id=f"chunk:{document.id}:0",
+    )
+    session.add(chunk)
+    session.flush()
+    extraction = models.GraphExtraction(
+        chunk_id=chunk.id,
+        provider="ollama",
+        model="gemma4:latest",
+        prompt_version="graph-v1",
+        schema_version="graph-relations-v1",
+        status="pending",
+        input_sha256="a" * 64,
+        attempt_count=1,
+        is_identity_owner=True,
+    )
+    session.add(extraction)
+    session.commit()
+
+    store = FakeVectorStore()
+    report = await reconcile_ingestion(
+        session=session,
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=store,
+        batch_size=10,
+    )
+
+    # The pending extraction must be terminalized.
+    assert report["pending_extractions_failed"] == 1
+    assert report["staged_documents_failed"] == 1
+
+    # The extraction must be failed WITH completed_at set (lifecycle invariant).
+    session.refresh(extraction)
+    assert extraction.status == "failed"
+    assert extraction.error_code == "reconciled_incomplete"
+    assert extraction.completed_at is not None
+
+    session.close()
