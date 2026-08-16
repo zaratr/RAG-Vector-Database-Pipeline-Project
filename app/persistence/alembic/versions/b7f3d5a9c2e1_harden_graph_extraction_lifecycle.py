@@ -94,24 +94,33 @@ def upgrade() -> None:
             completed_at = created
             attempt_started_at = created
             error_code = None
+            error_detail = None
         elif status == "failed":
             completed_at = created
             attempt_started_at = created
-            error_code = row.error_code if row.error_code else "predecessor_failed"
+            if row.error_code:
+                error_code = row.error_code
+                error_detail = row.error_detail if hasattr(row, 'error_detail') else None
+            else:
+                error_code = "predecessor_failed"
+                error_detail = "unknown pre-b7 failure"
         elif status == "pending":
             completed_at = None
             attempt_started_at = created
             error_code = None
+            error_detail = None
         else:
             # Unknown predecessor status — treat as terminal succeeded defensively.
             completed_at = created
             attempt_started_at = created
             error_code = None
+            error_detail = None
         bind.execute(
             sa.text(
                 "UPDATE graph_extractions SET input_sha256 = :sha, "
                 "attempt_count = 1, completed_at = :comp, "
-                "attempt_started_at = :started, error_code = :ec "
+                "attempt_started_at = :started, error_code = :ec, "
+                "error_detail = :ed "
                 "WHERE id = :gid"
             ),
             {
@@ -119,6 +128,7 @@ def upgrade() -> None:
                 "comp": completed_at,
                 "started": attempt_started_at,
                 "ec": error_code,
+                "ed": error_detail,
                 "gid": row.ge_id,
             },
         )

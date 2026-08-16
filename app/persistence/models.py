@@ -28,6 +28,14 @@ class Document(Base):
             "ingestion_status IN ('staged', 'ready', 'failed')",
             name="ck_documents_ingestion_status",
         ),
+        CheckConstraint(
+            "trust_tier IN ('trusted', 'standard', 'untrusted', 'blocked')",
+            name="ck_documents_trust_tier",
+        ),
+        CheckConstraint(
+            "trust_score >= 0 AND trust_score <= 1",
+            name="ck_documents_trust_score",
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -38,6 +46,17 @@ class Document(Base):
         String(20), nullable=False, default="ready", server_default="ready", index=True
     )
     failure_code = Column(String(100), nullable=True)
+    # 10B.2 server-assigned provenance fields.
+    trust_tier = Column(
+        String(20), nullable=False, default="untrusted", server_default="untrusted", index=True
+    )
+    trust_score = Column(Float, nullable=False, default=0.0, server_default="0")
+    trust_policy_version = Column(
+        String(50), nullable=False, default="unassigned", server_default="unassigned", index=True
+    )
+    ingestion_origin = Column(
+        String(50), nullable=False, default="api", server_default="api"
+    )
 
     chunks = relationship("Chunk", back_populates="document", cascade="all, delete-orphan")
 
@@ -71,6 +90,10 @@ class Chunk(Base):
         }
         if self.document and self.document.title:
             meta["title"] = self.document.title
+        if self.document and self.document.source:
+            # 10B.3: per-source caps need the authoritative source in the
+            # vector metadata; without it every context shares "unknown".
+            meta["source"] = self.document.source
         if self.document and self.document.tags:
             tags = [t.strip() for t in self.document.tags.split(",") if t.strip()]
             if tags:
@@ -260,3 +283,104 @@ class GraphEdgeEvidence(Base):
 
     edge = relationship("GraphEdge", back_populates="evidence")
     extraction = relationship("GraphExtraction", back_populates="edge_evidence")
+
+
+class RetrievalAudit(Base):
+    """End-to-end /query lifecycle audit (10B.2)."""
+    __tablename__ = "retrieval_audits"
+    __table_args__ = (
+        CheckConstraint(
+            "retrieval_mode IN ('vector', 'graph', 'hybrid')",
+            name="ck_retrieval_audits_mode",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'completed', 'failed')",
+            name="ck_retrieval_audits_status",
+        ),
+        CheckConstraint(
+            "candidate_count >= 0 AND selected_count >= 0 AND rejected_count >= 0",
+            name="ck_retrieval_audits_counts_nonneg",
+        ),
+        CheckConstraint(
+            "candidate_count = selected_count + rejected_count",
+            name="ck_retrieval_audits_counter_equality",
+        ),
+        # Lifecycle: pending has no completion/failure; completed has completion/no failure;
+        # failed has completion and failure code.
+        CheckConstraint(
+            "(status = 'pending' AND completed_at IS NULL AND failure_code IS NULL) "
+            "OR (status = 'completed' AND completed_at IS NOT NULL AND failure_code IS NULL) "
+            "OR (status = 'failed' AND completed_at IS NOT NULL AND failure_code IS NOT NULL)",
+            name="ck_retrieval_audits_lifecycle",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True)
+    query_sha256 = Column(String(64), nullable=False)
+    retrieval_mode = Column(String(10), nullable=False)
+    status = Column(String(20), nullable=False)
+    provenance_policy_version = Column(String(50), nullable=False)
+    retrieval_policy_version = Column(String(50), nullable=False)
+    context_policy_version = Column(String(50), nullable=False)
+    candidate_count = Column(Integer, nullable=False, default=0, server_default="0")
+    selected_count = Column(Integer, nullable=False, default=0, server_default="0")
+    rejected_count = Column(Integer, nullable=False, default=0, server_default="0")
+    failure_code = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    decisions = relationship(
+        "RetrievalCandidateDecision", back_populates="audit", cascade="all, delete-orphan"
+    )
+
+
+class RetrievalCandidateDecision(Base):
+    """Durable evidence snapshot for a retrieval candidate (10B.2)."""
+    __tablename__ = "retrieval_candidate_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "audit_id", "chunk_id_snapshot", name="uq_candidate_decisions_audit_chunk"
+        ),
+        CheckConstraint(
+            "provenance_score >= 0 AND provenance_score <= 1",
+            name="ck_candidate_decisions_provenance_score",
+        ),
+        Index("ix_candidate_decisions_audit_decision", "audit_id", "decision"),
+        Index("ix_candidate_decisions_live_doc", "document_id"),
+        Index("ix_candidate_decisions_live_chunk", "chunk_id"),
+        Index("ix_candidate_decisions_snapshot_doc", "document_id_snapshot"),
+        Index("ix_candidate_decisions_snapshot_chunk", "chunk_id_snapshot"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    audit_id = Column(
+        String(36), ForeignKey("retrieval_audits.id", ondelete="CASCADE"), nullable=False
+    )
+    document_id = Column(
+        Integer, ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
+    )
+    chunk_id = Column(
+        Integer, ForeignKey("chunks.id", ondelete="SET NULL"), nullable=True
+    )
+    document_id_snapshot = Column(Integer, nullable=False)
+    chunk_id_snapshot = Column(Integer, nullable=False)
+    decision = Column(String(50), nullable=False)
+    native_score = Column(Float, nullable=True)
+    provenance_score = Column(Float, nullable=False)
+    reason_codes = Column(Text, nullable=False)
+    content_sha256 = Column(String(64), nullable=False)
+    bounded_excerpt = Column(String(200), nullable=True)
+
+    audit = relationship("RetrievalAudit", back_populates="decisions")
+
+
+class IngestionRateBucket(Base):
+    """Fixed-window ingestion rate limiter (10B.2/10B.3)."""
+    __tablename__ = "ingestion_rate_buckets"
+    __table_args__ = (
+        CheckConstraint("request_count > 0", name="ck_ingestion_rate_buckets_count"),
+    )
+
+    identity_sha256 = Column(String(64), primary_key=True)
+    window_start_epoch = Column(Integer, primary_key=True)
+    request_count = Column(Integer, nullable=False)

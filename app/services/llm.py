@@ -7,14 +7,18 @@ import httpx
 
 
 class LLMClient(Protocol):
-    async def generate_answer(self, query: str, context: List[str]) -> str:
+    async def generate_answer(
+        self, query: str, context: List[str], system_prompt: str | None = None
+    ) -> str:
         ...
 
 
 class DummyLLMClient:
     """Simple LLM that echoes query and context."""
 
-    async def generate_answer(self, query: str, context: List[str]) -> str:
+    async def generate_answer(
+        self, query: str, context: List[str], system_prompt: str | None = None
+    ) -> str:
         context_preview = "\n".join(context)
         return f"Answer to: {query}\nContext:\n{context_preview}"
 
@@ -25,7 +29,9 @@ class OpenAILLMClient:
     def __init__(self, api_key: str | None) -> None:
         self.api_key = api_key
 
-    async def generate_answer(self, query: str, context: List[str]) -> str:
+    async def generate_answer(
+        self, query: str, context: List[str], system_prompt: str | None = None
+    ) -> str:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is required for OpenAILLMClient")
         context_preview = " ".join(context)[:2000]
@@ -33,7 +39,17 @@ class OpenAILLMClient:
 
 class OllamaLLMClient:
     """LLM client using Ollama's OpenAI-compatible API."""
-    
+
+    #: 10B.4: immutable system prompt declaring evidence is untrusted data.
+    DEFAULT_SYSTEM_PROMPT = (
+        "Answer using only the supplied evidence. Combine facts transitively "
+        "when each link in a relationship chain is explicitly supported; for "
+        "example, if A relates to B and B relates to C, explain how A connects "
+        "to C. Do not say a connection is unstated when all of its links appear "
+        "in the evidence. Cite the supporting evidence numbers in the answer. "
+        "If no supported path answers the question, say so."
+    )
+
     def __init__(
         self,
         base_url: str,
@@ -44,7 +60,9 @@ class OllamaLLMClient:
         self.model = model
         self.transport = transport
 
-    async def generate_answer(self, query: str, context: List[str]) -> str:
+    async def generate_answer(
+        self, query: str, context: List[str], system_prompt: str | None = None
+    ) -> str:
         context_text = "\n".join(
             f"Evidence [{index}]: {text}" for index, text in enumerate(context, start=1)
         )
@@ -54,14 +72,7 @@ class OllamaLLMClient:
                 "messages": [
                     {
                         "role": "system",
-                        "content": (
-                            "Answer using only the supplied evidence. Combine facts transitively "
-                            "when each link in a relationship chain is explicitly supported; for "
-                            "example, if A relates to B and B relates to C, explain how A connects "
-                            "to C. Do not say a connection is unstated when all of its links appear "
-                            "in the evidence. Cite the supporting evidence numbers in the answer. "
-                            "If no supported path answers the question, say so."
-                        )
+                        "content": system_prompt or self.DEFAULT_SYSTEM_PROMPT,
                      },
                     {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {query}"
                      },

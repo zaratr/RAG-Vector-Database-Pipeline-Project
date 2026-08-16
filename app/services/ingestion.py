@@ -61,6 +61,10 @@ async def ingest_text(
     graph_extractor: GraphExtractor | None = None,
     graph_extraction_provider: str = EXTRACTION_PROVIDER,
     graph_extraction_model: str = "unknown",
+    trust_tier: str = "untrusted",
+    trust_score: float = 0.0,
+    trust_policy_version: str = "unassigned",
+    ingestion_origin: str = "api",
 ) -> dict:
     """Ingest raw text into the system following the 10A.4 state machine."""
     normalized = " ".join(text.split())
@@ -72,6 +76,11 @@ async def ingest_text(
     # leave a truthful staged state rather than vanishing.
     document = repositories.create_document(session, title=title, source=source, tags=tags)
     document.ingestion_status = "staged"
+    # 10B.2: server-assigned provenance fields.
+    document.trust_tier = trust_tier
+    document.trust_score = trust_score
+    document.trust_policy_version = trust_policy_version
+    document.ingestion_origin = ingestion_origin
     chunk_models: List[models.Chunk] = repositories.create_chunks(
         session, document=document, chunks=chunk_payloads
     )

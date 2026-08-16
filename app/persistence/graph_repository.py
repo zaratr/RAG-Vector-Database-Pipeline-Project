@@ -439,6 +439,10 @@ def _get_or_create_mention(
             end_offset=end,
         )
         session.add(mention)
+        # Sessions run with autoflush=False; flush so a later relation's
+        # dedup query sees this pending mention instead of accumulating a
+        # duplicate that violates the unique constraint at commit time.
+        session.flush()
     return mention
 
 
@@ -516,6 +520,9 @@ def _persist_relation(
                 confidence=relation.confidence,
             )
         )
+        # Same autoflush=False invisibility as mentions (D-29/D-33): flush so
+        # an identical duplicate relation's dedup query sees this row.
+        session.flush()
     elif relation.confidence > existing_evidence.confidence:
         existing_evidence.confidence = relation.confidence
 

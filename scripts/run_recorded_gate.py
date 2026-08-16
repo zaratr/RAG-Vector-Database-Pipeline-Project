@@ -59,12 +59,131 @@ PRIMARY_STEPS: dict[str, list[dict[str, Any]]] = {
     for gate in GATE_IDS
 }
 
+# Typed phase10b sequence exactly as the plan's 10B task gate specifies it.
+# Scoped environment values are applied in-memory (never argv/ledger strings)
+# via the "phase10b_scoped_env" step kind. Steps may carry "stdout_to" to
+# redirect captured stdout into a reports file, standing in for `>` shells.
+PRIMARY_STEPS["phase10b"] = [
+    {"kind": "subprocess", "argv": ["python", "scripts/source_manifest.py",
+     "--output", ".hermes/reports/phase10b-source-manifest.json"],
+     "description": "phase10b source manifest"},
+    {"kind": "subprocess", "argv": ["python", "scripts/snapshot_nonsecret_deployment.py",
+     "--deployment-output", ".hermes/reports/phase10b-base-deployment.json",
+     "--settings-output", ".hermes/reports/phase10b-base-expected-settings.json"],
+     "description": "phase10b base non-secret deployment/settings snapshot"},
+    {"kind": "phase10b_scoped_env",
+     "description": "phase10b in-memory scoped operator/source env (no values recorded)"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "config", "--quiet"],
+     "description": "compose config validation"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "build", "--no-cache", "api", "migrate"],
+     "description": "phase10b labeled build"},
+    {"kind": "subprocess", "argv": ["python", "scripts/create_phase10_source_binding.py",
+     "--manifest", ".hermes/reports/phase10b-source-manifest.json",
+     "--output", ".hermes/reports/phase10b-source-binding.json",
+     "--services", "api", "migrate"],
+     "description": "phase10b source binding"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "up", "-d", "--force-recreate"],
+     "description": "phase10b deploy (operator env)"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python", "-c",
+     "from app.config import get_settings; s=get_settings(); assert s.operator_api_enabled; "
+     "print({'operator_api_enabled':True,'source_trust_policy_path':str(s.source_trust_policy_path)})"],
+     "description": "operator settings assert in container"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "run", "--rm", "migrate"],
+     "description": "migrate one-shot"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api",
+     "python", "-m", "app.core.migrations"],
+     "description": "in-container migrations wrapper"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "-m", "alembic", "-c", "alembic.ini", "current"],
+     "description": "alembic current"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "-m", "alembic", "-c", "alembic.ini", "check"],
+     "description": "alembic check"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/fingerprint_production_state.py", "--json"],
+     "stdout_to": "phase10b-state-before.json",
+     "description": "production state fingerprint (before)"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "-m", "pytest", "-q"],
+     "description": "phase10b full test suite"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/validate_phase10b.py"],
+     "description": "phase10b live validator"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/validate_phase10a.py"],
+     "description": "phase10a regression validator"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/fingerprint_production_state.py", "--json"],
+     "stdout_to": "phase10b-state-after.json",
+     "description": "production state fingerprint (after)"},
+    {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10b-state-before.json",
+     ".hermes/reports/phase10b-state-after.json"],
+     "description": "state equality"},
+    {"kind": "curl_status", "url": "http://127.0.0.1:8000/security/audits/00000000-0000-0000-0000-000000000000",
+     "expected_status": 401, "headers_to": "phase10b-missing-auth-headers.txt",
+     "description": "missing-auth 401"},
+    {"kind": "curl_status", "url": "http://127.0.0.1:8000/security/audits/00000000-0000-0000-0000-000000000000",
+     "expected_status": 401, "headers_to": "phase10b-invalid-auth-headers.txt",
+     "bearer": "invalid-phase10-token",
+     "description": "invalid-auth 401"},
+    {"kind": "file_contains_lower", "path": ".hermes/reports/phase10b-missing-auth-headers.txt",
+     "substrings": ["www-authenticate: bearer"],
+     "description": "missing-auth bearer challenge header"},
+    {"kind": "file_contains_lower", "path": ".hermes/reports/phase10b-invalid-auth-headers.txt",
+     "substrings": ["www-authenticate: bearer"],
+     "description": "invalid-auth bearer challenge header"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "-e", "OPERATOR_BEARER",
+     "api", "python", "scripts/probe_operator_auth.py", "--assert-authorized",
+     "--expected-status", "404", "--assertion-id", "phase10b-operator-valid-auth"],
+     "pass_env": ["OPERATOR_BEARER"],
+     "description": "B-12 valid-auth probe (credential only via env, never argv)"},
+]
+
+# phase10b restoration: destroy the in-memory scoped credential/override, then
+# force-recreate under the exact pre-gate environment and assert health.
 RESTORATION_STEPS: list[dict[str, Any]] = [
     {
         "kind": "subprocess",
         "argv": ["docker", "compose", "up", "-d", "--force-recreate"],
         "description": "restoration base recreation",
     },
+]
+
+PHASE10B_RESTORATION_STEPS: list[dict[str, Any]] = [
+    {"kind": "phase10b_unscoped_env",
+     "description": "destroy in-memory scoped operator/source env"},
+    {
+        "kind": "subprocess",
+        "argv": ["docker", "compose", "up", "-d", "--force-recreate"],
+        "description": "restoration base recreation (default env)",
+    },
+    # The plan places the restored snapshots and their comparisons OUTSIDE the
+    # scoped subshell: they must run after the override is destroyed, or the
+    # scoped keys (e.g. RAG_OPERATOR_API_ENABLED) would leak into the
+    # "restored" snapshot and the base-vs-restored cmp could never hold (D-50).
+    {"kind": "subprocess", "argv": ["python", "scripts/snapshot_nonsecret_deployment.py",
+     "--deployment-output", ".hermes/reports/phase10b-restored-deployment.json",
+     "--settings-output", ".hermes/reports/phase10b-restored-expected-settings.json"],
+     "description": "restored non-secret deployment/settings snapshot (default env)"},
+    {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10b-base-deployment.json",
+     ".hermes/reports/phase10b-restored-deployment.json"],
+     "description": "base/restored deployment equality"},
+    {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10b-base-expected-settings.json",
+     ".hermes/reports/phase10b-restored-expected-settings.json"],
+     "description": "base/restored expected-settings equality"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api",
+     "python", "scripts/snapshot_nonsecret_settings.py"],
+     "stdout_to": "phase10b-restored-running-settings.json",
+     "description": "restored running settings"},
+    {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10b-base-expected-settings.json",
+     ".hermes/reports/phase10b-restored-running-settings.json"],
+     "description": "expected vs running settings equality"},
+    {"kind": "heartbeat", "url": "http://127.0.0.1:8000/",
+     "attempts": 30, "interval_seconds": 2,
+     "description": "api heartbeat (readiness-polled)"},
+    {"kind": "heartbeat", "url": "http://127.0.0.1:8001/api/v2/heartbeat",
+     "attempts": 30, "interval_seconds": 2,
+     "description": "chroma heartbeat (readiness-polled)"},
 ]
 
 _LEDGER_SCHEMA_PATH = Path("app/tests/fixtures/phase10-command-ledger.schema.json")
@@ -117,8 +236,16 @@ def _scan_for_secrets(text: str) -> bool:
 
 
 def _run_step(argv: list[str]) -> tuple[int, str, str, str, str, int, int]:
-    """Run one subprocess step, returning (rc, stdout, stderr, stdout_sha, stderr_sha, out_bytes, err_bytes)."""
-    result = subprocess.run(argv, capture_output=True, text=True)
+    """Run one subprocess step, returning (rc, stdout, stderr, stdout_sha, stderr_sha, out_bytes, err_bytes).
+
+    Host-side python steps always use ``sys.executable``: a bare ``python``
+    resolves through PATH/CreateProcess and may land on a dependency-less
+    interpreter when the runner itself executes inside a virtualenv (D-46).
+    """
+    resolved = list(argv)
+    if resolved and resolved[0] == "python":
+        resolved[0] = sys.executable
+    result = subprocess.run(resolved, capture_output=True, text=True)
     stdout = result.stdout if isinstance(result.stdout, str) else ""
     stderr = result.stderr if isinstance(result.stderr, str) else ""
     rc = result.returncode if isinstance(result.returncode, int) else 0
@@ -135,13 +262,20 @@ def _record_step(
     *,
     phase: str,
 ) -> None:
-    """Append a ledger row with in-memory hashes and a secret-scan result."""
+    """Append a ledger row with in-memory hashes and a secret-scan result.
+
+    Rich step kinds (scoped-env, curl probes, file assertions) record under
+    the closed schema's ``internal`` kind with a symbolic argv; only real
+    subprocesses are recorded as ``subprocess`` (D-45).
+    """
     secret_scan = not (_scan_for_secrets(stdout) or _scan_for_secrets(stderr))
+    step_kind = step.get("kind", "subprocess")
+    ledger_kind = step_kind if step_kind == "subprocess" else "internal"
     row: dict[str, Any] = {
         "ordinal": ordinal,
-        "kind": step.get("kind", "subprocess"),
+        "kind": ledger_kind,
         "phase": phase,
-        "argv": list(step.get("argv", [])),
+        "argv": _step_argv_for_ledger(step),
         "cwd": ".",
         "exit_code": rc,
         "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
@@ -172,6 +306,142 @@ def _write_ledger(reports_dir: Path, gate: str, ledger: list[dict[str, Any]]) ->
     return path
 
 
+_PHASE10B_SCOPED_KEYS = (
+    "RAG_OPERATOR_API_ENABLED", "RAG_OPERATOR_TOKEN", "OPERATOR_BEARER",
+    "SOURCE_REVISION", "SOURCE_CONTEXT_SHA256", "SOURCE_DIRTY",
+)
+
+
+def _phase10b_scoped_env(reports: Path) -> tuple[int, str, str]:
+    """Apply the typed scoped env in-memory only (never argv/ledger strings).
+
+    The operator bearer is a fresh token_urlsafe(32); the SOURCE_* values come
+    from the phase10b source manifest produced earlier in the sequence.
+    """
+    import os
+    import secrets
+
+    manifest_path = reports / "phase10b-source-manifest.json"
+    manifest: dict[str, Any] = {}
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    bearer = secrets.token_urlsafe(32)
+    os.environ["RAG_OPERATOR_API_ENABLED"] = "true"
+    os.environ["RAG_OPERATOR_TOKEN"] = bearer
+    os.environ["OPERATOR_BEARER"] = bearer
+    if manifest.get("commit_sha"):
+        os.environ["SOURCE_REVISION"] = str(manifest["commit_sha"])
+    if manifest.get("image_context_sha256"):
+        os.environ["SOURCE_CONTEXT_SHA256"] = str(manifest["image_context_sha256"])
+    if manifest.get("dirty") is not None:
+        os.environ["SOURCE_DIRTY"] = str(manifest["dirty"]).lower()
+    return 0, "", ""
+
+
+def _phase10b_unscoped_env() -> tuple[int, str, str]:
+    """Destroy the in-memory scoped credential/override (restoration)."""
+    import os
+
+    for key in _PHASE10B_SCOPED_KEYS:
+        os.environ.pop(key, None)
+    return 0, "", ""
+
+
+def _curl_status_step(step: dict[str, Any], reports: Path) -> tuple[int, str, str]:
+    """Fetch a URL, capture headers, and compare the HTTP status code."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(step["url"], method="GET")
+    bearer = step.get("bearer")
+    if bearer:
+        req.add_header("Authorization", f"Bearer {bearer}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = resp.getcode()
+            headers = "".join(f"{k}: {v}" + chr(10) for k, v in resp.headers.items())
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        headers = "".join(f"{k}: {v}" + chr(10) for k, v in exc.headers.items())
+    headers_to = step.get("headers_to")
+    if headers_to:
+        (reports / headers_to).write_text(headers, encoding="utf-8")
+    if status != step["expected_status"]:
+        return 1, "", f"status {status} != expected {step['expected_status']}"
+    return 0, "", ""
+
+
+def _heartbeat_step(step: dict[str, Any]) -> tuple[int, str, str]:
+    """Poll a heartbeat URL until it answers 2xx, with bounded retries.
+
+    `docker compose up` returns when containers start, not when the HTTP
+    listener is ready; a zero-tolerance curl can race uvicorn's startup and
+    fail the whole restoration (D-48).
+    """
+    import time
+    import urllib.error
+    import urllib.request
+
+    attempts = int(step.get("attempts", 30))
+    interval = float(step.get("interval_seconds", 2.0))
+    last_error = ""
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(step["url"], timeout=5) as resp:
+                if 200 <= resp.getcode() < 300:
+                    return 0, "", ""
+                last_error = f"status {resp.getcode()}"
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        if attempt < attempts - 1:
+            time.sleep(interval)
+    return 1, "", f"heartbeat failed after {attempts} attempts: {last_error}"
+
+
+def _file_contains_lower_step(step: dict[str, Any]) -> tuple[int, str, str]:
+    """Assert each substring is present in the file (case-insensitive)."""
+    text = Path(step["path"]).read_text(encoding="utf-8").lower()
+    missing = [sub for sub in step["substrings"] if sub.lower() not in text]
+    if missing:
+        return 1, "", f"missing substrings: {missing}"
+    return 0, "", ""
+
+
+def _run_recorded_step(
+    step: dict[str, Any], reports: Path
+) -> tuple[int, str, str, str, str, int, int]:
+    """Dispatch one typed step; same return shape as ``_run_step``."""
+    kind = step.get("kind", "subprocess")
+    if kind == "phase10b_scoped_env":
+        rc, out, err = _phase10b_scoped_env(reports)
+    elif kind == "phase10b_unscoped_env":
+        rc, out, err = _phase10b_unscoped_env()
+    elif kind == "curl_status":
+        rc, out, err = _curl_status_step(step, reports)
+    elif kind == "file_contains_lower":
+        rc, out, err = _file_contains_lower_step(step)
+    elif kind == "heartbeat":
+        rc, out, err = _heartbeat_step(step)
+    else:
+        rc, out, err, *_ = _run_step(step["argv"])
+        stdout_to = step.get("stdout_to")
+        if stdout_to and rc == 0:
+            (reports / stdout_to).write_text(out, encoding="utf-8", newline="")
+    return (
+        rc, out, err,
+        hashlib.sha256(out.encode()).hexdigest(),
+        hashlib.sha256(err.encode()).hexdigest(),
+        len(out.encode()), len(err.encode()),
+    )
+
+
+def _step_argv_for_ledger(step: dict[str, Any]) -> list[str]:
+    """Symbolic argv for non-subprocess kinds (never values/env contents)."""
+    if "argv" in step:
+        return list(step["argv"])
+    return [f"<{step.get('kind', 'subprocess')}>"]
+
+
 def run_gate(gate: str, plan: str, reports_dir: str) -> int:
     """Execute a recorded gate: primary steps (stop at first failure) + restoration.
 
@@ -182,15 +452,16 @@ def run_gate(gate: str, plan: str, reports_dir: str) -> int:
         raise ValueError(f"unknown gate: {gate!r}")
     reports = Path(reports_dir)
     reports.mkdir(parents=True, exist_ok=True)
+    restoration_steps = (
+        PHASE10B_RESTORATION_STEPS if gate == "phase10b" else RESTORATION_STEPS
+    )
     ledger: list[dict[str, Any]] = []
     ordinal = 0
     primary_exit = 0
 
     try:
         for step in PRIMARY_STEPS[gate]:
-            if step.get("kind") != "subprocess":
-                continue
-            rc, stdout, stderr, *_ = _run_step(step["argv"])
+            rc, stdout, stderr, *_ = _run_recorded_step(step, reports)
             _record_step(ledger, ordinal, step, rc, stdout, stderr, phase="primary")
             ordinal += 1
             if rc != 0:
@@ -198,10 +469,8 @@ def run_gate(gate: str, plan: str, reports_dir: str) -> int:
                 break
     finally:
         # Restoration always runs, even after a primary failure.
-        for step in RESTORATION_STEPS:
-            if step.get("kind") != "subprocess":
-                continue
-            rc, stdout, stderr, *_ = _run_step(step["argv"])
+        for step in restoration_steps:
+            rc, stdout, stderr, *_ = _run_recorded_step(step, reports)
             _record_step(ledger, ordinal, step, rc, stdout, stderr, phase="restoration")
             ordinal += 1
             if rc != 0:

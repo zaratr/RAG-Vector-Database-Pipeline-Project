@@ -42,8 +42,28 @@ app.dependency_overrides[get_graph_extractor] = lambda: DisabledGraphExtractor()
 client = TestClient(app)
 
 
+_rate_db_path = None
+
+
 @pytest.fixture(scope="module", autouse=True)
-def setup_db():
+def setup_db(tmp_path_factory):
+    # Isolate the rate limiter's durable buckets from the production DB: the
+    # limiter builds its own engine from settings.database_url, so env +
+    # settings cache must point at a disposable database (D-36).
+    import os
+
+    from app.config import get_settings
+
+    rate_db = tmp_path_factory.mktemp("rag-api-rate") / "rate.db"
+    global _rate_db_path
+    _rate_db_path = rate_db
+    rate_engine = create_engine(f"sqlite:///{rate_db}")
+    Base.metadata.create_all(bind=rate_engine)
+    rate_engine.dispose()
+    original_db_url = os.environ.get("RAG_DATABASE_URL")
+    os.environ["RAG_DATABASE_URL"] = f"sqlite:///{rate_db}"
+    get_settings.cache_clear()
+
     client = chromadb.EphemeralClient()
     vector_store = ChromaVectorStore(
         collection_name="test-rag-api", client=client
@@ -58,17 +78,28 @@ def setup_db():
     routes_documents.get_vector_store = original_documents_store
     routes_query.get_vector_store = original_query_store
     client.delete_collection("test-rag-api")
+    if original_db_url is None:
+        os.environ.pop("RAG_DATABASE_URL", None)
+    else:
+        os.environ["RAG_DATABASE_URL"] = original_db_url
+    get_settings.cache_clear()
 
 
 def test_ingest_and_query():
+    # The document/query pair mirrors the calibration corpus style so the
+    # ingested chunk lands within the calibrated max_distance (10B.3).
     ingest_response = client.post(
         "/documents",
-        data={"title": "API Doc", "text": "FastAPI enables quick APIs", "source": "unit"},
+        data={
+            "title": "API Doc",
+            "text": "FastAPI enables quick APIs. FastAPI is a web framework for building APIs.",
+            "source": "unit",
+        },
     )
     assert ingest_response.status_code == 201
     doc_id = ingest_response.json()["document_id"]
 
-    query_response = client.post("/query", json={"query": "FastAPI", "top_k": 1})
+    query_response = client.post("/query", json={"query": "What enables quick APIs?", "top_k": 1})
     assert query_response.status_code == 200
     payload = query_response.json()
     assert "answer" in payload
@@ -257,3 +288,89 @@ def test_ingest_valid_pdf_no_extractable_text_returns_400():
     )
     assert response.status_code == 400
     assert "No text content" in response.json()["detail"]
+
+
+def test_rate_limiter_rows_went_to_isolated_database():
+    """D-36 regression: this module's POSTs must never write rate buckets to
+    the production database — the isolated limiter DB holds them instead."""
+    import hashlib
+    import sqlite3
+
+    assert _rate_db_path is not None and _rate_db_path.exists()
+    with sqlite3.connect(_rate_db_path) as conn:
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM ingestion_rate_buckets WHERE identity_sha256 = ?",
+            (hashlib.sha256(b"client:testclient").hexdigest(),),
+        ).fetchone()[0]
+    assert rows >= 1
+
+
+def test_rate_identity_follows_authentication_not_server_token(monkeypatch):
+    """D-37: with a configured operator token, a no-bearer ingestion hashes to
+    client:<host> and a VALID bearer hashes to operator:<token>; anonymous
+    callers must never share the operator bucket."""
+    import hashlib
+    import os
+    import sqlite3
+
+    from app.config import get_settings
+
+    token = "rate-identity-token-0123456789abcdef"
+    monkeypatch.setenv("RAG_OPERATOR_API_ENABLED", "true")
+    monkeypatch.setenv("RAG_OPERATOR_TOKEN", token)
+    get_settings.cache_clear()
+    try:
+        anonymous = client.post(
+            "/documents", data={"title": "anon", "text": "anonymous probe"}
+        )
+        assert anonymous.status_code == 201
+        operator = client.post(
+            "/documents",
+            data={"title": "oper", "text": "operator probe"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert operator.status_code == 201
+    finally:
+        get_settings.cache_clear()
+
+    with sqlite3.connect(_rate_db_path) as conn:
+        identities = {
+            row[0]
+            for row in conn.execute("SELECT DISTINCT identity_sha256 FROM ingestion_rate_buckets")
+        }
+    client_hash = hashlib.sha256(b"client:testclient").hexdigest()
+    operator_hash = hashlib.sha256(f"operator:{token}".encode()).hexdigest()
+    assert client_hash in identities
+    assert operator_hash in identities
+
+
+def test_blocked_source_returns_403():
+    """Auth-matrix row: the active policy's blocked source is refused."""
+    resp = client.post(
+        "/documents",
+        data={"title": "blocked", "source": "blocked-source", "text": "x"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "source_blocked"
+
+
+def test_operator_only_source_without_bearer_returns_403():
+    """Auth-matrix row: a requires_operator source needs a valid operator."""
+    resp = client.post(
+        "/documents",
+        data={"title": "protected", "source": "operator-curated", "text": "x"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "protected_source_requires_operator"
+
+
+def test_invalid_bearer_on_public_ingestion_returns_401():
+    """Auth-matrix row: any supplied bearer is validated even on public paths."""
+    resp = client.post(
+        "/documents",
+        data={"title": "bad-bearer", "text": "x"},
+        headers={"Authorization": "Bearer not-a-real-token"},
+    )
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "Invalid bearer token"
+    assert resp.headers["WWW-Authenticate"] == "Bearer"

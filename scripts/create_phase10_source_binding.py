@@ -37,9 +37,53 @@ def _resolve_image_id(service: str) -> str:
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0 or not result.stdout.strip():
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip().splitlines()[0]
+    # After a no-cache rebuild the running containers may reference an image
+    # record the daemon no longer holds, which makes `compose images` fail;
+    # resolve from the configured image name instead — the freshly built
+    # image exists locally (D-47).
+    config = subprocess.run(
+        ["docker", "compose", "config", "--format", "json"],
+        capture_output=True,
+        text=True,
+    )
+    if config.returncode != 0:
         raise RuntimeError(f"could not resolve image id for service {service!r}")
-    return result.stdout.strip().splitlines()[0]
+    config_json = json.loads(config.stdout)
+    service_config = (config_json.get("services", {}).get(service, {}) or {})
+
+    # Explicit image name (rare here): inspect it directly.
+    image_name = service_config.get("image")
+    if image_name:
+        inspect = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image_name],
+            capture_output=True,
+            text=True,
+        )
+        if inspect.returncode == 0 and inspect.stdout.strip():
+            return inspect.stdout.strip()
+
+    # Build-only services carry no `image` key; the freshly built image is
+    # findable through the compose labels docker build stamps on it. Pick the
+    # most recently created match (older layers linger after rebuilds).
+    project = config_json.get("name") or "rag-vector-database-pipeline-project"
+    listing = subprocess.run(
+        ["docker", "image", "ls", "--format", "{{.ID}}	{{.CreatedAt}}",
+         "--filter", f"label=com.docker.compose.project={project}",
+         "--filter", f"label=com.docker.compose.service={service}"],
+        capture_output=True,
+        text=True,
+    )
+    if listing.returncode != 0 or not listing.stdout.strip():
+        raise RuntimeError(f"could not resolve image id for service {service!r}")
+    best_id, _best_created = max(
+        (line.split("	", 1) for line in listing.stdout.strip().splitlines()),
+        key=lambda parts: parts[1] if len(parts) > 1 else "",
+    )
+    if not best_id:
+        raise RuntimeError(f"could not resolve image id for service {service!r}")
+    return best_id
 
 
 def _inspect_label(image_id: str, label: str) -> str:

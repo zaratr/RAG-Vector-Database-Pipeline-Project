@@ -1,11 +1,16 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-PLAN_PATH = Path(__file__).resolve().parents[2] / ".hermes" / "plans" / (
-    "2026-08-01_094008-phase-10-contract-reassessment-and-implementation.md"
-)
+_PLAN_FILENAME = "2026-08-01_094008-phase-10-contract-reassessment-and-implementation.md"
+# Plan may live in-project (.hermes) or in an external archive.
+_candidate_paths = [
+    Path(__file__).resolve().parents[2] / ".hermes" / "plans" / _PLAN_FILENAME,
+    Path(os.environ.get("RAG_PLAN_PATH", "/c/Users/zarat/Projects/random_archive/.hermes/plans")) / _PLAN_FILENAME,
+]
+PLAN_PATH = next((p for p in _candidate_paths if p.exists()), _candidate_paths[0])
 
 
 def test_validate_plan_payloads_locates_all_json_fence_payloads():

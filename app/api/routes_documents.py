@@ -6,8 +6,9 @@ from typing import List
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, Request
 from fastapi import status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -41,47 +42,52 @@ class DocumentCreateResponse(BaseModel):
     relations: int = 0
 
 
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+
 @router.post("", response_model=DocumentCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_document(
+    request: Request,
+    response: Response,
     title: str = Form(...),
     source: str | None = Form(default=None),
     tags: str | None = Form(default=None),
     text: str | None = Form(default=None),
     file: UploadFile | None = File(default=None),
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
     session: Session = Depends(get_db),
     graph_extractor: GraphExtractor = Depends(get_graph_extractor),
 ):
     embedding_provider = get_embedding_provider()
     vector_store = get_vector_store()
     text_content = text
+    settings = get_settings()
 
     parsed_tags = [t.strip() for t in tags.split(",")] if tags else None
 
+    # Physical size limit first: an oversized file creates no SQL/Chroma rows,
+    # including no rate-bucket row (streamed in 64 KiB chunks, B-10/B-20).
+    image_payload: tuple[bytes, str] | None = None
     if file:
-        content = await file.read()
-
-        if file.content_type  in {"image/png", "image/jpeg", "image/gif", "image/webp" }:
-            suffix = Path(file.filename).suffix or ".png"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(content)
-                tmp_path= tmp.name
-            image_provider = get_image_embedding_provider()
-
-            try:
-                result = await ingest_image(
-                        title = title,
-                        source = source,
-                        tags = parsed_tags,
-                        image_path = tmp_path,
-                        media_type = file.content_type,
-                        embedding_provider = image_provider,
-                        vector_store = vector_store,
-                        session = session
+        file_max = settings.ingestion_file_max_bytes
+        chunks = []
+        total = 0
+        while True:
+            chunk = await file.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > file_max:
+                raise HTTPException(
+                    status_code=413,
+                    detail={"code": "ingestion_too_large", "limit_bytes": file_max, "measured": "file"},
                 )
-            finally:
-                Path(tmp_path).unlink(missing_ok=True)
-            return DocumentCreateResponse(**result)
-        
+            chunks.append(chunk)
+        content = b"".join(chunks)
+
+        if file.content_type in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+            # Decode/dispatch happens after the rate limiter (D-17).
+            image_payload = (content, file.content_type)
         elif file.content_type == "application/pdf":
             if not PdfReader:
                 raise HTTPException(status_code=500, detail="PDF support not available")
@@ -103,13 +109,116 @@ async def create_document(
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type")
 
-    if not text_content or not text_content.strip():
+    # Auth matrix BEFORE the limiter: authentication rejections consume no slot.
+    import hmac
+
+    is_operator = False
+    if credentials is not None:
+        token_val = settings.operator_token.get_secret_value()
+        if not token_val or not hmac.compare_digest(credentials.credentials, token_val):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        is_operator = True
+
+    # 10B.3: rate limiting AFTER auth, BEFORE application validation, in a
+    # SEPARATE transaction (D-8): successful AND application-invalid upload
+    # attempts consume a slot; only authentication rejections do not.
+    from app.services.ingestion_limits import check_rate_limit_http
+    from app.core.db import create_database_engine, sessionmaker as _sm
+    remote_host = request.client.host if request.client else "unknown"
+    # Rate identity (plan §10B.3): operator:<token> only for a VALID operator
+    # bearer; every other caller — authenticated or not — is client:<host>.
+    # Never seed the limiter with the server-configured token for anonymous
+    # requests (D-37): that would couple all clients into one shared bucket.
+    op_token = credentials.credentials if is_operator else None
+    # Use a separate engine/session so the rate increment survives ingestion rollback.
+    _rl_engine = create_database_engine(settings.database_url)
+    _rl_session = _sm(bind=_rl_engine)()
+    try:
+        allowed, rl_headers = check_rate_limit_http(
+            _rl_session, operator_token=op_token, remote_host=remote_host,
+            limit=settings.ingest_rate_limit_requests,
+            window_seconds=settings.ingest_rate_limit_window_seconds,
+        )
+        _rl_session.commit()
+    except Exception:
+        _rl_session.rollback()
+        raise
+    finally:
+        _rl_session.close()
+        _rl_engine.dispose()
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail={"code": "ingestion_rate_limited"},
+            headers=rl_headers,
+        )
+
+    # 10B.3: extracted/normalized UTF-8 bytes are measured before chunking,
+    # after decode/extraction finalizes the text (D-16).
+    if text_content is not None:
+        extracted_bytes = len(text_content.encode("utf-8"))
+        if extracted_bytes > settings.ingestion_extracted_max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "code": "ingestion_too_large",
+                    "limit_bytes": settings.ingestion_extracted_max_bytes,
+                    "measured": "extracted",
+                },
+            )
+
+    if image_payload is None and (not text_content or not text_content.strip()):
         raise HTTPException(status_code=400, detail="No text content provided")
 
+    # 10B.2: server-assigned trust assessment using lifespan-cached policy.
+    from app.services.provenance import SourceTrustPolicy
 
+    policy: SourceTrustPolicy = getattr(request.app.state, "source_trust_policy", None)
+    if policy is None:
+        from app.services.provenance import load_source_trust_policy
+        try:
+            policy = load_source_trust_policy(settings.source_trust_policy_path)
+        except Exception:
+            raise HTTPException(status_code=503, detail="Trust policy unavailable")
 
+    # Check for blocked source (any bearer).
+    if policy.is_blocked(source):
+        raise HTTPException(status_code=403, detail="source_blocked")
 
-    settings = get_settings()
+    # Check for protected trusted source without operator.
+    if policy.requires_operator(source) and not is_operator:
+        raise HTTPException(status_code=403, detail="protected_source_requires_operator")
+
+    if image_payload is not None:
+        content, media_type = image_payload
+        suffix = Path(file.filename).suffix or ".png"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        image_provider = get_image_embedding_provider()
+        try:
+            result = await ingest_image(
+                title=title,
+                source=source,
+                tags=parsed_tags,
+                image_path=tmp_path,
+                media_type=media_type,
+                embedding_provider=image_provider,
+                vector_store=vector_store,
+                session=session,
+            )
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+        response.headers.update(rl_headers)
+        return DocumentCreateResponse(**result)
+
+    # Assess trust tier with the resolved operator flag.
+    trust_tier, trust_score = policy.assess(source, is_operator=is_operator)
+
     try:
         result = await ingest_text(
             title=title,
@@ -125,6 +234,10 @@ async def create_document(
                 settings.graph_extraction_model or settings.llm_model
             ),
             session=session,
+            trust_tier=trust_tier,
+            trust_score=trust_score,
+            trust_policy_version=policy.version,
+            ingestion_origin="api",
         )
     except GraphProviderUnavailable as exc:
         raise HTTPException(
@@ -138,6 +251,8 @@ async def create_document(
         raise HTTPException(
             status_code=502, detail="Graph extraction provider failed"
         ) from exc
+    # Accepted requests carry the same rate-limit headers as rejections.
+    response.headers.update(rl_headers)
     return DocumentCreateResponse(**result)
 
 

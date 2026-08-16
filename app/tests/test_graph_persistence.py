@@ -933,3 +933,127 @@ def test_complete_with_matching_attempt_count_succeeds():
 
     session.close()
     engine.dispose()
+
+
+def test_repersisting_shared_entity_relations_does_not_violate_mention_uniqueness():
+    """D-29: with autoflush=False sessions, a pending mention must be visible
+    to the next relation's dedup query. Two relations sharing an entity,
+    persisted for a second chunk with entities/edges pre-existing, must not
+    raise UNIQUE(entity_id, extraction_id)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.core.db import Base
+    from app.persistence import graph_repository, models  # noqa: F401
+    from app.services.graph_extraction import ExtractedEntity, ExtractedRelation
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(autoflush=False, bind=engine)  # matches app sessions
+    session = Session()
+    try:
+        document = models.Document(title="t", source="unit", ingestion_status="ready")
+        session.add(document)
+        session.flush()
+        chunk_a = models.Chunk(
+            document_id=document.id, index=0,
+            text="Aria manages Project Helios. Project Helios uses Vector Engine.",
+            start_offset=0, end_offset=60, media_type="text/plain",
+            vector_id="chunk:1:0",
+        )
+        chunk_b = models.Chunk(
+            document_id=document.id, index=1,
+            text="Aria notes Project Helios uses Vector Engine again.",
+            start_offset=0, end_offset=55, media_type="text/plain",
+            vector_id="chunk:1:1",
+        )
+        session.add_all([chunk_a, chunk_b])
+        session.flush()
+
+        relations = [
+            ExtractedRelation(
+                source=ExtractedEntity(name="Aria", canonical_name="aria", entity_type="person"),
+                predicate="manages",
+                target=ExtractedEntity(name="Project Helios", canonical_name="project helios", entity_type="project"),
+                evidence="Aria manages Project Helios",
+                evidence_start=0, evidence_end=26, confidence=1.0,
+            ),
+            ExtractedRelation(
+                source=ExtractedEntity(name="Project Helios", canonical_name="project helios", entity_type="project"),
+                predicate="uses",
+                target=ExtractedEntity(name="Vector Engine", canonical_name="vector engine", entity_type="system"),
+                evidence="Project Helios uses Vector Engine",
+                evidence_start=27, evidence_end=57, confidence=1.0,
+            ),
+        ]
+        graph_repository.persist_chunk_extraction(
+            session, chunk=chunk_a, relations=relations, provider="test", model="m",
+        )
+        session.commit()
+        # Second chunk re-extracts the shared entity — the D-29 repro.
+        graph_repository.persist_chunk_extraction(
+            session, chunk=chunk_b, relations=relations, provider="test", model="m",
+        )
+        session.commit()
+
+        mentions = session.query(models.EntityMention).all()
+        seen = {(m.entity_id, m.extraction_id) for m in mentions}
+        assert len(seen) == len(mentions)  # no duplicate (entity, extraction) pairs
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_duplicate_identical_relation_twice_does_not_violate_evidence_uniqueness():
+    """D-33: with autoflush=False sessions, a pending edge-evidence insert
+    must be visible to an identical duplicate relation's dedup query."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.core.db import Base
+    from app.persistence import graph_repository, models  # noqa: F401
+    from app.services.graph_extraction import ExtractedEntity, ExtractedRelation
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(autoflush=False, bind=engine)  # matches app sessions
+    session = Session()
+    try:
+        document = models.Document(title="t", source="unit", ingestion_status="ready")
+        session.add(document)
+        session.flush()
+        chunk = models.Chunk(
+            document_id=document.id, index=0,
+            text="Aria manages Project Helios. Aria manages Project Helios.",
+            start_offset=0, end_offset=55, media_type="text/plain",
+            vector_id="chunk:9:0",
+        )
+        session.add(chunk)
+        session.flush()
+
+        relation = ExtractedRelation(
+            source=ExtractedEntity(name="Aria", canonical_name="aria", entity_type="person"),
+            predicate="manages",
+            target=ExtractedEntity(
+                name="Project Helios", canonical_name="project helios", entity_type="project"
+            ),
+            evidence="Aria manages Project Helios",
+            evidence_start=0, evidence_end=26, confidence=1.0,
+        )
+        # The identical relation persisted twice for one extraction: the
+        # second insert must dedup against the first pending evidence row.
+        graph_repository.persist_chunk_extraction(
+            session, chunk=chunk, relations=[relation, relation],
+            provider="test", model="m",
+        )
+        session.commit()
+
+        rows = (
+            session.query(models.GraphEdgeEvidence)
+            .filter_by(evidence_start=0, evidence_end=26)
+            .all()
+        )
+        assert len(rows) == 1
+    finally:
+        session.close()
+        engine.dispose()

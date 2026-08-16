@@ -1,0 +1,1 @@
+{"default":{"score":0.2,"tier":"untrusted"},"rules":[{"requires_operator":true,"rule_id":"SRC001","score":1.0,"source":"operator-curated","tier":"trusted"},{"requires_operator":false,"rule_id":"SRC002","score":0.0,"source":"blocked-source","tier":"blocked"}],"version":"source-trust-v1"}

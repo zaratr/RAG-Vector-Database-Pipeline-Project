@@ -1,6 +1,8 @@
 """Retrieval utilities."""
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import List, Literal
 
 from sqlalchemy.orm import Session
@@ -13,6 +15,35 @@ from app.services.graph_retrieval import (
     retrieve_graph_contexts,
     retrieve_graph_paths,
 )
+from app.services.retrieval_security import (
+    Candidate,
+    RetrievalSecurityPolicy,
+    apply_security_filters,
+    load_retrieval_security_policy_strict,
+)
+
+# Immutable process-wide policy: loaded once, never reloaded per request, and
+# never replaced by an arbitrary default (plan §10B.3 fail-closed requirement).
+_POLICY_CACHE: RetrievalSecurityPolicy | None = None
+
+
+def get_retrieval_security_policy() -> RetrievalSecurityPolicy:
+    """Return the immutable policy, loading it exactly once; fail closed."""
+    global _POLICY_CACHE
+    if _POLICY_CACHE is None:
+        from app.config import get_settings
+
+        settings = get_settings()
+        _POLICY_CACHE = load_retrieval_security_policy_strict(
+            settings.retrieval_security_policy_path
+        )
+    return _POLICY_CACHE
+
+
+def reset_retrieval_security_policy_cache() -> None:
+    """Test hook: forget the cached policy so the next call reloads strictly."""
+    global _POLICY_CACHE
+    _POLICY_CACHE = None
 
 
 async def retrieve(
@@ -166,7 +197,7 @@ def _graph_contexts_from_paths(
     return contexts
 
 
-async def retrieve_contexts(
+async def retrieve_contexts_detailed(
     *,
     query: str,
     embedding_provider: EmbeddingProvider,
@@ -176,8 +207,14 @@ async def retrieve_contexts(
     top_k: int = 5,
     graph_max_hops: int = 2,
     filters: dict | None = None,
-) -> List[dict]:
-    """Retrieve vector, graph, or reciprocal-rank-fused hybrid evidence."""
+) -> tuple[List[dict], list[dict]]:
+    """Retrieve vector, graph, or reciprocal-rank-fused hybrid evidence.
+
+    Returns ``(contexts, retrieval_decisions)`` where contexts are the
+    post-security survivors (top_k-limited) and retrieval_decisions is the
+    full per-candidate decision list (selected/rejected_*) ready for audit
+    persistence.
+    """
     vector_contexts: list[dict] = []
     graph_contexts: list[dict] = []
     if mode in {"vector", "hybrid"}:
@@ -209,10 +246,11 @@ async def retrieve_contexts(
         )
 
     if mode == "vector":
-        return vector_contexts[:top_k]
+        contexts, decisions = _apply_security_filter(session, vector_contexts, mode="vector")
+        return contexts[:top_k], decisions
     if mode == "graph":
-        # Graph contexts already carry full graph_paths + graph_score metadata.
-        return graph_contexts[:top_k]
+        contexts, decisions = _apply_security_filter(session, graph_contexts, mode="graph")
+        return contexts[:top_k], decisions
 
     fused: dict[tuple, dict] = {}
     rrf_scores: dict[tuple, float] = {}
@@ -254,10 +292,135 @@ async def retrieve_contexts(
 
     for key, context in fused.items():
         context["metadata"]["hybrid_score"] = round(rrf_scores[key], 6)
-    return sorted(
+    hybrid_results = sorted(
         fused.values(),
         key=lambda item: (
             -item["metadata"]["hybrid_score"],
             _context_key(item),
         ),
-    )[:top_k]
+    )
+    contexts, decisions = _apply_security_filter(session, hybrid_results, mode="hybrid")
+    return contexts[:top_k], decisions
+
+
+async def retrieve_contexts(
+    *,
+    query: str,
+    embedding_provider: EmbeddingProvider,
+    vector_store: VectorStore,
+    session: Session,
+    mode: Literal["vector", "graph", "hybrid"] = "vector",
+    top_k: int = 5,
+    graph_max_hops: int = 2,
+    filters: dict | None = None,
+) -> List[dict]:
+    """Backward-compatible wrapper returning only the survivor contexts."""
+    contexts, _ = await retrieve_contexts_detailed(
+        query=query,
+        embedding_provider=embedding_provider,
+        vector_store=vector_store,
+        session=session,
+        mode=mode,
+        top_k=top_k,
+        graph_max_hops=graph_max_hops,
+        filters=filters,
+    )
+    return contexts
+
+
+def _apply_security_filter(session: Session, contexts: list[dict], mode: str = "vector") -> tuple[list[dict], list[dict]]:
+    """Apply retrieval poisoning controls (distance, duplicate, caps) to contexts.
+
+    Builds Candidate objects from SQL-hydrated contexts, applies the mode-aware
+    security filters (native pre-rank order per the §10B.3 ordering table,
+    distance applicability by origin, duplicate/cap controls, graph-origin
+    annotation), and returns ``(selected_contexts, decisions)`` where
+    ``decisions`` is the full per-candidate final decision list ready for
+    audit persistence. The immutable policy is loaded once per process and
+    fail-closed.
+    """
+    if not contexts:
+        return [], []
+
+    # Immutable, fail-closed: never an arbitrary default threshold.
+    policy = get_retrieval_security_policy()
+
+    candidates: list[Candidate] = []
+    context_by_chunk: dict[int, dict] = {}
+    for ctx in contexts:
+        meta = ctx.get("metadata") or {}
+        chunk_id = meta.get("chunk_id")
+        if chunk_id is None:
+            continue
+        doc_id = meta.get("document_id")
+        source = meta.get("source") or "unknown"
+        text = ctx.get("text", "")
+        score = ctx.get("score", 1.0)
+        # Determine origin from retrieval_sources metadata.
+        sources = meta.get("retrieval_sources", ["vector"])
+        if "graph" in sources and "vector" in sources:
+            origin = "hybrid_both"
+        elif "graph" in sources:
+            origin = "graph"
+        elif "vector" in sources:
+            origin = "vector"
+        else:
+            origin = "vector"
+
+        # Look up trust tier from SQL.
+        trust_tier = "standard"
+        document_ready = True
+        if doc_id:
+            doc = session.get(models.Document, doc_id)
+            if doc:
+                trust_tier = doc.trust_tier or "standard"
+                document_ready = doc.ingestion_status == "ready"
+
+        # Native L2 distance exists only for vector-supported candidates; the
+        # Chroma score IS the distance for vector hits and must never be
+        # compared to max_distance for graph-only candidates.
+        distance = score if "vector" in sources else None
+        cand = Candidate(
+            chunk_id=chunk_id,
+            document_id=doc_id or 0,
+            source=source,
+            text=text,
+            native_score=score,
+            trust_tier=trust_tier,
+            document_ready=document_ready,
+            origin=origin,
+            distance=distance,
+            graph_score=meta.get("graph_score"),
+            hop=meta.get("min_hop", meta.get("hop")) if isinstance(
+                meta.get("min_hop", meta.get("hop")), int
+            ) else None,
+            hybrid_score=meta.get("hybrid_score"),
+        )
+        candidates.append(cand)
+        context_by_chunk[chunk_id] = ctx
+
+    decisions = apply_security_filters(candidates, policy=policy, mode=mode)
+    # Build survivor list in the mode's pre-rank order (filter output order)
+    # and the persistable decision dicts for every candidate.
+    result = []
+    decision_rows: list[dict] = []
+    for d in decisions:
+        ctx = context_by_chunk.get(d.chunk_id)
+        if ctx is None:
+            continue
+        document_id = (ctx.get("metadata") or {}).get("document_id")
+        text = ctx.get("text", "")
+        decision_rows.append({
+            "chunk_id": d.chunk_id,
+            "document_id": document_id,
+            "document_id_snapshot": document_id or 0,
+            "chunk_id_snapshot": d.chunk_id,
+            "decision": d.decision,
+            "native_score": d.native_score,
+            "provenance_score": d.provenance_score,
+            "reason_codes": json.dumps(sorted(d.reason_codes)),
+            "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        })
+        if d.decision == "selected" and ctx is not None:
+            result.append(ctx)
+    return result, decision_rows

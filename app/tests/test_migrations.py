@@ -23,7 +23,7 @@ from app.persistence import models
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
 BASELINE_REVISION = "dee48bc24a7f"
-REVISION = "b7f3d5a9c2e1"
+REVISION = "c8a4e6b0d3f2"
 HEAD_TABLES = {
     "alembic_version",
     "chunks",
@@ -33,6 +33,9 @@ HEAD_TABLES = {
     "graph_edges",
     "graph_entities",
     "graph_extractions",
+    "retrieval_audits",
+    "retrieval_candidate_decisions",
+    "ingestion_rate_buckets",
 }
 
 
@@ -126,6 +129,10 @@ def test_baseline_creates_exact_schema_on_empty_db(tmp_path):
         "tags": ("VARCHAR", True, 0),
         "ingestion_status": ("VARCHAR(20)", False, 0),
         "failure_code": ("VARCHAR(100)", True, 0),
+        "trust_tier": ("VARCHAR(20)", False, 0),
+        "trust_score": ("FLOAT", False, 0),
+        "trust_policy_version": ("VARCHAR(50)", False, 0),
+        "ingestion_origin": ("VARCHAR(50)", False, 0),
     }
     assert {
         name: (str(column["type"]), column["nullable"], column["primary_key"])
@@ -163,6 +170,8 @@ def test_baseline_creates_exact_schema_on_empty_db(tmp_path):
     } == {
         "ix_documents_id": (["id"], 0),
         "ix_documents_ingestion_status": (["ingestion_status"], 0),
+        "ix_documents_trust_tier": (["trust_tier"], 0),
+        "ix_documents_trust_policy_version": (["trust_policy_version"], 0),
     }
     assert {
         index["name"]: (index["column_names"], index["unique"])
@@ -184,7 +193,7 @@ def test_graph_head_has_provenance_constraints_indexes_and_cascades(tmp_path):
     assert {
         constraint["name"]
         for constraint in inspector.get_check_constraints("documents")
-    } == {"ck_documents_ingestion_status"}
+    } == {"ck_documents_ingestion_status", "ck_documents_trust_tier", "ck_documents_trust_score"}
 
     assert {
         constraint["name"]

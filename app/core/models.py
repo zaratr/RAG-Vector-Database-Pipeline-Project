@@ -53,3 +53,7 @@ class RetrievedChunk(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     context: List[RetrievedChunk]
+    # 10B.5: query id matches retrieval_audits.id (generated pre-retrieval).
+    query_id: str | None = None
+    # 10B.4/10B.5: why candidates were selected/rejected, without payload data.
+    security_summary: dict | None = None

@@ -270,9 +270,11 @@ Important error behavior:
 
 - `400`: invalid/empty document input or unsupported file
 - `404`: document not found
+- `413`: request envelope, uploaded file, or extracted text exceeds the configured ingestion byte limits (`request_envelope_too_large` / `ingestion_too_large`)
 - `422`: invalid query controls or unsupported graph filters
+- `429`: ingestion rate limit exceeded (`ingestion_rate_limited`)
 - `502`: graph extraction provider returned unusable structured output
-- `503`: graph provider unavailable or traversal safety limit reached
+- `503`: graph provider unavailable or traversal safety limit reached; fail-closed security failures (`retrieval_failed`, `context_detector_failed`, `generation_provider_failed`, audit-persistence codes). When every retrieved candidate is blocked, `/query` still returns `200` with the deterministic answer `No safe context was available to answer the query.`
 
 ## Architecture
 

@@ -26,8 +26,23 @@ services:
     environment:
       RAG_DATABASE_URL: ${RAG_DATABASE_URL:-sqlite:////data/rag.db}
       RAG_EXTRACTION_LEASE_SECONDS: ${RAG_EXTRACTION_LEASE_SECONDS:-600}
+      RAG_SOURCE_TRUST_POLICY_PATH: ${RAG_SOURCE_TRUST_POLICY_PATH:-/app/config/source-trust-policy.json}
+      RAG_OPERATOR_API_ENABLED: ${RAG_OPERATOR_API_ENABLED:-false}
+      RAG_OPERATOR_TOKEN: ${RAG_OPERATOR_TOKEN:-}
+      RAG_SECURITY_AUDIT_RETENTION_DAYS: ${RAG_SECURITY_AUDIT_RETENTION_DAYS:-30}
+      RAG_RETRIEVAL_SECURITY_POLICY_PATH: ${RAG_RETRIEVAL_SECURITY_POLICY_PATH:-/app/config/retrieval-security-policy.json}
+      RAG_CONTEXT_SECURITY_POLICY_PATH: ${RAG_CONTEXT_SECURITY_POLICY_PATH:-/app/config/context-security-policy.json}
+      RAG_INGESTION_REQUEST_MAX_BYTES: ${RAG_INGESTION_REQUEST_MAX_BYTES:-11534336}
+      RAG_INGESTION_FILE_MAX_BYTES: ${RAG_INGESTION_FILE_MAX_BYTES:-10485760}
+      RAG_INGESTION_EXTRACTED_MAX_BYTES: ${RAG_INGESTION_EXTRACTED_MAX_BYTES:-5242880}
+      RAG_INGEST_RATE_LIMIT_REQUESTS: ${RAG_INGEST_RATE_LIMIT_REQUESTS:-30}
+      RAG_INGEST_RATE_LIMIT_WINDOW_SECONDS: ${RAG_INGEST_RATE_LIMIT_WINDOW_SECONDS:-60}
+      RAG_PLAN_PATH: ${RAG_PLAN_PATH:-/plan-archive}
     volumes:
       - relational_data:/data
+      # Read-only mount of the external Phase 10 plan archive; the plan is
+      # normative and read-only, never copied into the image.
+      - ${RAG_PLAN_ARCHIVE:-../random_archive/.hermes/plans}:/plan-archive:ro
     depends_on:
       migrate:
         condition: service_completed_successfully

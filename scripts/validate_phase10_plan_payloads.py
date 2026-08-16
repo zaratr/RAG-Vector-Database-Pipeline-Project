@@ -7,6 +7,10 @@ The plan embeds normative JSON payloads in two forms:
   ``<!-- payload: <label> bytes=<n> [sha256=<hex>] -->``.
 * **Inline-text payloads** — literal JSON in prose (not a fence), marked by the
   same HTML comment form with ``type=inline``.
+* **Prose-declared payloads** — literal fences bound to an artifact path by an
+  adjacent prose line declaring the byte count and SHA-256 (``json`` fences for
+  ``.json`` artifacts, raw-text fences for ``.txt`` artifacts), plus the attack
+  corpus declared via a "the following N-byte … SHA-256" lead.
 
 The tool locates each labeled payload, reconstructs it with the exact canonical
 serializer (``json.dumps(obj, sort_keys=True, separators=(",",":"), ensure_ascii=True)
@@ -36,6 +40,38 @@ _MARKER_RE = re.compile(
 
 # A ```json fence block.
 _FENCE_RE = re.compile(r"```json\n(?P<body>.*?)\n```", re.DOTALL)
+
+# A ```text fence block (raw-text payloads such as the OWASP excerpt).
+_TEXT_FENCE_RE = re.compile(r"```text\n(?P<body>.*?)\n```", re.DOTALL)
+
+# Prose declarations: some payloads are bound to an artifact path or a
+# "the following N-byte" lead instead of an HTML marker.
+# Trailing form "`path`: N bytes ... SHA-256 `hex`" — the payload fence
+# immediately precedes the declaration line.
+_TRAILING_DECL_RE = re.compile(
+    r"`(?P<path>[^`\n]+)`:\s*(?P<bytes>[\d,]+)\s+bytes\b[^\n]*?"
+    r"SHA-256\s+`(?P<sha>[0-9a-fA-F]{64})`"
+)
+# Leading form "`path` is exactly these N ... bytes ... SHA-256 `hex`" —
+# the payload fence immediately follows the declaration line.
+_LEADING_DECL_RE = re.compile(
+    r"`(?P<path>[^`\n]+)`\s+is exactly these\s+(?P<bytes>[\d,]+)[^\n]*?"
+    r"SHA-256\s+`(?P<sha>[0-9a-fA-F]{64})`"
+)
+# "the following N-byte ... SHA-256 `hex`" on a line naming the attack
+# file — the payload fence immediately follows the declaration line.
+_ATTACK_DECL_RE = re.compile(
+    r"the following\s+(?P<bytes>[\d,]+)-byte\b[^\n]*?"
+    r"SHA-256\s+`(?P<sha>[0-9a-fA-F]{64})`"
+)
+
+# Artifact-path fragment → payload label for prose-declared payloads.
+_PATH_LABEL_FRAGMENTS = (
+    ("content-safety-policy.json", "content-safety-policy"),
+    ("content_safety.json", "content-safety-fixture"),
+    ("attack_payloads.json", "attack-corpus"),
+    ("owasp", "owasp-excerpt"),
+)
 
 # Known payload labels the manifest requires (L158-164). The tool locates
 # whichever are present; validate_plan asserts the required set is present.
@@ -97,6 +133,115 @@ def locate_payloads(plan_path: str) -> list[dict[str, Any]]:
             "declared_sha256": declared_sha,
         })
         seen_labels.add(label)
+
+    payloads.extend(_locate_prose_payloads(text, seen_labels))
+    return payloads
+
+
+def _label_for_path(path: str) -> str | None:
+    """Map a prose-declared artifact path to its payload label."""
+    for fragment, label in _PATH_LABEL_FRAGMENTS:
+        if fragment in path:
+            return label
+    return None
+
+
+def _line_bounds(text: str, pos: int) -> tuple[int, int]:
+    """Return the (start, end) span of the line containing ``pos``."""
+    start = text.rfind("\n", 0, pos) + 1
+    nl = text.find("\n", pos)
+    end = len(text) if nl == -1 else nl
+    return start, end
+
+
+def _locate_prose_payloads(text: str, seen_labels: set[str]) -> list[dict[str, Any]]:
+    """Locate payloads the plan declares in prose instead of HTML markers.
+
+    HTML markers take precedence; prose declarations for an already-located
+    label are ignored so each label resolves to exactly one payload.
+    """
+    payloads: list[dict[str, Any]] = []
+    json_fences = list(_FENCE_RE.finditer(text))
+    text_fences = list(_TEXT_FENCE_RE.finditer(text))
+
+    def fence_before(pos: int, fences: list) -> re.Match | None:
+        candidates = [
+            m for m in fences
+            if m.end() <= pos and not text[m.end():pos].strip()
+        ]
+        return max(candidates, key=lambda m: m.end(), default=None)
+
+    def fence_after(pos: int, fences: list) -> re.Match | None:
+        candidates = [
+            m for m in fences
+            if m.start() >= pos and not text[pos:m.start()].strip()
+        ]
+        return min(candidates, key=lambda m: m.start(), default=None)
+
+    def record(
+        label: str | None,
+        declared_bytes: int,
+        declared_sha: str,
+        fence: re.Match | None,
+        payload_type: str,
+        serialize,
+    ) -> None:
+        if label is None or fence is None or label in seen_labels:
+            return
+        raw = fence.group("body")
+        payloads.append({
+            "label": label,
+            "payload_type": payload_type,
+            "raw": raw,
+            "serialized": serialize(raw),
+            "declared_bytes": declared_bytes,
+            "declared_sha256": declared_sha.lower(),
+        })
+        seen_labels.add(label)
+
+    for m in _TRAILING_DECL_RE.finditer(text):
+        record(
+            _label_for_path(m.group("path")),
+            int(m.group("bytes").replace(",", "")),
+            m.group("sha"),
+            fence_before(m.start(), json_fences),
+            "json-fence",
+            _canonical_serialize_text,
+        )
+
+    for m in _LEADING_DECL_RE.finditer(text):
+        path = m.group("path")
+        if path.endswith(".txt"):
+            record(
+                _label_for_path(path),
+                int(m.group("bytes").replace(",", "")),
+                m.group("sha"),
+                fence_after(_line_bounds(text, m.start())[1], text_fences),
+                "text-fence",
+                lambda raw: raw.encode("utf-8") + b"\n",
+            )
+        else:
+            record(
+                _label_for_path(path),
+                int(m.group("bytes").replace(",", "")),
+                m.group("sha"),
+                fence_after(_line_bounds(text, m.start())[1], json_fences),
+                "json-fence",
+                _canonical_serialize_text,
+            )
+
+    for m in _ATTACK_DECL_RE.finditer(text):
+        line_start, line_end = _line_bounds(text, m.start())
+        if "attack" not in text[line_start:line_end]:
+            continue
+        record(
+            "attack-corpus",
+            int(m.group("bytes").replace(",", "")),
+            m.group("sha"),
+            fence_after(line_end, json_fences),
+            "json-fence",
+            _canonical_serialize_text,
+        )
 
     return payloads
 

@@ -1,11 +1,6 @@
 # Version-control and local agent metadata
 .git
 .git/**
-# .hermes: ignore reports/validation evidence, keep the normative plan visible
-.hermes/reports
-.hermes/reports/**
-.hermes/validation
-.hermes/validation/**
 
 # Secrets and local configuration
 .env
