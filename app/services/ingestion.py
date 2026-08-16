@@ -34,6 +34,11 @@ from app.services.graph_extraction import (
     GraphExtractor,
 )
 from app.services.vector_store import VectorStore
+from app.services.safety_review import (
+    IngestionSafetyBlocked,
+    SafetyReviewSubsystemFailure,
+)
+from app.services.safety_policy import get_safety_policy
 
 EXTRACTION_PROVIDER = "ollama"
 FAILED_AFTER_CHUNK = "aborted_after_chunk_failure"
@@ -88,30 +93,8 @@ async def ingest_text(
         chunk_model.vector_id = f"chunk:{chunk_model.id}"
         chunk_model.media_type = "text/plain"
     session.flush()
-    # Establish extraction identities as pending/skipped before external work.
-    lease_by_index: dict[int, object] = {}
-    for idx, chunk_model in enumerate(chunk_models):
-        if graph_extractor is not None:
-            lease = graph_repository.begin_chunk_extraction(
-                session,
-                chunk=chunk_model,
-                provider=graph_extraction_provider,
-                model=graph_extraction_model,
-                prompt_version=PROMPT_VERSION,
-                schema_version=SCHEMA_VERSION,
-            )
-            lease_by_index[idx] = lease
-        else:
-            lease = graph_repository.skip_chunk_extraction(
-                session,
-                chunk=chunk_model,
-                provider=graph_extraction_provider,
-                model=graph_extraction_model,
-                prompt_version=PROMPT_VERSION,
-                schema_version=SCHEMA_VERSION,
-                reason_code="extraction_disabled",
-            )
-            lease_by_index[idx] = lease
+    # 10C.4: stage WITHOUT extraction leases first; the ingestion-scope
+    # safety review runs on the staged rows before any identity exists.
     session.commit()
 
     document_id = document.id
@@ -119,6 +102,68 @@ async def ingest_text(
     relation_count = 0
 
     try:
+        # 10C.4 ingestion-scope safety enforcement: block|filter creates
+        # direct terminal skipped identities (safety_blocked,
+        # attempt_count=0), marks the document failed, writes no vectors,
+        # and raises for HTTP 422.
+        from app.config import get_settings as _get_settings
+
+        _settings = _get_settings()
+        if _settings.content_safety_enabled:
+            from app.services.safety_review import SafetyReviewService
+
+            safety_policy = get_safety_policy()
+            safety_service = SafetyReviewService(session)
+            run = safety_service.review_ingestion(
+                document=document, text=normalized, policy=safety_policy,
+                mode=_settings.safety_llm_mode,
+            )
+            if run.status != "succeeded":
+                raise SafetyReviewSubsystemFailure(
+                    f"ingestion safety review {run.status}: {run.failure_code}")
+            if run.final_action in ("block", "filter"):
+                for chunk_model in chunk_models:
+                    graph_repository.skip_chunk_extraction(
+                        session,
+                        chunk=chunk_model,
+                        provider=graph_extraction_provider,
+                        model=graph_extraction_model,
+                        prompt_version=PROMPT_VERSION,
+                        schema_version=SCHEMA_VERSION,
+                        reason_code="safety_blocked",
+                    )
+                document.ingestion_status = "failed"
+                document.failure_code = "safety_blocked"
+                session.commit()
+                raise IngestionSafetyBlocked(run.final_action)
+
+        # Establish extraction identities as pending/skipped before external
+        # work.
+        lease_by_index: dict[int, object] = {}
+        for idx, chunk_model in enumerate(chunk_models):
+            if graph_extractor is not None:
+                lease = graph_repository.begin_chunk_extraction(
+                    session,
+                    chunk=chunk_model,
+                    provider=graph_extraction_provider,
+                    model=graph_extraction_model,
+                    prompt_version=PROMPT_VERSION,
+                    schema_version=SCHEMA_VERSION,
+                )
+                lease_by_index[idx] = lease
+            else:
+                lease = graph_repository.skip_chunk_extraction(
+                    session,
+                    chunk=chunk_model,
+                    provider=graph_extraction_provider,
+                    model=graph_extraction_model,
+                    prompt_version=PROMPT_VERSION,
+                    schema_version=SCHEMA_VERSION,
+                    reason_code="extraction_disabled",
+                )
+                lease_by_index[idx] = lease
+        session.commit()
+
         # Step 3: external work (embeddings + extraction) outside the SQL txn.
         try:
             embeddings = await embedding_provider.embed_texts(chunk_texts)

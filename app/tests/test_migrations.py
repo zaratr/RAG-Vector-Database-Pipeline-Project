@@ -23,7 +23,7 @@ from app.persistence import models
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
 BASELINE_REVISION = "dee48bc24a7f"
-REVISION = "c8a4e6b0d3f2"
+REVISION = "d9b5f7c1e4a3"
 HEAD_TABLES = {
     "alembic_version",
     "chunks",
@@ -36,6 +36,8 @@ HEAD_TABLES = {
     "retrieval_audits",
     "retrieval_candidate_decisions",
     "ingestion_rate_buckets",
+    "safety_review_runs",
+    "safety_findings",
 }
 
 
@@ -723,4 +725,376 @@ def test_required_columns_reject_null(tmp_path, statement, missing_column):
     with pytest.raises(IntegrityError):
         with engine.begin() as conn:
             conn.execute(text(statement))
+    engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 10C.4: d9b5f7c1e4a3 migration matrix
+# ---------------------------------------------------------------------------
+
+D9_HEAD = "d9b5f7c1e4a3"
+
+
+def test_d9_upgrade_creates_safety_tables_with_exact_columns(tmp_path):
+    db_url = _db_url(tmp_path / "d9.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    insp = inspect(engine)
+    assert "safety_review_runs" in insp.get_table_names()
+    assert "safety_findings" in insp.get_table_names()
+    cols = {c["name"] for c in insp.get_columns("safety_review_runs")}
+    expected = {"id", "scope", "status", "document_id", "chunk_id",
+                "document_id_snapshot", "chunk_id_snapshot",
+                "retrieval_audit_id", "input_sha256", "policy_version",
+                "detector_version", "provider", "model", "prompt_version",
+                "schema_version", "llm_status", "final_action",
+                "failure_code", "created_at", "completed_at"}
+    assert cols == expected
+    engine.dispose()
+
+
+def test_d9_named_checks_exist(tmp_path):
+    db_url = _db_url(tmp_path / "d9-checks.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    insp = inspect(engine)
+    names = {c["name"] for c in insp.get_check_constraints("safety_review_runs")}
+    expected = {"ck_safety_runs_scope", "ck_safety_runs_status",
+                "ck_safety_runs_llm_status", "ck_safety_runs_action",
+                "ck_safety_runs_hash", "ck_safety_runs_provenance",
+                "ck_safety_runs_lifecycle"}
+    assert expected.issubset(names)
+    engine.dispose()
+
+
+def test_d9_partial_unique_indexes_exist(tmp_path):
+    db_url = _db_url(tmp_path / "d9-idx.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    with engine.connect() as conn:
+        idx_rows = conn.execute(text(
+            "SELECT sql FROM sqlite_master WHERE type='index' "
+            "AND tbl_name='safety_review_runs' AND sql IS NOT NULL"
+        )).fetchall()
+    partial_sql = " ".join(r[0] for r in idx_rows)
+    assert "CREATE UNIQUE INDEX" in partial_sql
+    assert "scope = 'ingestion'" in partial_sql and "document_id_snapshot" in partial_sql
+    assert "scope = 'context'" in partial_sql and "chunk_id_snapshot" in partial_sql
+    assert "scope = 'answer'" in partial_sql
+    engine.dispose()
+
+
+def _d9_insert_extraction(engine, *, error_code, attempt_count, sha):
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO graph_extractions (chunk_id, provider, model, "
+            "prompt_version, schema_version, status, error_code, "
+            "input_sha256, attempt_count, is_identity_owner, completed_at) "
+            "VALUES (1, 'p', 'm', 'pv', 'sv', 'skipped', :code, :sha, "
+            ":attempts, 1, '2026-08-01T00:00:00Z')"
+        ), {"code": error_code, "sha": sha, "attempts": attempt_count})
+
+
+def test_d9_graph_extractions_skip_check_includes_safety_blocked(tmp_path):
+    db_url = _db_url(tmp_path / "d9-skip.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (document_id, \"index\", text, "
+            "start_offset, end_offset) VALUES (0, 0, 'x', 0, 1)"))
+    # valid at d9: skipped + safety_blocked + attempt_count == 0
+    _d9_insert_extraction(engine, error_code="safety_blocked",
+                          attempt_count=0, sha="a" * 64)
+    # rejected: skipped requires attempt_count == 0 (distinct input_sha256 so
+    # the skip-reason CHECK raises, not the identity-owner unique index)
+    with pytest.raises(IntegrityError):
+        _d9_insert_extraction(engine, error_code="safety_blocked",
+                              attempt_count=1, sha="b" * 64)
+    # rejected: only the three stable skip codes are permitted
+    with pytest.raises(IntegrityError):
+        _d9_insert_extraction(engine, error_code="unsupported_skip_code",
+                              attempt_count=0, sha="c" * 64)
+    engine.dispose()
+
+
+def test_d9_candidate_decisions_check_includes_rejected_safety(tmp_path):
+    db_url = _db_url(tmp_path / "d9-decision.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    insp = inspect(engine)
+    decision_sql = " ".join(
+        c.get("sqltext", "")
+        for c in insp.get_check_constraints("retrieval_candidate_decisions")
+    )
+    assert "rejected_safety" in decision_sql
+    assert "rejected_injection" in decision_sql
+    assert "selected" in decision_sql
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO retrieval_candidate_decisions (decision) "
+                "VALUES ('rejected_safety_typo')"
+            ))
+    engine.dispose()
+
+
+def test_d9_downgrade_refuses_when_safety_blocked_rows_present(tmp_path):
+    db_url = _db_url(tmp_path / "d9-refuse.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (document_id, \"index\", text, "
+            "start_offset, end_offset) VALUES (0, 0, 'x', 0, 1)"))
+    _d9_insert_extraction(engine, error_code="safety_blocked",
+                          attempt_count=0, sha="a" * 64)
+    with pytest.raises(RuntimeError):
+        command.downgrade(_alembic_config(db_url), "c8a4e6b0d3f2")
+    engine.dispose()
+
+
+def test_d9_downgrade_refuses_when_rejected_safety_rows_present(tmp_path):
+    db_url = _db_url(tmp_path / "d9-refuse-rs.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    sha = "a" * 64
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO retrieval_audits (id, query_sha256, retrieval_mode, "
+            "status, provenance_policy_version, retrieval_policy_version, "
+            "context_policy_version, completed_at) "
+            "VALUES ('audit-1', :sha, 'vector', 'completed', 'p', 'r', 'c', "
+            "'2026-08-01T00:00:00Z')"
+        ), {"sha": "b" * 64})
+        conn.execute(text(
+            "INSERT INTO retrieval_candidate_decisions "
+            "(audit_id, chunk_id_snapshot, document_id_snapshot, "
+            "content_sha256, decision, reason_codes, provenance_score) "
+            "VALUES ('audit-1', 1, 1, :sha, 'rejected_safety', '[]', 0.5)"
+        ), {"sha": sha})
+    with pytest.raises(RuntimeError):
+        command.downgrade(_alembic_config(db_url), "c8a4e6b0d3f2")
+    engine.dispose()
+
+
+def test_d9_downgrade_representable_data_restores_c8_b7_exactly(tmp_path):
+    db_url = _db_url(tmp_path / "d9-down-ok.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (document_id, \"index\", text, "
+            "start_offset, end_offset) VALUES (0, 0, 'x', 0, 1)"))
+    _d9_insert_extraction(engine, error_code="extraction_disabled",
+                          attempt_count=0, sha="a" * 64)
+    rows_before = engine.connect().execute(text(
+        "SELECT id, status, error_code FROM graph_extractions ORDER BY id"
+    )).fetchall()
+    command.downgrade(_alembic_config(db_url), "c8a4e6b0d3f2")
+    insp = inspect(engine)
+    tables = set(insp.get_table_names())
+    assert "safety_review_runs" not in tables
+    assert "safety_findings" not in tables
+    assert _revision(engine) == "c8a4e6b0d3f2"
+    ge_sql = " ".join(
+        c.get("sqltext", "")
+        for c in insp.get_check_constraints("graph_extractions")
+    )
+    assert "safety_blocked" not in ge_sql
+    dec_sql = " ".join(
+        c.get("sqltext", "")
+        for c in insp.get_check_constraints("retrieval_candidate_decisions")
+    )
+    assert "rejected_safety" not in dec_sql
+    rows_after = engine.connect().execute(text(
+        "SELECT id, status, error_code FROM graph_extractions ORDER BY id"
+    )).fetchall()
+    assert rows_after == rows_before
+    engine.dispose()
+
+
+def test_d9_re_upgrade_after_downgrade_is_lossless(tmp_path):
+    db_url = _db_url(tmp_path / "d9-roundtrip.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (document_id, \"index\", text, "
+            "start_offset, end_offset) VALUES (0, 0, 'x', 0, 1)"))
+    _d9_insert_extraction(engine, error_code="extraction_disabled",
+                          attempt_count=0, sha="a" * 64)
+    fingerprint_before = engine.connect().execute(text(
+        "SELECT id, status, error_code, attempt_count, input_sha256 "
+        "FROM graph_extractions ORDER BY id"
+    )).fetchall()
+    command.downgrade(_alembic_config(db_url), "c8a4e6b0d3f2")
+    upgrade_database(db_url)
+    assert _revision(engine) == D9_HEAD
+    fingerprint_after = engine.connect().execute(text(
+        "SELECT id, status, error_code, attempt_count, input_sha256 "
+        "FROM graph_extractions ORDER BY id"
+    )).fetchall()
+    assert fingerprint_after == fingerprint_before
+    insp = inspect(engine)
+    assert "safety_review_runs" in insp.get_table_names()
+    assert "safety_findings" in insp.get_table_names()
+    engine.dispose()
+
+
+def test_d9_upgrade_from_c8_with_data_preserves_all_rows(tmp_path):
+    db_url = _db_url(tmp_path / "d9-from-c8.db")
+    command.upgrade(_alembic_config(db_url), "c8a4e6b0d3f2")
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (document_id, \"index\", text, "
+            "start_offset, end_offset) VALUES (0, 0, 'x', 0, 1)"))
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO graph_extractions (chunk_id, provider, model, "
+            "prompt_version, schema_version, status, error_code, "
+            "input_sha256, attempt_count, is_identity_owner, completed_at) "
+            "VALUES (1, 'p', 'm', 'pv', 'sv', 'skipped', 'extraction_disabled', "
+            ":sha, 0, 1, '2026-08-01T00:00:00Z')"
+        ), {"sha": "a" * 64})
+    rows_before = engine.connect().execute(text(
+        "SELECT id, input_sha256 FROM graph_extractions ORDER BY id"
+    )).fetchall()
+    engine.dispose()
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    assert _revision(engine) == D9_HEAD
+    rows_after = engine.connect().execute(text(
+        "SELECT id, input_sha256 FROM graph_extractions ORDER BY id"
+    )).fetchall()
+    assert rows_after == rows_before
+    insp = inspect(engine)
+    assert "safety_review_runs" in insp.get_table_names()
+    assert "safety_findings" in insp.get_table_names()
+    assert engine.connect().execute(text(
+        "SELECT COUNT(*) FROM safety_review_runs")).scalar() == 0
+    assert engine.connect().execute(text(
+        "SELECT COUNT(*) FROM safety_findings")).scalar() == 0
+    engine.dispose()
+
+
+def test_d9_upgrade_from_every_prior_head(tmp_path):
+    for head in ["dee48bc24a7f", "4c9a8d7e6f5b", "a6e2c4f8b1d9",
+                 "b7f3d5a9c2e1", "c8a4e6b0d3f2"]:
+        db_url = _db_url(tmp_path / f"from-{head}.db")
+        command.upgrade(_alembic_config(db_url), head)
+        upgrade_database(db_url)
+        engine = create_engine(db_url)
+        assert _revision(engine) == D9_HEAD
+        engine.dispose()
+
+
+def test_d9_fk_cascade_deletes_safety_findings_on_run_delete(tmp_path):
+    import sqlite3
+    db_path = tmp_path / "d9-cascade.db"
+    upgrade_database(_db_url(db_path))
+    sha = "a" * 64
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=ON")
+    cur = conn.execute(
+        "INSERT INTO safety_review_runs (scope, status, input_sha256, "
+        "policy_version, detector_version, llm_status, document_id_snapshot) "
+        "VALUES ('ingestion', 'pending', ?, 'safety-v1', 'det-1', 'skipped', 1)",
+        (sha,))
+    rid = cur.lastrowid
+    conn.execute(
+        "INSERT INTO safety_findings (review_run_id, category, severity, "
+        "action, start_offset, end_offset, source_rule_ids, excerpt_sha256) "
+        "VALUES (?, 'violence', 3, 'warn', 0, 4, ?, ?)",
+        (rid, '["SAF001_violence"]', sha))
+    conn.execute("DELETE FROM safety_review_runs WHERE id = ?", (rid,))
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM safety_findings WHERE review_run_id = ?", (rid,)
+    ).fetchone()[0]
+    conn.commit()
+    conn.close()
+    assert remaining == 0
+
+
+def test_d9_fk_set_null_on_document_delete_preserves_snapshot(tmp_path):
+    import sqlite3
+    db_path = tmp_path / "d9-setnull.db"
+    upgrade_database(_db_url(db_path))
+    sha = "a" * 64
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=ON")
+    cur = conn.execute(
+        "INSERT INTO documents (title, ingestion_status) VALUES ('D', 'failed')")
+    did = cur.lastrowid
+    conn.execute(
+        "INSERT INTO safety_review_runs (scope, status, input_sha256, "
+        "policy_version, detector_version, llm_status, document_id, "
+        "document_id_snapshot) VALUES ('ingestion', 'pending', ?, "
+        "'safety-v1', 'det-1', 'skipped', ?, ?)",
+        (sha, did, did))
+    conn.execute("DELETE FROM documents WHERE id = ?", (did,))
+    row = conn.execute(
+        "SELECT document_id, document_id_snapshot FROM safety_review_runs"
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    assert row[0] is None
+    assert row[1] == did
+
+
+def test_d9_lifecycle_check_rejects_invalid_combinations(tmp_path):
+    db_url = _db_url(tmp_path / "d9-life.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    sha = "a" * 64
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO safety_review_runs (scope, status, input_sha256, "
+                "policy_version, detector_version, llm_status, document_id_snapshot, "
+                "completed_at) VALUES ('ingestion', 'pending', :sha, 'safety-v1', "
+                "'det-1', 'skipped', 1, '2026-08-01T00:00:00Z')"
+            ), {"sha": sha})
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO safety_review_runs (scope, status, input_sha256, "
+                "policy_version, detector_version, llm_status, document_id_snapshot, "
+                "final_action, completed_at, failure_code) VALUES ('ingestion', "
+                "'succeeded', :sha, 'safety-v1', 'det-1', 'skipped', 1, 'allow', "
+                "'2026-08-01T00:00:00Z', 'boom')"
+            ), {"sha": sha})
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO safety_review_runs (scope, status, input_sha256, "
+                "policy_version, detector_version, llm_status, document_id_snapshot, "
+                "completed_at) VALUES ('ingestion', 'failed', :sha, 'safety-v1', "
+                "'det-1', 'failed', 1, '2026-08-01T00:00:00Z')"
+            ), {"sha": sha})
+    engine.dispose()
+
+
+def test_d9_provenance_check_rejects_wrong_scope_column_combination(tmp_path):
+    db_url = _db_url(tmp_path / "d9-prov.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    sha = "a" * 64
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO safety_review_runs (scope, status, input_sha256, "
+                "policy_version, detector_version, llm_status, document_id_snapshot, "
+                "chunk_id_snapshot) VALUES ('ingestion', 'pending', :sha, "
+                "'safety-v1', 'det-1', 'skipped', 1, 1)"
+            ), {"sha": sha})
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO safety_review_runs (scope, status, input_sha256, "
+                "policy_version, detector_version, llm_status, retrieval_audit_id, "
+                "document_id_snapshot) VALUES ('answer', 'pending', :sha, "
+                "'safety-v1', 'det-1', 'skipped', 'audit-1', 1)"
+            ), {"sha": sha})
     engine.dispose()

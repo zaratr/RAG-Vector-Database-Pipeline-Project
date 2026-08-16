@@ -183,5 +183,182 @@ def test_prune_output_has_closed_keys(tmp_path):
     }
     assert required_keys.issubset(set(data.keys()))
     assert data["schema_version"] == "security-audit-prune-v1"
-    assert data["head"] == "c8a4e6b0d3f2"
+    assert data["head"] == "d9b5f7c1e4a3"
     assert data["batch_size"] == 1000
+
+
+# ---------------------------------------------------------------------------
+# 10C.4: d9 cascade subprocess contract
+# ---------------------------------------------------------------------------
+
+def _d9_fixture_db(tmp_path, *, eligible_old=True):
+    """Build a d9 database with the pruning-CLI fixture set.
+
+    - one eligible audit (old terminal) with candidate decisions plus linked
+      context and answer safety runs/findings;
+    - one retained boundary audit (recent terminal) with equivalent children;
+    - one unrelated ingestion-scope safety run.
+    """
+    import json
+    import sqlite3
+    import subprocess
+    import sys as _sys
+
+    import secrets as _secrets
+
+    db_path = tmp_path / f"prune-security-audits-{_secrets.token_hex(16)}.db"
+    subprocess.run(
+        [_sys.executable, "-m", "app.core.migrations"],
+        env={**__import__("os").environ,
+             "RAG_DATABASE_URL": f"sqlite:///{db_path}"},
+        capture_output=True, check=True,
+    )
+    conn = sqlite3.connect(str(db_path))
+    now_iso = "2026-08-15T12:00:00Z"
+    old_iso = "2026-05-15T12:00:00Z"  # ~92 days before now
+    sha = "a" * 64
+    conn.execute(
+        "INSERT INTO documents (title, ingestion_status, trust_tier, "
+        "trust_score, trust_policy_version, ingestion_origin) "
+        "VALUES ('D1', 'ready', 'standard', 0.5, 'p', 'api')")
+    doc_id = conn.execute("SELECT id FROM documents").fetchone()[0]
+    conn.execute(
+        "INSERT INTO chunks (document_id, \"index\", text, start_offset, "
+        "end_offset, vector_id, media_type) "
+        "VALUES (?, 0, 'chunk text', 0, 10, 'v1', 'text/plain')", (doc_id,))
+    chunk_id = conn.execute("SELECT id FROM chunks").fetchone()[0]
+
+    def _audit(audit_id, completed_iso):
+        conn.execute(
+            "INSERT INTO retrieval_audits (id, query_sha256, retrieval_mode, "
+            "status, provenance_policy_version, retrieval_policy_version, "
+            "context_policy_version, candidate_count, selected_count, "
+            "rejected_count, completed_at) VALUES (?, ?, 'vector', "
+            "'completed', 'p', 'r', 'c', 1, 1, 0, ?)",
+            (audit_id, sha, completed_iso))
+
+    def _decision(audit_id, chunk_snapshot):
+        conn.execute(
+            "INSERT INTO retrieval_candidate_decisions (audit_id, "
+            "document_id, chunk_id, document_id_snapshot, chunk_id_snapshot, "
+            "decision, provenance_score, reason_codes, content_sha256) "
+            "VALUES (?, ?, ?, ?, ?, 'selected', 0.5, '[]', ?)",
+            (audit_id, doc_id, chunk_id, doc_id, chunk_snapshot, sha))
+
+    def _safety_run(run_id, scope, audit_id, snapshot_doc, snapshot_chunk):
+        conn.execute(
+            "INSERT INTO safety_review_runs (id, scope, status, document_id, "
+            "chunk_id, document_id_snapshot, chunk_id_snapshot, "
+            "retrieval_audit_id, input_sha256, policy_version, "
+            "detector_version, llm_status, final_action, completed_at) "
+            "VALUES (?, ?, 'succeeded', ?, ?, ?, ?, ?, ?, 'safety-v1', "
+            "'rules-v1', 'skipped', 'allow', '2026-08-15T12:00:00Z')",
+            (run_id, scope,
+             snapshot_doc if scope == "context" else None,
+             snapshot_chunk if scope == "context" else None,
+             snapshot_doc, snapshot_chunk, audit_id, sha))
+        conn.execute(
+            "INSERT INTO safety_findings (review_run_id, category, severity, "
+            "action, start_offset, end_offset, source_rule_ids, "
+            "excerpt_sha256) VALUES (?, 'violence', 3, 'warn', 0, 4, "
+            "'[\"SAF001_violence\"]', ?)", (run_id, sha))
+
+    _audit("eligible-audit", old_iso)
+    _decision("eligible-audit", chunk_id)
+    _safety_run(1, "context", "eligible-audit", doc_id, chunk_id)
+    _safety_run(2, "answer", "eligible-audit", None, None)
+
+    _audit("boundary-audit", now_iso)
+    _decision("boundary-audit", chunk_id)
+    _safety_run(3, "context", "boundary-audit", doc_id, chunk_id)
+    _safety_run(4, "answer", "boundary-audit", None, None)
+
+    # Unrelated ingestion-scope run: never pruned by audit pruning.
+    conn.execute(
+        "INSERT INTO safety_review_runs (id, scope, status, document_id, "
+        "document_id_snapshot, input_sha256, policy_version, "
+        "detector_version, llm_status, final_action, completed_at) "
+        "VALUES (5, 'ingestion', 'succeeded', ?, ?, ?, 'safety-v1', "
+        "'rules-v1', 'skipped', 'allow', '2026-08-15T12:00:00Z')",
+        (doc_id, doc_id, sha))
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_d9_cascade_subprocess_contract(tmp_path):
+    """Dry-run reports child counts without writes; pruning removes only the
+    eligible audit's decisions and linked context/answer runs/findings; the
+    boundary audit and ingestion run survive byte-for-byte; second run is a
+    no-op."""
+    import json
+    import sqlite3
+    import subprocess
+    import sys as _sys
+
+    db_path = _d9_fixture_db(tmp_path)
+
+    def _run(*extra):
+        return subprocess.run(
+            [_sys.executable, "scripts/prune_security_audits.py",
+             "--before-days", "30", "--database-url",
+             f"sqlite:///{db_path}", "--allow-disposable-database", *extra],
+            capture_output=True, text=True, check=False,
+            cwd=str(Path(__file__).resolve().parents[2]),
+        )
+
+    dry = _run("--dry-run")
+    assert dry.returncode == 0, dry.stderr
+    dry_data = json.loads(dry.stdout)
+    assert dry_data["eligible_audits"] == 1
+    assert dry_data["eligible_candidate_decisions"] == 1
+    assert dry_data["eligible_safety_reviews"] == 2
+    assert dry_data["eligible_safety_findings"] == 2
+
+    conn = sqlite3.connect(str(db_path))
+    before_boundary = conn.execute(
+        "SELECT id, status, completed_at FROM retrieval_audits "
+        "WHERE id = 'boundary-audit'").fetchall()
+    before_ingestion = conn.execute(
+        "SELECT id, scope, status, final_action FROM safety_review_runs "
+        "WHERE id = 5").fetchall()
+    conn.close()
+
+    prune = _run()
+    assert prune.returncode == 0, prune.stderr
+    prune_data = json.loads(prune.stdout)
+    assert prune_data["deleted_audits"] == 1
+    assert prune_data["deleted_candidate_decisions"] == 1
+    assert prune_data["deleted_safety_reviews"] == 2
+    assert prune_data["deleted_safety_findings"] == 2
+
+    conn = sqlite3.connect(str(db_path))
+    assert conn.execute(
+        "SELECT COUNT(*) FROM retrieval_audits").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM retrieval_candidate_decisions").fetchone()[0] == 1
+    # Context/answer runs linked to the eligible audit are gone; the
+    # boundary-linked and ingestion-scope runs remain.
+    remaining_runs = conn.execute(
+        "SELECT id, scope FROM safety_review_runs ORDER BY id").fetchall()
+    assert remaining_runs == [(3, "context"), (4, "answer"), (5, "ingestion")]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM safety_findings").fetchone()[0] == 2
+    after_boundary = conn.execute(
+        "SELECT id, status, completed_at FROM retrieval_audits "
+        "WHERE id = 'boundary-audit'").fetchall()
+    after_ingestion = conn.execute(
+        "SELECT id, scope, status, final_action FROM safety_review_runs "
+        "WHERE id = 5").fetchall()
+    conn.close()
+    assert after_boundary == before_boundary
+    assert after_ingestion == before_ingestion
+
+    second = _run()
+    assert second.returncode == 0
+    second_data = json.loads(second.stdout)
+    assert second_data["deleted_audits"] == 0
+    assert second_data["deleted_candidate_decisions"] == 0
+    assert second_data["deleted_safety_reviews"] == 0
+    assert second_data["deleted_safety_findings"] == 0
+    db_path.unlink(missing_ok=True)

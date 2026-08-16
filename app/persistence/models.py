@@ -146,6 +146,12 @@ class GraphExtraction(Base):
             "length(input_sha256) = 64 AND input_sha256 NOT GLOB '*[^0-9a-f]*'",
             name="ck_graph_extractions_input_sha256_hex",
         ),
+        CheckConstraint(
+            "status != 'skipped' OR (error_code IN "
+            "('extraction_disabled', 'unsupported_media_type', 'safety_blocked') "
+            "AND attempt_count = 0)",
+            name="ck_graph_extractions_skip_reason",
+        ),
         Index(
             "uq_graph_extractions_identity_owner",
             "chunk_id",
@@ -345,6 +351,13 @@ class RetrievalCandidateDecision(Base):
             "provenance_score >= 0 AND provenance_score <= 1",
             name="ck_candidate_decisions_provenance_score",
         ),
+        CheckConstraint(
+            "decision IN ('selected', 'rejected_distance', "
+            "'rejected_blocked_source', 'rejected_source_cap', "
+            "'rejected_document_cap', 'rejected_duplicate', "
+            "'rejected_injection', 'rejected_safety')",
+            name="ck_candidate_decisions_decision",
+        ),
         Index("ix_candidate_decisions_audit_decision", "audit_id", "decision"),
         Index("ix_candidate_decisions_live_doc", "document_id"),
         Index("ix_candidate_decisions_live_chunk", "chunk_id"),
@@ -384,3 +397,180 @@ class IngestionRateBucket(Base):
     identity_sha256 = Column(String(64), primary_key=True)
     window_start_epoch = Column(Integer, primary_key=True)
     request_count = Column(Integer, nullable=False)
+
+
+class SafetyReviewRun(Base):
+    """Persisted safety review run (10C.4).
+
+    Provenance is immutable through the snapshot columns: ingestion reviews
+    hang off a document snapshot, context reviews off a retrieval audit plus
+    chunk snapshot, answer reviews off the retrieval audit alone. Partial
+    unique indexes make ``begin`` idempotent per review target.
+    """
+    __tablename__ = "safety_review_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('ingestion', 'context', 'answer')",
+            name="ck_safety_runs_scope",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'succeeded', 'failed')",
+            name="ck_safety_runs_status",
+        ),
+        CheckConstraint(
+            "llm_status IN ('skipped', 'succeeded', 'failed')",
+            name="ck_safety_runs_llm_status",
+        ),
+        CheckConstraint(
+            "final_action IS NULL OR final_action IN "
+            "('allow', 'warn', 'filter', 'block')",
+            name="ck_safety_runs_action",
+        ),
+        CheckConstraint(
+            "length(input_sha256) = 64 AND input_sha256 NOT GLOB '*[^0-9a-f]*'",
+            name="ck_safety_runs_hash",
+        ),
+        CheckConstraint(
+            "(scope = 'ingestion' AND document_id_snapshot IS NOT NULL "
+            "AND chunk_id_snapshot IS NULL AND chunk_id IS NULL "
+            "AND retrieval_audit_id IS NULL) OR "
+            "(scope = 'context' AND document_id_snapshot IS NOT NULL "
+            "AND chunk_id_snapshot IS NOT NULL "
+            "AND retrieval_audit_id IS NOT NULL) OR "
+            "(scope = 'answer' AND document_id_snapshot IS NULL "
+            "AND chunk_id_snapshot IS NULL AND document_id IS NULL "
+            "AND chunk_id IS NULL AND retrieval_audit_id IS NOT NULL)",
+            name="ck_safety_runs_provenance",
+        ),
+        CheckConstraint(
+            "(document_id IS NULL OR document_id = document_id_snapshot) "
+            "AND (chunk_id IS NULL OR chunk_id = chunk_id_snapshot)",
+            name="ck_safety_runs_live_ids",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND completed_at IS NULL AND final_action "
+            "IS NULL AND failure_code IS NULL AND llm_status = 'skipped') OR "
+            "(status = 'succeeded' AND completed_at IS NOT NULL AND "
+            "final_action IS NOT NULL AND failure_code IS NULL AND "
+            "llm_status IN ('skipped', 'succeeded', 'failed')) OR "
+            "(status = 'failed' AND completed_at IS NOT NULL AND final_action "
+            "IS NULL AND failure_code IS NOT NULL AND llm_status IN "
+            "('skipped', 'failed'))",
+            name="ck_safety_runs_lifecycle",
+        ),
+        Index("ix_safety_runs_scope_status_created",
+              "scope", "status", "created_at"),
+        Index("ix_safety_runs_document", "document_id"),
+        Index("ix_safety_runs_chunk", "chunk_id"),
+        Index("ix_safety_runs_document_snapshot", "document_id_snapshot"),
+        Index("ix_safety_runs_chunk_snapshot", "chunk_id_snapshot"),
+        Index("ix_safety_runs_retrieval_audit", "retrieval_audit_id"),
+        Index("ix_safety_runs_policy_version", "policy_version"),
+        Index(
+            "uq_safety_runs_ingestion_document",
+            "document_id_snapshot", unique=True,
+            sqlite_where=text("scope = 'ingestion'"),
+        ),
+        Index(
+            "uq_safety_runs_context_audit_chunk",
+            "retrieval_audit_id", "chunk_id_snapshot", unique=True,
+            sqlite_where=text("scope = 'context'"),
+        ),
+        Index(
+            "uq_safety_runs_answer_audit",
+            "retrieval_audit_id", unique=True,
+            sqlite_where=text("scope = 'answer'"),
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    scope = Column(String(20), nullable=False)
+    status = Column(String(20), nullable=False, default="pending",
+                    server_default="pending")
+    document_id = Column(
+        Integer, ForeignKey("documents.id", ondelete="SET NULL"), nullable=True)
+    chunk_id = Column(
+        Integer, ForeignKey("chunks.id", ondelete="SET NULL"), nullable=True)
+    document_id_snapshot = Column(Integer, nullable=True)
+    chunk_id_snapshot = Column(Integer, nullable=True)
+    retrieval_audit_id = Column(
+        String(36), ForeignKey("retrieval_audits.id", ondelete="CASCADE"),
+        nullable=True)
+    input_sha256 = Column(String(64), nullable=False)
+    policy_version = Column(String(50), nullable=False)
+    detector_version = Column(String(50), nullable=False)
+    provider = Column(String(50), nullable=True)
+    model = Column(String(255), nullable=True)
+    prompt_version = Column(String(50), nullable=True)
+    schema_version = Column(String(50), nullable=True)
+    llm_status = Column(String(20), nullable=False, default="skipped",
+                        server_default="skipped")
+    final_action = Column(String(10), nullable=True)
+    failure_code = Column(String(100), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False,
+                        server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    findings = relationship(
+        "SafetyFinding", back_populates="review_run",
+        cascade="all, delete-orphan",
+    )
+
+
+class SafetyFinding(Base):
+    """Persisted safety finding for a review run (10C.4).
+
+    Never carries full reviewed input: only bounded excerpts (v1 stores none)
+    and the excerpt hash. ``source_rule_ids`` is the canonical sorted JSON
+    array; source (deterministic/llm/merged) derives from the ID prefixes.
+    """
+    __tablename__ = "safety_findings"
+    __table_args__ = (
+        CheckConstraint(
+            "category IN ('violence', 'self_harm', 'sexual_content', "
+            "'hate_harassment', 'illegal_activity', 'privacy_credentials')",
+            name="ck_safety_findings_category",
+        ),
+        CheckConstraint(
+            "severity >= 0 AND severity <= 4",
+            name="ck_safety_findings_severity",
+        ),
+        CheckConstraint(
+            "action IN ('allow', 'warn', 'filter', 'block')",
+            name="ck_safety_findings_action",
+        ),
+        CheckConstraint(
+            "start_offset >= 0 AND end_offset > start_offset",
+            name="ck_safety_findings_offsets",
+        ),
+        CheckConstraint(
+            "length(excerpt_sha256) = 64 AND excerpt_sha256 NOT GLOB "
+            "'*[^0-9a-f]*'",
+            name="ck_safety_findings_hash",
+        ),
+        CheckConstraint(
+            "bounded_excerpt IS NULL OR length(bounded_excerpt) <= 200",
+            name="ck_safety_findings_excerpt_length",
+        ),
+        UniqueConstraint(
+            "review_run_id", "category", "start_offset", "end_offset",
+            "source_rule_ids", name="uq_safety_findings_run_span_rules",
+        ),
+        Index("ix_safety_findings_run_category_action",
+              "review_run_id", "category", "action"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    review_run_id = Column(
+        Integer, ForeignKey("safety_review_runs.id", ondelete="CASCADE"),
+        nullable=False)
+    category = Column(String(50), nullable=False)
+    severity = Column(Integer, nullable=False)
+    action = Column(String(10), nullable=False)
+    start_offset = Column(Integer, nullable=False)
+    end_offset = Column(Integer, nullable=False)
+    source_rule_ids = Column(Text, nullable=False)
+    excerpt_sha256 = Column(String(64), nullable=False)
+    bounded_excerpt = Column(String(200), nullable=True)
+
+    review_run = relationship("SafetyReviewRun", back_populates="findings")

@@ -311,3 +311,25 @@ def load_safety_policy(path, fixture_path=None) -> SafetyPolicy:
         precedence=tuple(raw["precedence"]),
         retention_days=raw["retention_days"],
     )
+
+
+# Immutable process-wide policy: loaded once, fail-closed, no request reload.
+_SAFETY_POLICY_CACHE: SafetyPolicy | None = None
+
+
+def get_safety_policy() -> SafetyPolicy:
+    """Return the immutable content-safety policy, loading it exactly once."""
+    global _SAFETY_POLICY_CACHE
+    if _SAFETY_POLICY_CACHE is None:
+        from app.config import get_settings
+
+        _SAFETY_POLICY_CACHE = load_safety_policy(
+            get_settings().content_safety_policy_path
+        )
+    return _SAFETY_POLICY_CACHE
+
+
+def reset_safety_policy_cache() -> None:
+    """Test hook: forget the cached policy so the next call reloads strictly."""
+    global _SAFETY_POLICY_CACHE
+    _SAFETY_POLICY_CACHE = None

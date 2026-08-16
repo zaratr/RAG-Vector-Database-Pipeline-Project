@@ -129,6 +129,12 @@ def _run(args: argparse.Namespace) -> int:
                     f"SELECT COUNT(*) FROM safety_review_runs WHERE retrieval_audit_id IN ({placeholders})",
                     eligible_ids,
                 ).fetchone()[0]
+                eligible_safety_findings = conn.execute(
+                    f"SELECT COUNT(*) FROM safety_findings WHERE review_run_id IN ("
+                    f"SELECT id FROM safety_review_runs WHERE retrieval_audit_id IN "
+                    f"({placeholders}))",
+                    eligible_ids,
+                ).fetchone()[0]
             except sqlite3.OperationalError:
                 pass
 
@@ -175,6 +181,29 @@ def _run(args: argparse.Namespace) -> int:
                 f"SELECT COUNT(*) FROM retrieval_candidate_decisions WHERE audit_id IN ({placeholders})",
                 batch,
             ).fetchone()[0]
+            # 10C.4: context/answer safety runs hang off the audit (partial
+            # unique targets) and cascade their findings; delete explicitly so
+            # the closed-JSON counts are exact.
+            finding_count = conn.execute(
+                f"SELECT COUNT(*) FROM safety_findings WHERE review_run_id IN ("
+                f"SELECT id FROM safety_review_runs WHERE retrieval_audit_id IN "
+                f"({placeholders}))",
+                batch,
+            ).fetchone()[0]
+            review_count = conn.execute(
+                f"SELECT COUNT(*) FROM safety_review_runs WHERE retrieval_audit_id IN ({placeholders})",
+                batch,
+            ).fetchone()[0]
+            conn.execute(
+                f"DELETE FROM safety_findings WHERE review_run_id IN ("
+                f"SELECT id FROM safety_review_runs WHERE retrieval_audit_id IN "
+                f"({placeholders}))",
+                batch,
+            )
+            conn.execute(
+                f"DELETE FROM safety_review_runs WHERE retrieval_audit_id IN ({placeholders})",
+                batch,
+            )
             conn.execute(
                 f"DELETE FROM retrieval_candidate_decisions WHERE audit_id IN ({placeholders})",
                 batch,
@@ -185,6 +214,8 @@ def _run(args: argparse.Namespace) -> int:
             )
             deleted_audits += len(batch)
             deleted_decisions += dec_count
+            deleted_reviews += review_count
+            deleted_findings += finding_count
             applied_batches += 1
 
         # Verify no eligible IDs remain

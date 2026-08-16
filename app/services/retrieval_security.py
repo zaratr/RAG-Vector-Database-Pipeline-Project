@@ -25,6 +25,7 @@ Decision = Literal[
     "rejected_document_cap",
     "rejected_duplicate",
     "rejected_injection",
+    "rejected_safety",
 ]
 
 

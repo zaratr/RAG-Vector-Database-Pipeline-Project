@@ -8,6 +8,7 @@ from typing import List
 
 from sqlalchemy.orm import Session
 
+from app.persistence import models
 from app.services.embeddings import EmbeddingProvider
 from app.services.llm import LLMClient
 from app.services.vector_store import VectorStore
@@ -15,6 +16,12 @@ from app.services import retrieval
 from app.services.context_security import detect_context_injection, get_context_security_policy
 from app.services.graph_retrieval import GraphTraversalLimitError, UnsupportedGraphFilter
 from app.services.security_audit import SecurityAuditService
+from app.services.safety_review import (
+    ANSWER_WITHHELD,
+    SafetyReviewService,
+    SafetyReviewSubsystemFailure,
+    apply_answer_filter,
+)
 
 logger = logging.getLogger("rag-pipeline")
 
@@ -56,6 +63,17 @@ class ContextDetectorFailure(QuerySecurityFailure):
 
 class GenerationProviderFailure(QuerySecurityFailure):
     code = "generation_provider_failed"
+
+
+class SafetyReviewFailed(QuerySecurityFailure):
+    code = "safety_review_failed"
+
+
+class _ChunkRef:
+    """Minimal chunk stand-in carrying only the id the safety review needs."""
+
+    def __init__(self, chunk_id):
+        self.id = chunk_id
 
 
 def escape_evidence(text: str) -> str:
@@ -169,6 +187,57 @@ async def answer_query(
         _fail_audit(audit, session, audit_id, "context_detector_failed")
         raise ContextDetectorFailure("context detector failed") from exc
 
+    # 10C.4 context-scope safety review on each remaining SQL chunk.
+    from app.config import get_settings
+
+    settings = get_settings()
+    safety_context_counts = {"allowed": 0, "warned": 0, "filtered": 0, "blocked": 0}
+    safety_rejected_by_chunk: dict[int, list[str]] = {}
+    safety_policy_version = None
+    if settings.content_safety_enabled:
+        from app.services.safety_policy import get_safety_policy
+
+        try:
+            safety_policy = get_safety_policy()
+            safety_policy_version = safety_policy.version
+            safety_service = SafetyReviewService(session)
+            surviving: List[dict] = []
+            for ctx in allowed:
+                meta = ctx.get("metadata") or {}
+                chunk_id = meta.get("chunk_id")
+                run = safety_service.review_context(
+                    chunk=_ChunkRef(chunk_id),
+                    document_id=meta.get("document_id"),
+                    retrieval_audit_id=audit_id,
+                    text=ctx.get("text", ""),
+                    policy=safety_policy,
+                    mode=settings.safety_llm_mode,
+                )
+                if run.status != "succeeded":
+                    raise SafetyReviewSubsystemFailure(
+                        f"context safety review {run.status}: {run.failure_code}")
+                safety_context_counts[run.final_action] = \
+                    safety_context_counts.get(run.final_action, 0) + 1
+                if run.final_action in ("block", "filter"):
+                    finding_rows = (
+                        session.query(models.SafetyFinding)
+                        .filter_by(review_run_id=run.id)
+                        .all()
+                    )
+                    safety_rejected_by_chunk[chunk_id] = sorted({
+                        rule_id
+                        for row in finding_rows
+                        for rule_id in json.loads(row.source_rule_ids)
+                    })
+                else:
+                    surviving.append(ctx)
+            allowed = surviving
+        except QuerySecurityFailure:
+            raise
+        except Exception as exc:
+            _fail_audit(audit, session, audit_id, "safety_review_failed")
+            raise SafetyReviewFailed("context safety review failed") from exc
+
     # Final candidate decision persistence: start from the retrieval-stage
     # decisions, then override injection-rejected chunks (quarantine/block)
     # with their final rejected_injection decision and rule IDs. Rejected rows
@@ -192,6 +261,14 @@ async def answer_query(
                 "content_sha256": hashlib.sha256(
                     ctx.get("text", "").encode("utf-8")
                 ).hexdigest(),
+            }
+        safety_reasons = safety_rejected_by_chunk.get(chunk_id)
+        if safety_reasons is not None:
+            row = {
+                **row,
+                "decision": "rejected_safety",
+                "provenance_score": 0.0,
+                "reason_codes": json.dumps(safety_reasons),
             }
         final_decisions.append(row)
 
@@ -218,6 +295,15 @@ async def answer_query(
         "audit_id": audit_id,
     }
 
+    safety_summary = None
+    if settings.content_safety_enabled:
+        safety_summary = {
+            "policy_version": safety_policy_version,
+            "contexts": safety_context_counts,
+            "answer_action": "allow",
+            "answer_findings": 0,
+        }
+
     if not allowed:
         try:
             audit.complete(audit_id)
@@ -231,6 +317,7 @@ async def answer_query(
             "context": [],
             "query_id": audit_id,
             "security_summary": security_summary,
+            "safety_summary": safety_summary,
         }
 
     # Generation starts only after all final candidate decisions are durable.
@@ -246,6 +333,46 @@ async def answer_query(
         _fail_audit(audit, session, audit_id, "generation_provider_failed")
         raise GenerationProviderFailure("generation provider failed") from exc
 
+    # 10C.4 answer-scope review BEFORE constructing the HTTP response; the
+    # retrieval audit completes only after the answer review is persisted.
+    if settings.content_safety_enabled:
+        from app.services.safety_policy import get_safety_policy
+
+        try:
+            safety_policy = get_safety_policy()
+            safety_service = SafetyReviewService(session)
+            answer_run = safety_service.review_answer(
+                retrieval_audit_id=audit_id, text=answer,
+                policy=safety_policy, mode=settings.safety_llm_mode,
+            )
+            if answer_run.status != "succeeded":
+                raise SafetyReviewSubsystemFailure(
+                    f"answer safety review {answer_run.status}: "
+                    f"{answer_run.failure_code}")
+            if safety_summary is not None:
+                safety_summary["answer_action"] = answer_run.final_action
+            answer_findings = (
+                session.query(models.SafetyFinding)
+                .filter_by(review_run_id=answer_run.id)
+                .all()
+            )
+            if safety_summary is not None:
+                safety_summary["answer_findings"] = len(answer_findings)
+            if answer_run.final_action == "block":
+                # The unreviewed answer is never returned, logged, or excerpted.
+                answer = ANSWER_WITHHELD
+            elif answer_run.final_action == "filter":
+                spans = [
+                    (f.start_offset, f.end_offset, f.category)
+                    for f in answer_findings if f.action == "filter"
+                ]
+                answer = apply_answer_filter(answer, spans)
+        except QuerySecurityFailure:
+            raise
+        except Exception as exc:
+            _fail_audit(audit, session, audit_id, "safety_review_failed")
+            raise SafetyReviewFailed("answer safety review failed") from exc
+
     try:
         audit.complete(audit_id)
         session.commit()
@@ -258,4 +385,5 @@ async def answer_query(
         "context": allowed,
         "query_id": audit_id,
         "security_summary": security_summary,
+        "safety_summary": safety_summary,
     }

@@ -46,7 +46,9 @@ from app.services.retrieval_security import (  # noqa: E402
 # Backward-compatible alias for earlier callers.
 validate_corpus = validate_calibration_corpus
 
-EXPECTED_MIGRATION_HEAD = "c8a4e6b0d3f2"
+# 10C.4 moves the chain head to d9b5f7c1e4a3; the calibrator verifies
+# the disposable wrapper applied the complete current chain.
+EXPECTED_MIGRATION_HEAD = "d9b5f7c1e4a3"
 PRODUCTION_COLLECTION_NAME = "rag-collection"
 DISPOSABLE_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 DISPOSABLE_DB_URL_RE = re.compile(r"^sqlite:////tmp/calibration-(?P<run_id>[0-9a-f]{32})\.db$")

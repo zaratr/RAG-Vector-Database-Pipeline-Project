@@ -57,3 +57,5 @@ class QueryResponse(BaseModel):
     query_id: str | None = None
     # 10B.4/10B.5: why candidates were selected/rejected, without payload data.
     security_summary: dict | None = None
+    # 10C.4: safety enforcement summary (present only when safety enabled).
+    safety_summary: dict | None = None

@@ -17,6 +17,10 @@ from app.core.models import DocumentDetail, DocumentSummary
 from app.persistence import models, repositories
 from app.services.embeddings import get_embedding_provider
 from app.services.ingestion import chunks_for_document, ingest_text, ingest_image, VectorIndexIncomplete
+from app.services.safety_review import (
+    IngestionSafetyBlocked,
+    SafetyReviewSubsystemFailure,
+)
 from app.services.graph_extraction import (
     DisabledGraphExtractor,
     GraphExtractionError,
@@ -250,6 +254,20 @@ async def create_document(
     except GraphExtractionError as exc:
         raise HTTPException(
             status_code=502, detail="Graph extraction provider failed"
+        ) from exc
+    except SafetyReviewSubsystemFailure as exc:
+        # 10C.4: safety subsystem failure fails closed with 503.
+        raise HTTPException(
+            status_code=503, detail="safety_review_failed",
+        ) from exc
+    except IngestionSafetyBlocked as exc:
+        # 10C.4: ingestion-scope block|filter refuses with 422; the failed
+        # document, skipped safety_blocked identities, and the safety review
+        # are already persisted by the ingestion pipeline.
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "ingestion_safety_blocked",
+                    "final_action": exc.final_action},
         ) from exc
     # Accepted requests carry the same rate-limit headers as rejections.
     response.headers.update(rl_headers)
