@@ -119,7 +119,11 @@ def safe_client(monkeypatch, tmp_path):
     routes_query.get_llm_client = lambda **kwargs: llm_client
 
     # Track vector upserts so tests can assert none happen on blocked docs.
+    # The live list is shared through the module global so test bodies can
+    # reach it (the fixture yields only the TestClient).
     calls: list = []
+    _LAST_STORE_CALLS.clear()
+    _LAST_STORE_CALLS_ref.append(calls)
     original_upsert = store.upsert_embeddings
 
     async def _tracking_upsert(*args, **kwargs):
@@ -127,7 +131,6 @@ def safe_client(monkeypatch, tmp_path):
         return await original_upsert(*args, **kwargs)
 
     store.upsert_embeddings = _tracking_upsert
-    store.calls = calls
 
     yield TestClient(app)
 
@@ -183,15 +186,13 @@ def test_ingestion_block_creates_skipped_extraction_and_failed_document(
         session.close()
     assert safe_client.app  # client alive
     # no vectors upserted; no pending extraction remains
-    from app.services.vector_store import ChromaVectorStore  # noqa: F401
-    store = safe_client.app  # placeholder; vectors tracked via fixture store
-    # (vector assertion via the fixture's tracked calls)
-    global_calls = _LAST_STORE_CALLS
-    assert _LAST_STORE_CALLS == []
+    assert _LAST_STORE_CALLS_ref[-1] == []
 
 
-# The fixture shares the tracked upsert list through this module global.
+# The fixture shares the tracked upsert list through these module globals:
+# _LAST_STORE_CALLS is cleared per test; _ref[0] is the live per-test list.
 _LAST_STORE_CALLS: list = []
+_LAST_STORE_CALLS_ref: list = []
 
 
 @pytest.fixture(autouse=True)
@@ -220,7 +221,7 @@ def test_ingestion_filter_behaves_like_block_for_vectors(safe_client):
         assert run.final_action == "filter"
     finally:
         session.close()
-    assert _LAST_STORE_CALLS == []
+    assert _LAST_STORE_CALLS_ref[-1] == []
 
 
 def test_ingestion_warn_proceeds_to_normal_extraction(safe_client):
@@ -236,6 +237,9 @@ def test_ingestion_warn_proceeds_to_normal_extraction(safe_client):
             scope="ingestion").one()
         assert run.status == "succeeded"
         assert run.final_action == "warn"
+        # Positive control for the no-vector assertions: the normal path
+        # DOES upsert, so the tracked list is genuinely live.
+        assert len(_LAST_STORE_CALLS_ref[-1]) >= 1
     finally:
         session.close()
 
@@ -674,3 +678,81 @@ def test_concurrent_begin_one_winner_losers_reload(tmp_path):
     finally:
         session.close()
         cc_engine.dispose()
+
+
+def test_provider_success_persists_succeeded_llm_status():
+    """D-58: a valid provider outcome maps ok -> succeeded for the d9 check
+    and records provider provenance columns."""
+    from app.services.llm_safety_review import (
+        LLMSafetyFinding,
+        LLMSafetyReviewResult,
+    )
+    from app.services.safety_policy import load_safety_policy
+    from app.services.safety_review import SafetyReviewService
+
+    class _StubProvider:
+        provider_name = "stub"
+        model = "stub-model"
+
+        async def review(self, text, scope):
+            return LLMSafetyReviewResult(
+                findings=[LLMSafetyFinding(
+                    category="violence", severity=3, action="warn",
+                    start=8, end=22, evidence="stab the guard")],
+                overall_action="warn", rationale_codes=["x"])
+
+    policy = load_safety_policy(
+        PROJECT_ROOT / "config/content-safety-policy.json")
+    session = _get_session()
+    try:
+        sha_hash = hashlib.sha256(b"stub provider input").hexdigest()
+        session.add(models.RetrievalAudit(
+            id="stub-audit", query_sha256=sha_hash, retrieval_mode="vector",
+            status="pending", provenance_policy_version="p",
+            retrieval_policy_version="r", context_policy_version="c"))
+        session.commit()
+        service = SafetyReviewService(session)
+        run = service.review_answer(
+            retrieval_audit_id="stub-audit",
+            text="he will stab the guard in the scene",
+            policy=policy, mode="rules_only", provider=_StubProvider())
+        assert run.status == "succeeded"
+        assert run.llm_status == "succeeded"
+        assert run.final_action == "warn"
+        assert run.provider == "stub"
+        assert run.model == "stub-model"
+        assert run.prompt_version is not None
+        assert run.schema_version is not None
+    finally:
+        session.close()
+
+
+def test_loser_pending_reload_fails_typed():
+    """D-59: a second reviewer hitting a still-pending target gets a typed
+    subsystem failure, never an AttributeError."""
+    from app.services.safety_policy import load_safety_policy
+    from app.services.safety_review import (
+        SafetyReviewService,
+        SafetyReviewSubsystemFailure,
+    )
+
+    policy = load_safety_policy(
+        PROJECT_ROOT / "config/content-safety-policy.json")
+    session = _get_session()
+    try:
+        sha_hash = hashlib.sha256(b"loser pending input").hexdigest()
+        session.add(models.RetrievalAudit(
+            id="loser-audit", query_sha256=sha_hash, retrieval_mode="vector",
+            status="pending", provenance_policy_version="p",
+            retrieval_policy_version="r", context_policy_version="c"))
+        session.commit()
+        service = SafetyReviewService(session)
+        service.begin(
+            "answer", input_text="loser pending input", policy=policy,
+            retrieval_audit_id="loser-audit")  # leaves the row pending
+        with pytest.raises(SafetyReviewSubsystemFailure):
+            service.review_answer(
+                retrieval_audit_id="loser-audit",
+                text="loser pending input", policy=policy, mode="disabled")
+    finally:
+        session.close()

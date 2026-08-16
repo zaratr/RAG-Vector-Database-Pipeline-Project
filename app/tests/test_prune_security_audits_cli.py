@@ -362,3 +362,56 @@ def test_d9_cascade_subprocess_contract(tmp_path):
     assert second_data["deleted_safety_reviews"] == 0
     assert second_data["deleted_safety_findings"] == 0
     db_path.unlink(missing_ok=True)
+
+
+def test_prune_c8_head_non_dry_still_prunes(tmp_path):
+    """D-57: the safety-cascade deletion is head-gated; a c8-head database
+    (safety tables absent) must prune decisions/audits exactly as before."""
+    import json
+    import subprocess
+    import sys as _sys
+    from datetime import datetime, timedelta, timezone
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config as _Config
+
+    run_id = secrets.token_hex(16)
+    db_path = tmp_path / f"prune-security-audits-{run_id}.db"
+    db_url = f"sqlite:///{db_path}"
+    cfg = _Config("alembic.ini")
+    cfg.set_main_option(
+        "script_location",
+        str(Path(__file__).resolve().parents[2] / "app/persistence/alembic"))
+    cfg.set_main_option("sqlalchemy.url", db_url)
+    cfg.attributes["database_url_explicit"] = True
+    command.upgrade(cfg, "c8a4e6b0d3f2")
+
+    old_iso = (datetime.now(timezone.utc) - timedelta(days=90)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO retrieval_audits (id, query_sha256, retrieval_mode, "
+        "status, provenance_policy_version, retrieval_policy_version, "
+        "context_policy_version, completed_at) VALUES ('old-audit', ?, "
+        "'vector', 'completed', 'p', 'r', 'c', ?)", ("a" * 64, old_iso))
+    conn.commit()
+    conn.close()
+
+    result = subprocess.run(
+        [_sys.executable, "scripts/prune_security_audits.py",
+         "--before-days", "30", "--database-url", db_url,
+         "--allow-disposable-database"],
+        capture_output=True, text=True, check=False,
+        cwd=str(Path(__file__).resolve().parents[2]),
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["deleted_audits"] == 1
+    conn = sqlite3.connect(str(db_path))
+    assert conn.execute(
+        "SELECT COUNT(*) FROM retrieval_audits").fetchone()[0] == 0
+    conn.close()
+    db_path.unlink(missing_ok=True)

@@ -183,27 +183,31 @@ def _run(args: argparse.Namespace) -> int:
             ).fetchone()[0]
             # 10C.4: context/answer safety runs hang off the audit (partial
             # unique targets) and cascade their findings; delete explicitly so
-            # the closed-JSON counts are exact.
-            finding_count = conn.execute(
-                f"SELECT COUNT(*) FROM safety_findings WHERE review_run_id IN ("
-                f"SELECT id FROM safety_review_runs WHERE retrieval_audit_id IN "
-                f"({placeholders}))",
-                batch,
-            ).fetchone()[0]
-            review_count = conn.execute(
-                f"SELECT COUNT(*) FROM safety_review_runs WHERE retrieval_audit_id IN ({placeholders})",
-                batch,
-            ).fetchone()[0]
-            conn.execute(
-                f"DELETE FROM safety_findings WHERE review_run_id IN ("
-                f"SELECT id FROM safety_review_runs WHERE retrieval_audit_id IN "
-                f"({placeholders}))",
-                batch,
-            )
-            conn.execute(
-                f"DELETE FROM safety_review_runs WHERE retrieval_audit_id IN ({placeholders})",
-                batch,
-            )
+            # the closed-JSON counts are exact. Only at the d9 head — the
+            # safety tables do not exist at c8.
+            review_count = 0
+            finding_count = 0
+            if head == "d9b5f7c1e4a3":
+                finding_count = conn.execute(
+                    f"SELECT COUNT(*) FROM safety_findings WHERE review_run_id IN ("
+                    f"SELECT id FROM safety_review_runs WHERE retrieval_audit_id IN "
+                    f"({placeholders}))",
+                    batch,
+                ).fetchone()[0]
+                review_count = conn.execute(
+                    f"SELECT COUNT(*) FROM safety_review_runs WHERE retrieval_audit_id IN ({placeholders})",
+                    batch,
+                ).fetchone()[0]
+                conn.execute(
+                    f"DELETE FROM safety_findings WHERE review_run_id IN ("
+                    f"SELECT id FROM safety_review_runs WHERE retrieval_audit_id IN "
+                    f"({placeholders}))",
+                    batch,
+                )
+                conn.execute(
+                    f"DELETE FROM safety_review_runs WHERE retrieval_audit_id IN ({placeholders})",
+                    batch,
+                )
             conn.execute(
                 f"DELETE FROM retrieval_candidate_decisions WHERE audit_id IN ({placeholders})",
                 batch,

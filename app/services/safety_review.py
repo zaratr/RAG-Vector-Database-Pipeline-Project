@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.persistence import models
 from app.services.content_safety import SafetyAssessment, classify_content
+from app.services.llm_safety_review import PROMPT_VERSION, RESULT_SCHEMA_VERSION
 from app.services.safety_policy import SafetyPolicy
 
 DETECTOR_VERSION = "rules-v1"
@@ -203,8 +204,17 @@ class SafetyReviewService:
             run.review_llm_status = "failed"
         else:
             run.review_failure_code = None
-            run.review_llm_status = outcome.llm_status
+            # The 10C.3 outcome vocabulary is skipped|failed|ok; the d9
+            # column check permits skipped|succeeded|failed (D-58).
+            run.review_llm_status = (
+                "succeeded" if outcome.llm_status == "ok" else outcome.llm_status)
             run.review_outcome = outcome
+            if provider is not None:
+                run.provider = getattr(provider, "provider_name", None) \
+                    or type(provider).__name__[:50]
+                run.model = getattr(provider, "model", None)
+                run.prompt_version = PROMPT_VERSION
+                run.schema_version = RESULT_SCHEMA_VERSION
             self._record_findings(run.id, outcome.findings, input_text)
             self.session.commit()
         return run
@@ -292,14 +302,23 @@ class SafetyReviewService:
             "ingestion", input_text=text, policy=policy, mode=mode,
             provider=provider, document_id=document.id,
         )
+        return self._finish_review(run)
+
+    def _finish_review(self, run: models.SafetyReviewRun) -> models.SafetyReviewRun:
+        """Terminalize a freshly created review run (D-59: a reloaded
+        still-pending row — a concurrent creator owns it — fails typed)."""
         if run.status != "pending":
             return run  # terminal from a prior attempt; caller honors it
         failure = getattr(run, "review_failure_code", None)
         if failure is not None:
             return self.fail(run, failure_code=failure, llm_status="failed")
+        outcome = getattr(run, "review_outcome", None)
+        if outcome is None:
+            raise SafetyReviewSubsystemFailure(
+                f"safety run {run.id} is pending under a concurrent creator")
         return self.complete(
             run,
-            final_action=run.review_outcome.overall_action,
+            final_action=outcome.overall_action,
             llm_status=run.review_llm_status,
         )
 
@@ -313,16 +332,7 @@ class SafetyReviewService:
             provider=provider, document_id=document_id, chunk_id=chunk.id,
             retrieval_audit_id=retrieval_audit_id,
         )
-        if run.status != "pending":
-            return run
-        failure = getattr(run, "review_failure_code", None)
-        if failure is not None:
-            return self.fail(run, failure_code=failure, llm_status="failed")
-        return self.complete(
-            run,
-            final_action=run.review_outcome.overall_action,
-            llm_status=run.review_llm_status,
-        )
+        return self._finish_review(run)
 
     def review_answer(
         self, *, retrieval_audit_id: str, text: str, policy: SafetyPolicy,
@@ -333,16 +343,7 @@ class SafetyReviewService:
             "answer", input_text=text, policy=policy, mode=mode,
             provider=provider, retrieval_audit_id=retrieval_audit_id,
         )
-        if run.status != "pending":
-            return run
-        failure = getattr(run, "review_failure_code", None)
-        if failure is not None:
-            return self.fail(run, failure_code=failure, llm_status="failed")
-        return self.complete(
-            run,
-            final_action=run.review_outcome.overall_action,
-            llm_status=run.review_llm_status,
-        )
+        return self._finish_review(run)
 
     # ------------------------------------------------------------------
     # Internals

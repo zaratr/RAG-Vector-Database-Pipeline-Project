@@ -271,7 +271,10 @@ async def _handle_ingestion_failure(
         failed_document = session.get(models.Document, document_id)
         if failed_document is not None:
             failed_document.ingestion_status = "failed"
-            failed_document.failure_code = type(exc).__name__[:100]
+            # Preserve an explicitly set stable code (e.g. safety_blocked);
+            # only synthesize the exception-class code when none was set.
+            if not failed_document.failure_code:
+                failed_document.failure_code = type(exc).__name__[:100]
         session.commit()
     except Exception:  # pragma: no cover - best-effort failure marking
         session.rollback()
