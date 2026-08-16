@@ -99,7 +99,7 @@ async def lifespan(app: FastAPI):
     # (ranges and the envelope > file cross-field rule live in Settings).
     from app.config import get_settings as _get_settings
 
-    _get_settings()
+    boot_settings = _get_settings()
 
     from app.services.provenance import load_source_trust_policy
 
@@ -144,6 +144,25 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error("FATAL: context security policy load failed: %s", exc)
         raise
+
+    # 10C.1: load the content-safety policy when enabled — missing/invalid/
+    # unreadable policy aborts startup. Disabled by default; no request can
+    # replace the injected immutable policy object. Uses the freshly built
+    # settings, never the import-time snapshot, so env changes in tests and
+    # recreations are honored per startup.
+    if boot_settings.content_safety_enabled:
+        try:
+            from app.services.safety_policy import load_safety_policy
+
+            safety_policy = load_safety_policy(boot_settings.content_safety_policy_path)
+            app.state.content_safety_policy = safety_policy
+            logger.info(
+                "Content safety policy loaded: version=%s, rules=%d",
+                safety_policy.version, len(safety_policy.rules),
+            )
+        except Exception as exc:
+            logger.error("FATAL: content safety policy load failed: %s", exc)
+            raise
 
     yield
 

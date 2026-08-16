@@ -38,6 +38,9 @@ services:
       RAG_INGEST_RATE_LIMIT_REQUESTS: ${RAG_INGEST_RATE_LIMIT_REQUESTS:-30}
       RAG_INGEST_RATE_LIMIT_WINDOW_SECONDS: ${RAG_INGEST_RATE_LIMIT_WINDOW_SECONDS:-60}
       RAG_PLAN_PATH: ${RAG_PLAN_PATH:-/plan-archive}
+      RAG_CONTENT_SAFETY_ENABLED: ${RAG_CONTENT_SAFETY_ENABLED:-false}
+      RAG_CONTENT_SAFETY_POLICY_PATH: ${RAG_CONTENT_SAFETY_POLICY_PATH:-/app/config/content-safety-policy.json}
+      RAG_SAFETY_LLM_MODE: ${RAG_SAFETY_LLM_MODE:-disabled}
     volumes:
       - relational_data:/data
       # Read-only mount of the external Phase 10 plan archive; the plan is

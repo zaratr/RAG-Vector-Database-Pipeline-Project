@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     ingest_rate_limit_requests: int = Field(default=30, ge=1, le=1000)
     ingest_rate_limit_window_seconds: int = Field(default=60, ge=1, le=3600)
 
+    # 10C.1 content safety.
+    content_safety_enabled: bool = Field(default=False)
+    content_safety_policy_path: str = Field(
+        default="/app/config/content-safety-policy.json"
+    )
+    safety_llm_mode: str = Field(default="disabled")
+
     openai_api_key: Optional[str] = Field(default=None)
     chroma_host: Optional[str] = Field(default=None)
     chroma_port: int = Field(default=8000)
@@ -65,6 +72,15 @@ class Settings(BaseSettings):
             raise ValueError(
                 "RAG_INGESTION_REQUEST_MAX_BYTES must be greater than "
                 "RAG_INGESTION_FILE_MAX_BYTES"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_safety_llm_mode(self):
+        """10C.1: the LLM safety mode is a closed set."""
+        if self.safety_llm_mode not in ("disabled", "rules_only", "fail_closed"):
+            raise ValueError(
+                "RAG_SAFETY_LLM_MODE must be one of disabled|rules_only|fail_closed"
             )
         return self
 
