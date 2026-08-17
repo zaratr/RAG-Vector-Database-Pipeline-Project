@@ -82,6 +82,22 @@ def main() -> int:
     db_path = _sqlite_path_from_url(settings.database_url)
     sql_before = _fingerprint_sqlite(db_path)
 
+    # The warned fixture proceeds through the real extraction pipeline: when
+    # a live graph provider is reachable it creates graph rows that have no
+    # run-tag linkage. Capture per-table id watermarks so cleanup removes
+    # exactly this run's inserts and nothing pre-existing.
+    graph_tables = ("graph_edge_evidence", "entity_mentions",
+                    "graph_edges", "graph_entities")
+    watermarks: dict[str, int] = {}
+    _wm_conn = sqlite3.connect(f"file:{db_path.resolve().as_posix()}?mode=ro",
+                               uri=True)
+    try:
+        for table in graph_tables:
+            watermarks[table] = _wm_conn.execute(
+                f"SELECT COALESCE(MAX(id), 0) FROM {table}").fetchone()[0]
+    finally:
+        _wm_conn.close()
+
     http = httpx.Client(base_url=args.base_url, timeout=60.0)
     created_doc_ids: list[int] = []
     audit_ids: list[str] = []
@@ -188,11 +204,26 @@ def main() -> int:
             from app.core.db import create_database_engine
 
             engine = create_database_engine(settings.database_url)
+            vector_ids: list[str] = []
             with engine.begin() as conn:
+                # Collect this run's vector ids before the rows go: the
+                # warned/allowed fixtures DO upsert vectors, and leaving them
+                # behind breaks prior-phase Chroma fingerprints (D-65).
+                vector_ids = [
+                    row[0] for row in conn.execute(
+                        sa_text(
+                            "SELECT c.vector_id FROM chunks c JOIN documents d "
+                            "ON c.document_id = d.id WHERE d.title LIKE :p"),
+                        {"p": f"{run_tag}%"},
+                    ) if row[0]
+                ]
                 # Ingestion-scope safety runs outlive their documents by
                 # design (document_id is SET NULL, snapshot provenance is
                 # kept), so they and their findings must be removed via the
-                # fixture documents before the documents themselves go.
+                # fixture documents before the documents themselves go —
+                # stale runs collide with reused document ids through the
+                # ingestion partial unique index and silently suppress
+                # future reviews (D-61/D-66).
                 conn.execute(
                     sa_text(
                         "DELETE FROM safety_findings WHERE review_run_id IN ("
@@ -227,11 +258,24 @@ def main() -> int:
                             "WHERE identity_sha256 = :h"),
                     {"h": identity},
                 )
+                # Remove exactly this run's graph rows (live-provider
+                # extraction side effects of the warned fixture): children
+                # first so no FK dangles mid-transaction.
+                for table in graph_tables:
+                    conn.execute(
+                        sa_text(f"DELETE FROM {table} WHERE id > :wm"),
+                        {"wm": watermarks[table]},
+                    )
                 remaining = conn.execute(
                     sa_text("SELECT COUNT(*) FROM documents "
                             "WHERE title LIKE :p"),
                     {"p": f"{run_tag}%"},
                 ).scalar()
+            if vector_ids:
+                from app.services.vector_store import ChromaVectorStore
+
+                store = ChromaVectorStore(collection_name="rag-collection")
+                store.collection.delete(ids=vector_ids)
             engine.dispose()
             if remaining:
                 cleanup_error = f"{remaining} fixture documents remain"

@@ -253,6 +253,25 @@ def main() -> int:
                     {"prefix": f"{run_tag}-%"},
                 ).fetchall()
                 vector_ids = [r[0] for r in rows if r[0]]
+                # Ingestion-scope safety runs outlive their documents by
+                # design (document_id SET NULL, snapshot kept): remove them
+                # and their findings via the fixture documents BEFORE the
+                # documents go. Stale runs collide with reused document ids
+                # through the ingestion partial unique index and silently
+                # suppress future safety reviews (D-66).
+                conn.execute(
+                    sa_text(
+                        "DELETE FROM safety_findings WHERE review_run_id IN ("
+                        "SELECT id FROM safety_review_runs WHERE document_id IN ("
+                        "SELECT id FROM documents WHERE title LIKE :prefix))"),
+                    {"prefix": f"{run_tag}-%"},
+                )
+                conn.execute(
+                    sa_text(
+                        "DELETE FROM safety_review_runs WHERE document_id IN ("
+                        "SELECT id FROM documents WHERE title LIKE :prefix)"),
+                    {"prefix": f"{run_tag}-%"},
+                )
                 conn.execute(
                     sa_text("DELETE FROM documents WHERE title LIKE :prefix"),
                     {"prefix": f"{run_tag}-%"},
