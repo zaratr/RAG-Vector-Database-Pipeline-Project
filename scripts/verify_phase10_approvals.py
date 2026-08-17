@@ -35,20 +35,31 @@ def scan_for_secrets(report_path: str) -> bool:
     return any(pattern.search(text) for pattern in _SECRET_PATTERNS)
 
 
-def verify_approvals(approvals_dir: str) -> dict[str, Any]:
-    """Verify the approval directory; return a structured result."""
+def verify_approvals(approvals_dir: str,
+                     required: set[str] | None = None) -> dict[str, Any]:
+    """Verify the approval directory; return a structured result.
+
+    ``required`` scopes which gates must be present (staged verification per
+    the plan: the 10A leaf runs ``--require phase10a``, the 10B leaf
+    ``phase10a,phase10b``, and so on). Gates outside the required set are
+    still validated when their pairs exist, but their absence is not a
+    failure — the final gate verifies the complete set with no ``required``
+    override. The default keeps the historical whole-registry behavior.
+    """
     approvals = Path(approvals_dir)
     result: dict[str, Any] = {
         "valid": True,
         "missing_gates": [],
         "gates": [],
     }
+    required_set = set(required) if required is not None else set(GATE_IDS)
     found: dict[str, dict[str, Any]] = {}
     for gate in GATE_IDS:
         json_path = approvals / f"{gate}.json"
         md_path = approvals / f"{gate}.md"
         if not json_path.is_file() or not md_path.is_file():
-            result["missing_gates"].append(gate)
+            if gate in required_set:
+                result["missing_gates"].append(gate)
             continue
         report = json.loads(json_path.read_text(encoding="utf-8"))
         verdict = report.get("terminal_verdict") or report.get("verdict")
@@ -85,11 +96,13 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reports", required=True)
     parser.add_argument("--require")
     args = parser.parse_args(argv)
-    result = verify_approvals(approvals_dir=args.reports)
-    if args.require:
-        required = set(args.require.split(","))
-        if required - {g for g in GATE_IDS if (Path(args.reports) / f"{g}.json").is_file()}:
-            result["valid"] = False
+    required = set(args.require.split(",")) if args.require else None
+    if required is not None and not required <= set(GATE_IDS):
+        sys.stdout.write(json.dumps(
+            {"valid": False, "error": "unknown gate id in --require"},
+            sort_keys=True) + "\n")
+        return 2
+    result = verify_approvals(approvals_dir=args.reports, required=required)
     sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
     return 0 if result["valid"] else 2
 

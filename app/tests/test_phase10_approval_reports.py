@@ -115,6 +115,56 @@ def test_verify_phase10_approvals_validates_exact_required_gate_set(tmp_path, mo
     assert "phase10b" in result["missing_gates"]
 
 
+def test_verify_phase10_approvals_staged_require_ignores_future_gates(tmp_path, monkeypatch):
+    """D-67: staged verification per the plan — the 10C leaf runs
+    ``--require phase10a,phase10b,phase10c`` while phase10d/documentation/
+    final pairs legitimately do not exist yet. Gates outside the required
+    set must not be counted missing, but a NOT APPROVED pair that IS
+    present still fails."""
+    monkeypatch.chdir(tmp_path)
+    approvals_dir = tmp_path / ".hermes" / "reports" / "approvals"
+    approvals_dir.mkdir(parents=True)
+    for gate in ("phase10a", "phase10b", "phase10c"):
+        (approvals_dir / f"{gate}.json").write_text(
+            json.dumps({"gate_id": gate, "terminal_verdict": "APPROVED",
+                        "blockers": []}),
+            encoding="utf-8",
+        )
+        (approvals_dir / f"{gate}.md").write_text("# APPROVED\n", encoding="utf-8")
+
+    from scripts.verify_phase10_approvals import verify_approvals
+
+    result = verify_approvals(
+        approvals_dir=str(approvals_dir),
+        required={"phase10a", "phase10b", "phase10c"},
+    )
+
+    assert result["valid"] is True
+    assert result["missing_gates"] == []
+
+
+def test_verify_phase10_approvals_staged_require_still_fails_missing_required(tmp_path, monkeypatch):
+    """A staged require set that is missing one of its own gates fails."""
+    monkeypatch.chdir(tmp_path)
+    approvals_dir = tmp_path / ".hermes" / "reports" / "approvals"
+    approvals_dir.mkdir(parents=True)
+    (approvals_dir / "phase10b.json").write_text(
+        json.dumps({"gate_id": "phase10b", "terminal_verdict": "APPROVED"}),
+        encoding="utf-8",
+    )
+    (approvals_dir / "phase10b.md").write_text("# APPROVED\n", encoding="utf-8")
+
+    from scripts.verify_phase10_approvals import verify_approvals
+
+    result = verify_approvals(
+        approvals_dir=str(approvals_dir),
+        required={"phase10b", "phase10c"},
+    )
+
+    assert result["valid"] is False
+    assert result["missing_gates"] == ["phase10c"]
+
+
 def test_verify_phase10_approvals_rejects_any_fail_finding(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     approvals_dir = tmp_path / ".hermes" / "reports" / "approvals"
