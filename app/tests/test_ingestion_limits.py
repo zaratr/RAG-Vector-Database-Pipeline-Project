@@ -225,15 +225,21 @@ def test_txt_file_extracted_bytes_over_limit_returns_ingestion_too_large_extract
     assert resp.json()["detail"]["limit_bytes"] == EXTRACTED_MAX
 
 
-def test_exact_extracted_limit_text_is_accepted(app_client):
+def test_exact_extracted_limit_text_is_accepted(app_client, monkeypatch):
     """D-20: a document at exactly EXTRACTED_MAX bytes is accepted end-to-end
     (vector upserts are batched below Chroma's maximum batch size)."""
+    # Pin safety off: this test exercises the plain ingestion envelope
+    # boundary; under ambient safety-enabled env the same text would be
+    # rejected by the safety policy's max_input_chars cap (D-64 fail-closed).
+    monkeypatch.setenv("RAG_CONTENT_SAFETY_ENABLED", "false")
+    get_settings.cache_clear()
     resp = app_client.post(
         "/documents",
         data={"title": "exact-limit", "text": "a" * EXTRACTED_MAX},
     )
     assert resp.status_code == 201
     assert resp.json()["chunks"] >= 1
+    get_settings.cache_clear()
 
 
 def test_image_ingestion_consumes_rate_slot_and_throttles(app_client, monkeypatch):

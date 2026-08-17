@@ -19,7 +19,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.persistence import models
-from app.services.content_safety import SafetyAssessment, classify_content
+from app.services.content_safety import (
+    SafetyAssessment,
+    SafetyInputLimitError,
+    classify_content,
+)
 from app.services.llm_safety_review import PROMPT_VERSION, RESULT_SCHEMA_VERSION
 from app.services.safety_policy import SafetyPolicy
 
@@ -192,31 +196,41 @@ class SafetyReviewService:
         # asyncio.run (which cannot nest inside a running loop).
         from app.services.llm_safety_review import review_with_llm
 
-        outcome = _run_coroutine_sync(review_with_llm(
-            input_text,
-            scope=scope,  # type: ignore[arg-type]
-            policy=policy,
-            mode=mode,
-            provider=provider,
-        ))
-        if hasattr(outcome, "error_code"):
-            run.review_failure_code = outcome.error_code
+        try:
+            outcome = _run_coroutine_sync(review_with_llm(
+                input_text,
+                scope=scope,  # type: ignore[arg-type]
+                policy=policy,
+                mode=mode,
+                provider=provider,
+            ))
+        except SafetyInputLimitError:
+            # 10C.2: input over max_input_chars is rejected with the typed
+            # error before classification — never silently truncated. Map it
+            # to a failed review run so every scope fails closed (503)
+            # instead of the error escaping as a 500 with an orphaned
+            # pending run (D-64).
+            run.review_failure_code = "safety_input_limit"
             run.review_llm_status = "failed"
         else:
-            run.review_failure_code = None
-            # The 10C.3 outcome vocabulary is skipped|failed|ok; the d9
-            # column check permits skipped|succeeded|failed (D-58).
-            run.review_llm_status = (
-                "succeeded" if outcome.llm_status == "ok" else outcome.llm_status)
-            run.review_outcome = outcome
-            if provider is not None:
-                run.provider = getattr(provider, "provider_name", None) \
-                    or type(provider).__name__[:50]
-                run.model = getattr(provider, "model", None)
-                run.prompt_version = PROMPT_VERSION
-                run.schema_version = RESULT_SCHEMA_VERSION
-            self._record_findings(run.id, outcome.findings, input_text)
-            self.session.commit()
+            if hasattr(outcome, "error_code"):
+                run.review_failure_code = outcome.error_code
+                run.review_llm_status = "failed"
+            else:
+                run.review_failure_code = None
+                # The 10C.3 outcome vocabulary is skipped|failed|ok; the d9
+                # column check permits skipped|succeeded|failed (D-58).
+                run.review_llm_status = (
+                    "succeeded" if outcome.llm_status == "ok" else outcome.llm_status)
+                run.review_outcome = outcome
+                if provider is not None:
+                    run.provider = getattr(provider, "provider_name", None) \
+                        or type(provider).__name__[:50]
+                    run.model = getattr(provider, "model", None)
+                    run.prompt_version = PROMPT_VERSION
+                    run.schema_version = RESULT_SCHEMA_VERSION
+                self._record_findings(run.id, outcome.findings, input_text)
+                self.session.commit()
         return run
 
     def complete(

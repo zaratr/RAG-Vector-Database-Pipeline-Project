@@ -266,7 +266,7 @@ def test_safety_enabled_block_persists_failed_doc_and_safety_review(monkeypatch)
         engine.dispose()
 
 
-def test_safety_disabled_skips_ingestion_review():
+def test_safety_disabled_skips_ingestion_review(monkeypatch):
     """RAG_CONTENT_SAFETY_ENABLED=false: no safety rows, original 10A.4 flow."""
     from fastapi.testclient import TestClient
     from sqlalchemy import create_engine
@@ -281,6 +281,10 @@ def test_safety_disabled_skips_ingestion_review():
         get_graph_extractor,
     )
 
+    # Pin the disabled flag explicitly: the recorded phase10c gate runs the
+    # suite under ambient safety-enabled env, and this test must still
+    # exercise the disabled path hermetically.
+    monkeypatch.setenv("RAG_CONTENT_SAFETY_ENABLED", "false")
     get_settings.cache_clear()
     engine = create_engine(
         "sqlite:///:memory:",

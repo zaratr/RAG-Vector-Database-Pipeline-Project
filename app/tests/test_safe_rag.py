@@ -224,6 +224,39 @@ def test_ingestion_filter_behaves_like_block_for_vectors(safe_client):
     assert _LAST_STORE_CALLS_ref[-1] == []
 
 
+def test_oversized_safety_input_fails_closed_with_failed_review(safe_client):
+    """D-64: input over the policy max_input_chars maps to a FAILED review
+    run (failure_code safety_input_limit) and fails closed with 503 — never
+    an escaped 500, an orphaned pending run, or a silently truncated review."""
+    from app.services.safety_policy import get_safety_policy
+
+    limit = get_safety_policy().max_input_chars
+    resp = safe_client.post(
+        "/documents",
+        data={"title": "Oversized", "source": "unit",
+              "text": "a" * (limit + 1)})
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "safety_review_failed"
+
+    session = _get_session()
+    try:
+        doc = session.query(models.Document).filter_by(
+            title="Oversized").one()
+        assert doc.ingestion_status == "failed"
+        run = session.query(models.SafetyReviewRun).filter_by(
+            scope="ingestion").one()
+        assert run.status == "failed"
+        assert run.failure_code == "safety_input_limit"
+        assert run.completed_at is not None
+        assert run.final_action is None
+        # No findings are recorded for a rejected input.
+        assert session.query(models.SafetyFinding).filter_by(
+            review_run_id=run.id).count() == 0
+    finally:
+        session.close()
+    assert _LAST_STORE_CALLS_ref[-1] == []
+
+
 def test_ingestion_warn_proceeds_to_normal_extraction(safe_client):
     text = "he would stab the guard in the play"  # SAF001 warn
     resp = safe_client.post(
