@@ -348,3 +348,154 @@ def test_phase10b_restored_snapshots_compared_only_after_unscope():
         step.get("kind") == "phase10b_unscoped_env"
         for step in PRIMARY_STEPS["phase10b"]
     )
+
+
+def test_phase10c_registry_kinds_produce_schema_valid_ledger():
+    """D-45: every step kind PRIMARY_STEPS['phase10c'] can emit must produce a
+    ledger row the closed command-ledger schema accepts. Built from the real
+    registry, not a patched shape."""
+    from scripts.run_recorded_gate import (
+        PRIMARY_STEPS,
+        _record_step,
+        validate_command_ledger,
+    )
+
+    ledger = []
+    for ordinal, step in enumerate(PRIMARY_STEPS["phase10c"]):
+        _record_step(ledger, ordinal, step, 0, "", "", phase="primary")
+    payload = {"schema": "phase10-command-ledger-v1", "gate_id": "phase10c",
+               "steps": ledger}
+    validate_command_ledger(payload)  # raises ValidationError on any bad kind
+    kinds = {row["kind"] for row in ledger}
+    assert kinds <= {"subprocess", "assertion", "internal"}
+    assert "internal" in kinds  # the rich non-subprocess kinds are recorded
+
+
+def test_phase10c_restored_snapshots_compared_only_after_unscope():
+    """D-50: every restored-snapshot/cmp step must execute after the scoped
+    operator/content-safety env is destroyed -- the plan places these
+    comparisons outside the scoped subshell, so the base-vs-restored equality
+    can actually hold."""
+    from scripts.run_recorded_gate import PHASE10C_RESTORATION_STEPS, PRIMARY_STEPS
+
+    full_sequence = list(PRIMARY_STEPS["phase10c"]) + list(PHASE10C_RESTORATION_STEPS)
+    unscope_positions = [
+        i for i, step in enumerate(full_sequence)
+        if step.get("kind") == "phase10c_unscoped_env"
+    ]
+    assert unscope_positions, "phase10c must destroy the scoped env"
+    unscope_at = unscope_positions[0]
+
+    restored_markers = (
+        "phase10c-restored-deployment.json",
+        "phase10c-restored-expected-settings.json",
+        "phase10c-restored-running-settings.json",
+    )
+    for index, step in enumerate(full_sequence):
+        argv = " ".join(step.get("argv", []))
+        touches_restored = any(marker in argv for marker in restored_markers)
+        compares_restored = argv.startswith("cmp ") and "restored" in argv
+        if touches_restored or compares_restored:
+            assert index > unscope_at, (
+                f"restored snapshot/cmp at index {index} runs before unscope "
+                f"at {unscope_at}"
+            )
+
+    # And the scoped env is never destroyed mid-primary.
+    assert not any(
+        step.get("kind") == "phase10c_unscoped_env"
+        for step in PRIMARY_STEPS["phase10c"]
+    )
+
+
+def test_phase10c_scoped_env_sets_all_eight_keys(monkeypatch, tmp_path):
+    """phase10c_scoped_env must set five RAG_*/OPERATOR_* keys plus three
+    SOURCE_* keys from the manifest, with a fresh bearer token."""
+    import os
+    from unittest import mock
+
+    monkeypatch.chdir(tmp_path)
+    reports_dir = tmp_path / ".hermes" / "reports"
+    reports_dir.mkdir(parents=True)
+
+    # Plant a manifest with known source fields.
+    manifest = {
+        "commit_sha": "abc123def456",
+        "image_context_sha256": "sha256:feedbeef",
+        "dirty": "false",
+    }
+    (reports_dir / "phase10c-source-manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+    # Clear any pre-existing scoped keys so assertions are deterministic.
+    from scripts.run_recorded_gate import _PHASE10C_SCOPED_KEYS
+
+    for key in _PHASE10C_SCOPED_KEYS:
+        os.environ.pop(key, None)
+
+    from scripts.run_recorded_gate import _phase10c_scoped_env
+
+    rc, out, err = _phase10c_scoped_env(reports_dir)
+
+    assert rc == 0
+    assert out == ""
+    assert err == ""
+
+    # Five operator / content-safety keys.
+    assert os.environ["RAG_OPERATOR_API_ENABLED"] == "true"
+    assert os.environ["RAG_OPERATOR_TOKEN"] == os.environ["OPERATOR_BEARER"]
+    bearer = os.environ["OPERATOR_BEARER"]
+    assert len(bearer) >= 32  # token_urlsafe(32) is well above this
+    # RAG_CONTENT_SAFETY_ENABLED and RAG_SAFETY_LLM_MODE are 10C-specific.
+    assert os.environ["RAG_CONTENT_SAFETY_ENABLED"] == "true"
+    assert os.environ["RAG_SAFETY_LLM_MODE"] == "rules_only"
+
+    # Three SOURCE_* keys derived from the manifest.
+    assert os.environ["SOURCE_REVISION"] == "abc123def456"
+    assert os.environ["SOURCE_CONTEXT_SHA256"] == "sha256:feedbeef"
+    assert os.environ["SOURCE_DIRTY"] == "false"
+
+    # Cleanup: restore process env.
+    from scripts.run_recorded_gate import _phase10c_unscoped_env
+
+    _phase10c_unscoped_env()
+
+
+def test_phase10c_unscoped_env_removes_all_scoped_keys(monkeypatch, tmp_path):
+    """phase10c_unscoped_env must remove exactly the eight scoped keys, leaving
+    the process environment identical to the pre-scope state."""
+    import os
+
+    monkeypatch.chdir(tmp_path)
+    reports_dir = tmp_path / ".hermes" / "reports"
+    reports_dir.mkdir(parents=True)
+
+    # Plant a minimal manifest so scoped_env can read it.
+    (reports_dir / "phase10c-source-manifest.json").write_text(
+        json.dumps({}), encoding="utf-8"
+    )
+
+    from scripts.run_recorded_gate import (
+        _PHASE10C_SCOPED_KEYS,
+        _phase10c_scoped_env,
+        _phase10c_unscoped_env,
+    )
+
+    # Snapshot pre-existing env state for the scoped keys.
+    pre_env = {key: os.environ.get(key) for key in _PHASE10C_SCOPED_KEYS}
+
+    # Apply scoped env.
+    _phase10c_scoped_env(reports_dir)
+    # Verify at least some keys are now set.
+    assert os.environ["RAG_OPERATOR_API_ENABLED"] == "true"
+    assert os.environ["RAG_CONTENT_SAFETY_ENABLED"] == "true"
+
+    # Unscope.
+    _phase10c_unscoped_env()
+
+    # Every scoped key must be absent (restored to pre-scope state).
+    for key in _PHASE10C_SCOPED_KEYS:
+        assert os.environ.get(key) == pre_env.get(key), (
+            f"{key} not restored: got {os.environ.get(key)!r}, expected {pre_env.get(key)!r}"
+        )

@@ -139,6 +139,70 @@ PRIMARY_STEPS["phase10b"] = [
      "description": "B-12 valid-auth probe (credential only via env, never argv)"},
 ]
 
+# Typed phase10c sequence exactly as the plan's 10C task gate specifies it.
+# Scoped environment values (operator + content-safety) are applied in-memory
+# (never argv/ledger strings) via the "phase10c_scoped_env" step kind.
+PRIMARY_STEPS["phase10c"] = [
+    {"kind": "subprocess", "argv": ["python", "scripts/source_manifest.py",
+     "--output", ".hermes/reports/phase10c-source-manifest.json"],
+     "description": "phase10c source manifest"},
+    {"kind": "subprocess", "argv": ["python", "scripts/snapshot_nonsecret_deployment.py",
+     "--deployment-output", ".hermes/reports/phase10c-base-deployment.json",
+     "--settings-output", ".hermes/reports/phase10c-base-expected-settings.json"],
+     "description": "phase10c base non-secret deployment/settings snapshot"},
+    {"kind": "phase10c_scoped_env",
+     "description": "phase10c in-memory scoped operator/content-safety/source env (no values recorded)"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "config", "--quiet"],
+     "description": "compose config validation"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "build", "--no-cache", "api", "migrate"],
+     "description": "phase10c labeled build"},
+    {"kind": "subprocess", "argv": ["python", "scripts/create_phase10_source_binding.py",
+     "--manifest", ".hermes/reports/phase10c-source-manifest.json",
+     "--output", ".hermes/reports/phase10c-source-binding.json",
+     "--services", "api", "migrate"],
+     "description": "phase10c source binding"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "up", "-d", "--force-recreate"],
+     "description": "phase10c deploy (operator + content-safety env)"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python", "-c",
+     "from app.config import get_settings; s=get_settings(); assert s.operator_api_enabled and s.content_safety_enabled and s.safety_llm_mode == 'rules_only'; "
+     "print({'operator_api_enabled':True,'content_safety_enabled':True,'safety_llm_mode':'rules_only'})"],
+     "description": "content-safety settings assert in container"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "run", "--rm", "migrate"],
+     "description": "migrate one-shot"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api",
+     "python", "-m", "app.core.migrations"],
+     "description": "in-container migrations wrapper"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "-m", "alembic", "-c", "alembic.ini", "current"],
+     "description": "alembic current"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "-m", "alembic", "-c", "alembic.ini", "check"],
+     "description": "alembic check"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/fingerprint_production_state.py", "--json"],
+     "stdout_to": "phase10c-state-before.json",
+     "description": "production state fingerprint (before)"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "-m", "pytest", "-q"],
+     "description": "phase10c full test suite"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/validate_phase10c.py"],
+     "description": "phase10c live validator"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/validate_phase10b.py"],
+     "description": "phase10b regression validator"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/validate_phase10a.py"],
+     "description": "phase10a regression validator"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/fingerprint_production_state.py", "--json"],
+     "stdout_to": "phase10c-state-after.json",
+     "description": "production state fingerprint (after)"},
+    {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10c-state-before.json",
+     ".hermes/reports/phase10c-state-after.json"],
+     "description": "state equality"},
+]
+
 # phase10b restoration: destroy the in-memory scoped credential/override, then
 # force-recreate under the exact pre-gate environment and assert health.
 RESTORATION_STEPS: list[dict[str, Any]] = [
@@ -177,6 +241,39 @@ PHASE10B_RESTORATION_STEPS: list[dict[str, Any]] = [
      "description": "restored running settings"},
     {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10b-base-expected-settings.json",
      ".hermes/reports/phase10b-restored-running-settings.json"],
+     "description": "expected vs running settings equality"},
+    {"kind": "heartbeat", "url": "http://127.0.0.1:8000/",
+     "attempts": 30, "interval_seconds": 2,
+     "description": "api heartbeat (readiness-polled)"},
+    {"kind": "heartbeat", "url": "http://127.0.0.1:8001/api/v2/heartbeat",
+     "attempts": 30, "interval_seconds": 2,
+     "description": "chroma heartbeat (readiness-polled)"},
+]
+
+PHASE10C_RESTORATION_STEPS: list[dict[str, Any]] = [
+    {"kind": "phase10c_unscoped_env",
+     "description": "destroy in-memory scoped operator/content-safety/source env"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "up", "-d", "--force-recreate"],
+     "description": "restoration base recreation (default env)"},
+    # Restored snapshots and comparisons run AFTER the override is destroyed,
+    # so scoped keys (e.g. RAG_CONTENT_SAFETY_ENABLED) cannot leak into the
+    # "restored" snapshot and the base-vs-restored cmp can hold (D-50).
+    {"kind": "subprocess", "argv": ["python", "scripts/snapshot_nonsecret_deployment.py",
+     "--deployment-output", ".hermes/reports/phase10c-restored-deployment.json",
+     "--settings-output", ".hermes/reports/phase10c-restored-expected-settings.json"],
+     "description": "restored non-secret deployment/settings snapshot (default env)"},
+    {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10c-base-deployment.json",
+     ".hermes/reports/phase10c-restored-deployment.json"],
+     "description": "base/restored deployment equality"},
+    {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10c-base-expected-settings.json",
+     ".hermes/reports/phase10c-restored-expected-settings.json"],
+     "description": "base/restored expected-settings equality"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api",
+     "python", "scripts/snapshot_nonsecret_settings.py"],
+     "stdout_to": "phase10c-restored-running-settings.json",
+     "description": "restored running settings"},
+    {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10c-base-expected-settings.json",
+     ".hermes/reports/phase10c-restored-running-settings.json"],
      "description": "expected vs running settings equality"},
     {"kind": "heartbeat", "url": "http://127.0.0.1:8000/",
      "attempts": 30, "interval_seconds": 2,
@@ -311,6 +408,12 @@ _PHASE10B_SCOPED_KEYS = (
     "SOURCE_REVISION", "SOURCE_CONTEXT_SHA256", "SOURCE_DIRTY",
 )
 
+_PHASE10C_SCOPED_KEYS = (
+    "RAG_OPERATOR_API_ENABLED", "RAG_OPERATOR_TOKEN", "OPERATOR_BEARER",
+    "RAG_CONTENT_SAFETY_ENABLED", "RAG_SAFETY_LLM_MODE",
+    "SOURCE_REVISION", "SOURCE_CONTEXT_SHA256", "SOURCE_DIRTY",
+)
+
 
 def _phase10b_scoped_env(reports: Path) -> tuple[int, str, str]:
     """Apply the typed scoped env in-memory only (never argv/ledger strings).
@@ -343,6 +446,45 @@ def _phase10b_unscoped_env() -> tuple[int, str, str]:
     import os
 
     for key in _PHASE10B_SCOPED_KEYS:
+        os.environ.pop(key, None)
+    return 0, "", ""
+
+
+def _phase10c_scoped_env(reports: Path) -> tuple[int, str, str]:
+    """Apply the typed scoped env in-memory only (never argv/ledger strings).
+
+    The operator bearer is a fresh token_urlsafe(32); the SOURCE_* values come
+    from the phase10c source manifest produced earlier in the sequence. 10C
+    additionally sets RAG_CONTENT_SAFETY_ENABLED and RAG_SAFETY_LLM_MODE for
+    the content-safety feature gate.
+    """
+    import os
+    import secrets
+
+    manifest_path = reports / "phase10c-source-manifest.json"
+    manifest: dict[str, Any] = {}
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    bearer = secrets.token_urlsafe(32)
+    os.environ["RAG_OPERATOR_API_ENABLED"] = "true"
+    os.environ["RAG_OPERATOR_TOKEN"] = bearer
+    os.environ["OPERATOR_BEARER"] = bearer
+    os.environ["RAG_CONTENT_SAFETY_ENABLED"] = "true"
+    os.environ["RAG_SAFETY_LLM_MODE"] = "rules_only"
+    if manifest.get("commit_sha"):
+        os.environ["SOURCE_REVISION"] = str(manifest["commit_sha"])
+    if manifest.get("image_context_sha256"):
+        os.environ["SOURCE_CONTEXT_SHA256"] = str(manifest["image_context_sha256"])
+    if manifest.get("dirty") is not None:
+        os.environ["SOURCE_DIRTY"] = str(manifest["dirty"]).lower()
+    return 0, "", ""
+
+
+def _phase10c_unscoped_env() -> tuple[int, str, str]:
+    """Destroy the in-memory scoped operator/content-safety/source override."""
+    import os
+
+    for key in _PHASE10C_SCOPED_KEYS:
         os.environ.pop(key, None)
     return 0, "", ""
 
@@ -416,6 +558,10 @@ def _run_recorded_step(
         rc, out, err = _phase10b_scoped_env(reports)
     elif kind == "phase10b_unscoped_env":
         rc, out, err = _phase10b_unscoped_env()
+    elif kind == "phase10c_scoped_env":
+        rc, out, err = _phase10c_scoped_env(reports)
+    elif kind == "phase10c_unscoped_env":
+        rc, out, err = _phase10c_unscoped_env()
     elif kind == "curl_status":
         rc, out, err = _curl_status_step(step, reports)
     elif kind == "file_contains_lower":
@@ -453,7 +599,9 @@ def run_gate(gate: str, plan: str, reports_dir: str) -> int:
     reports = Path(reports_dir)
     reports.mkdir(parents=True, exist_ok=True)
     restoration_steps = (
-        PHASE10B_RESTORATION_STEPS if gate == "phase10b" else RESTORATION_STEPS
+        PHASE10B_RESTORATION_STEPS if gate == "phase10b"
+        else PHASE10C_RESTORATION_STEPS if gate == "phase10c"
+        else RESTORATION_STEPS
     )
     ledger: list[dict[str, Any]] = []
     ordinal = 0
