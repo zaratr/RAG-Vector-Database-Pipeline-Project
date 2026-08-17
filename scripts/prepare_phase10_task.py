@@ -98,16 +98,49 @@ def _build_images(manifest_path: Path) -> None:
 def _resolve_image_id(service: str) -> str:
     """Resolve the built image ID for a Compose service.
 
-    A nonzero return code is a hard failure. An empty stdout under a zero return
-    code (e.g. a mocked test runner) resolves to an empty image id so the binding
-    file is still written for unit-tested control flow; the real flow always has
-    a concrete image id here.
+    A zero return code with empty stdout (e.g. a mocked test runner)
+    resolves to an empty image id so the binding file is still written for
+    unit-tested control flow; the real flow always has a concrete image id.
+    A nonzero return code from ``docker compose images`` is no longer fatal:
+    after a no-cache rebuild the running containers may reference an image
+    record the daemon no longer holds (the D-47/D-49 host condition), so the
+    id is resolved from the configured image name or, for build-only
+    services, from the newest image carrying the compose project/service
+    labels — the same fallback ``create_phase10_source_binding.py`` uses.
     """
     result = _run(["docker", "compose", "images", "-q", service])
-    if _rc(result) != 0:
+    if _rc(result) == 0:
+        stdout = _as_text(result.stdout).strip()
+        return stdout.splitlines()[0] if stdout else ""
+
+    config = _run(["docker", "compose", "config", "--format", "json"])
+    if _rc(config) != 0:
         _fail(f"could not resolve image id for service {service!r}")
-    stdout = _as_text(result.stdout).strip()
-    return stdout.splitlines()[0] if stdout else ""
+    config_json = json.loads(_as_text(config.stdout) or "{}")
+    service_config = (config_json.get("services", {}).get(service, {}) or {})
+
+    image_name = service_config.get("image")
+    if image_name:
+        inspect = _run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image_name])
+        if _rc(inspect) == 0 and _as_text(inspect.stdout).strip():
+            return _as_text(inspect.stdout).strip()
+
+    project = config_json.get("name") or "rag-vector-database-pipeline-project"
+    listing = _run([
+        "docker", "image", "ls", "--format", "{{.ID}}\t{{.CreatedAt}}",
+        "--filter", f"label=com.docker.compose.project={project}",
+        "--filter", f"label=com.docker.compose.service={service}",
+    ])
+    lines = _as_text(listing.stdout).strip().splitlines() if _rc(listing) == 0 else []
+    candidates = [line.split("\t", 1) for line in lines if line.strip("\t")]
+    if not candidates:
+        _fail(f"could not resolve image id for service {service!r}")
+    best_id, _best_created = max(
+        candidates,
+        key=lambda parts: parts[1] if len(parts) > 1 else "",
+    )
+    return best_id
 
 
 def _inspect_label(image_id: str, label: str) -> str:

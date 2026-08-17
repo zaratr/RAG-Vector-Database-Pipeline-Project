@@ -123,3 +123,74 @@ def test_prepare_never_passes_credentials_in_argv(monkeypatch, tmp_path):
         assert "token" not in joined.lower()
         assert "password" not in joined.lower()
         assert "secret" not in joined.lower()
+
+
+def test_prepare_resolves_image_id_via_label_fallback_when_compose_images_fails(monkeypatch):
+    """D-47/D-49 host condition: after a no-cache rebuild the running
+    containers may reference an image record the daemon no longer holds, so
+    ``docker compose images`` exits nonzero. Resolution must fall back to the
+    compose config plus the newest project/service-labeled image instead of
+    failing the preparation step."""
+    import json
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[:4] == ["docker", "compose", "images", "-q"]:
+            return mock.Mock(returncode=1, stdout="", stderr="No such image")
+        if argv[:3] == ["docker", "compose", "config"] and "--format" in argv:
+            payload = {"name": "demo-project", "services": {"api": {}}}
+            return mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+        if argv[:3] == ["docker", "image", "ls"]:
+            return mock.Mock(
+                returncode=0,
+                stdout=(
+                    "old111\t2026-01-01 00:00:00 +0000 UTC\n"
+                    "new222\t2026-02-02 00:00:00 +0000 UTC\n"
+                ),
+                stderr="",
+            )
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("scripts.prepare_phase10_task.subprocess.run", fake_run)
+
+    from scripts.prepare_phase10_task import _resolve_image_id
+
+    image_id = _resolve_image_id("api")
+
+    assert image_id == "new222"
+    assert [
+        "docker", "image", "ls", "--format", "{{.ID}}\t{{.CreatedAt}}",
+        "--filter", "label=com.docker.compose.project=demo-project",
+        "--filter", "label=com.docker.compose.service=api",
+    ] in calls
+
+
+def test_prepare_resolves_image_id_via_configured_image_name_when_compose_images_fails(monkeypatch):
+    """The fallback must also honor an explicit ``image:`` name in the
+    resolved compose config by inspecting that image directly."""
+    import json
+
+    def fake_run(argv, **kwargs):
+        if argv[:4] == ["docker", "compose", "images", "-q"]:
+            return mock.Mock(returncode=1, stdout="", stderr="No such image")
+        if argv[:3] == ["docker", "compose", "config"] and "--format" in argv:
+            payload = {
+                "name": "demo-project",
+                "services": {"api": {"image": "demo-api:latest"}},
+            }
+            return mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return mock.Mock(
+                returncode=0,
+                stdout="sha256:abc123def456\n",
+                stderr="",
+            )
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("scripts.prepare_phase10_task.subprocess.run", fake_run)
+
+    from scripts.prepare_phase10_task import _resolve_image_id
+
+    assert _resolve_image_id("api") == "sha256:abc123def456"
