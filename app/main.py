@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from app.api import routes_documents, routes_graph, routes_query, routes_security
+from app.api import routes_documents, routes_graph, routes_query, routes_security, routes_safety
 from app.config import get_settings
 from app.core.logging import logger
 
@@ -202,6 +202,7 @@ app.include_router(routes_documents.router)
 app.include_router(routes_query.router)
 app.include_router(routes_graph.router)
 app.include_router(routes_security.router)
+app.include_router(routes_safety.router)
 
 
 @app.get("/")
