@@ -270,6 +270,26 @@ def test_route_unavailable_when_safety_disabled(seeded_client, monkeypatch):
         assert seeded_client.get(path, headers=AUTH).status_code == 404
 
 
+def test_safety_disabled_yields_404_before_bearer_parsing_missing_bearer(
+        seeded_client, monkeypatch):
+    """D-63 regression: the feature-flag gate must run before auth, so a
+    missing bearer under safety-disabled is 404, never 401."""
+    monkeypatch.setenv("RAG_CONTENT_SAFETY_ENABLED", "false")
+    get_settings.cache_clear()
+    for path in ("/safety/findings", "/safety/findings/1", "/safety/stats"):
+        assert seeded_client.get(path).status_code == 404
+
+
+def test_safety_disabled_yields_404_before_bearer_parsing_invalid_bearer(
+        seeded_client, monkeypatch):
+    """D-63 regression: invalid bearer under safety-disabled is 404 too."""
+    monkeypatch.setenv("RAG_CONTENT_SAFETY_ENABLED", "false")
+    get_settings.cache_clear()
+    for path in ("/safety/findings", "/safety/stats"):
+        r = seeded_client.get(path, headers={"Authorization": "Bearer bad"})
+        assert r.status_code == 404
+
+
 def test_missing_bearer_returns_401_with_challenge(seeded_client):
     r = seeded_client.get("/safety/findings")
     assert r.status_code == 401
@@ -306,6 +326,34 @@ def test_bounded_excerpt_null_for_filter_or_block_action(seeded_client):
                              headers=AUTH).json()
     for item in body["items"]:
         assert item["bounded_excerpt"] is None
+
+
+def test_bounded_excerpt_round_trips_verbatim_when_legitimate(seeded_client):
+    """Positive control: a persisted non-null excerpt on a warn ingestion
+    finding is returned verbatim by list and detail, proving the NULL rules
+    above are enforced per category/scope/action and not by vacuous seeding
+    (the seeder never writes a non-null excerpt)."""
+    session = SessionLocal()
+    try:
+        finding = (
+            session.query(models.SafetyFinding)
+            .join(models.SafetyReviewRun,
+                  models.SafetyFinding.review_run_id == models.SafetyReviewRun.id)
+            .filter(models.SafetyReviewRun.scope == "ingestion",
+                    models.SafetyFinding.action == "warn")
+            .one())
+        finding.bounded_excerpt = "KEPT-EXCERPT-123"
+        session.commit()
+        finding_id = finding.id
+    finally:
+        session.close()
+    detail = seeded_client.get(f"/safety/findings/{finding_id}",
+                               headers=AUTH).json()
+    assert detail["finding"]["bounded_excerpt"] == "KEPT-EXCERPT-123"
+    page = seeded_client.get("/safety/findings?category=violence",
+                             headers=AUTH).json()
+    item = next(i for i in page["items"] if i["id"] == finding_id)
+    assert item["bounded_excerpt"] == "KEPT-EXCERPT-123"
 
 
 # ---------------------------------------------------------------------------

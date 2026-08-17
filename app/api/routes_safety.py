@@ -157,13 +157,13 @@ class StatsResponse(BaseModel):
     by_action: list[ActionRow]
     by_scope: list[ScopeRow]
 
-    model_config = {"populate_by_name": True}
 
+def _require_safety_routes() -> None:
+    """404 before bearer parsing unless content safety is enabled.
 
-def _require_safety_routes(
-    _operator: bool = Depends(require_operator),
-) -> None:
-    """Route availability = operator API AND content safety enabled."""
+    Declared ahead of ``require_operator`` in each route's dependency list so
+    a disabled feature flag can never surface as a 401 auth failure.
+    """
     settings = get_settings()
     if not settings.content_safety_enabled:
         raise HTTPException(
@@ -242,7 +242,8 @@ def _filtered_findings_query(
 
 
 @router.get("/findings", response_model=FindingsPage,
-            dependencies=[Depends(_require_safety_routes)])
+            dependencies=[Depends(_require_safety_routes),
+                        Depends(require_operator)])
 async def list_findings(
     category: str | None = Query(default=None),
     action: str | None = Query(default=None),
@@ -280,7 +281,8 @@ async def list_findings(
 
 
 @router.get("/findings/{finding_id}", response_model=FindingDetail,
-            dependencies=[Depends(_require_safety_routes)])
+            dependencies=[Depends(_require_safety_routes),
+                        Depends(require_operator)])
 async def get_finding(
     finding_id: int,
     session: Session = Depends(get_db),
@@ -309,7 +311,8 @@ async def get_finding(
 
 
 @router.get("/stats", response_model=StatsResponse,
-            dependencies=[Depends(_require_safety_routes)])
+            dependencies=[Depends(_require_safety_routes),
+                        Depends(require_operator)])
 async def safety_stats(
     policy_version: str | None = Query(default=None),
     category: str | None = Query(default=None),
