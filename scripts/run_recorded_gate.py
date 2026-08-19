@@ -283,6 +283,111 @@ PHASE10C_RESTORATION_STEPS: list[dict[str, Any]] = [
      "description": "chroma heartbeat (readiness-polled)"},
 ]
 
+# Typed phase10d sequence exactly as the plan's 10D task gate specifies it:
+# prior-phase validators in a/b/c order, then the 10D gate orchestrator and
+# named-volume durability validator as HOST python steps, then state equality.
+PRIMARY_STEPS["phase10d"] = [
+    {"kind": "subprocess", "argv": ["python", "scripts/source_manifest.py",
+     "--output", ".hermes/reports/phase10d-source-manifest.json"],
+     "description": "phase10d source manifest"},
+    {"kind": "subprocess", "argv": ["python", "scripts/snapshot_nonsecret_deployment.py",
+     "--deployment-output", ".hermes/reports/phase10d-base-deployment.json",
+     "--settings-output", ".hermes/reports/phase10d-base-expected-settings.json"],
+     "description": "phase10d base non-secret deployment/settings snapshot"},
+    {"kind": "phase10d_scoped_env",
+     "description": "phase10d in-memory scoped operator/content-safety/source env (no values recorded)"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "config", "--quiet"],
+     "description": "compose config validation"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "build", "--no-cache", "api", "migrate"],
+     "description": "phase10d labeled build"},
+    {"kind": "subprocess", "argv": ["python", "scripts/create_phase10_source_binding.py",
+     "--manifest", ".hermes/reports/phase10d-source-manifest.json",
+     "--output", ".hermes/reports/phase10d-source-binding.json",
+     "--services", "api", "migrate"],
+     "description": "phase10d source binding"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "up", "-d", "--force-recreate"],
+     "description": "phase10d deploy (operator + content-safety env)"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python", "-c",
+     "from app.config import get_settings; s=get_settings(); assert s.operator_api_enabled and s.content_safety_enabled and s.safety_llm_mode == 'rules_only'; "
+     "print({'operator_api_enabled':True,'content_safety_enabled':True,'safety_llm_mode':'rules_only'})"],
+     "description": "content-safety settings assert in container"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "run", "--rm", "migrate"],
+     "description": "migrate one-shot"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api",
+     "python", "-m", "app.core.migrations"],
+     "description": "in-container migrations wrapper"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "-m", "alembic", "-c", "alembic.ini", "current"],
+     "description": "alembic current"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "-m", "alembic", "-c", "alembic.ini", "check"],
+     "description": "alembic check"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/fingerprint_production_state.py", "--json"],
+     "stdout_to": "phase10d-state-before.json",
+     "description": "production state fingerprint (before)"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "-m", "pytest", "-q"],
+     "description": "phase10d full test suite"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/validate_phase10a.py"],
+     "description": "phase10a regression validator"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/validate_phase10b.py"],
+     "description": "phase10b regression validator"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/validate_phase10c.py"],
+     "description": "phase10c regression validator"},
+    {"kind": "subprocess", "argv": ["python", "scripts/run_phase10d_gate.py",
+     "--output", ".hermes/reports",
+     "--source-manifest", ".hermes/reports/phase10d-source-manifest.json",
+     "--source-binding", ".hermes/reports/phase10d-source-binding.json"],
+     "description": "phase10d recorded red-team gate (two runs + validation + normalization)"},
+    {"kind": "subprocess", "argv": ["python", "scripts/validate_named_volume_durability.py",
+     "--output", ".hermes/reports/phase10d-durability.json"],
+     "description": "named-volume durability validation"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "scripts/fingerprint_production_state.py", "--json"],
+     "stdout_to": "phase10d-state-after.json",
+     "description": "production state fingerprint (after)"},
+    {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10d-state-before.json",
+     ".hermes/reports/phase10d-state-after.json"],
+     "description": "state equality"},
+]
+
+PHASE10D_RESTORATION_STEPS: list[dict[str, Any]] = [
+    {"kind": "phase10d_unscoped_env",
+     "description": "destroy in-memory scoped operator/content-safety/source env"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "up", "-d", "--force-recreate"],
+     "description": "restoration base recreation (default env)"},
+    {"kind": "subprocess", "argv": ["python", "scripts/snapshot_nonsecret_deployment.py",
+     "--deployment-output", ".hermes/reports/phase10d-restored-deployment.json",
+     "--settings-output", ".hermes/reports/phase10d-restored-expected-settings.json"],
+     "description": "restored non-secret deployment/settings snapshot (default env)"},
+    {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10d-base-deployment.json",
+     ".hermes/reports/phase10d-restored-deployment.json"],
+     "description": "base/restored deployment equality"},
+    {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10d-base-expected-settings.json",
+     ".hermes/reports/phase10d-restored-expected-settings.json"],
+     "description": "base/restored expected-settings equality"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api",
+     "python", "scripts/snapshot_nonsecret_settings.py"],
+     "stdout_to": "phase10d-restored-running-settings.json",
+     "description": "restored running settings"},
+    {"kind": "subprocess", "argv": ["cmp", ".hermes/reports/phase10d-base-expected-settings.json",
+     ".hermes/reports/phase10d-restored-running-settings.json"],
+     "description": "expected vs running settings equality"},
+    {"kind": "subprocess", "argv": ["docker", "compose", "exec", "-T", "api", "python",
+     "-m", "alembic", "-c", "alembic.ini", "current"],
+     "description": "alembic current (restored)"},
+    {"kind": "heartbeat", "url": "http://127.0.0.1:8000/",
+     "attempts": 30, "interval_seconds": 2,
+     "description": "api heartbeat (readiness-polled)"},
+    {"kind": "heartbeat", "url": "http://127.0.0.1:8001/api/v2/heartbeat",
+     "attempts": 30, "interval_seconds": 2,
+     "description": "chroma heartbeat (readiness-polled)"},
+]
+
 _LEDGER_SCHEMA_PATH = Path("app/tests/fixtures/phase10-command-ledger.schema.json")
 
 # Sentinel substrings whose presence in recorded command output is a leak.
@@ -414,6 +519,10 @@ _PHASE10C_SCOPED_KEYS = (
     "SOURCE_REVISION", "SOURCE_CONTEXT_SHA256", "SOURCE_DIRTY",
 )
 
+# The phase10d registry's scoped env is the same operator/content-safety/
+# source set as phase10c (plan lines 2013-2022); the manifest source differs.
+_PHASE10D_SCOPED_KEYS = _PHASE10C_SCOPED_KEYS
+
 
 def _phase10b_scoped_env(reports: Path) -> tuple[int, str, str]:
     """Apply the typed scoped env in-memory only (never argv/ledger strings).
@@ -485,6 +594,39 @@ def _phase10c_unscoped_env() -> tuple[int, str, str]:
     import os
 
     for key in _PHASE10C_SCOPED_KEYS:
+        os.environ.pop(key, None)
+    return 0, "", ""
+
+
+def _phase10d_scoped_env(reports: Path) -> tuple[int, str, str]:
+    """Apply the phase10d scoped env in-memory (10C key set, 10D manifest)."""
+    import os
+    import secrets
+
+    manifest_path = reports / "phase10d-source-manifest.json"
+    manifest: dict[str, Any] = {}
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    bearer = secrets.token_urlsafe(32)
+    os.environ["RAG_OPERATOR_API_ENABLED"] = "true"
+    os.environ["RAG_OPERATOR_TOKEN"] = bearer
+    os.environ["OPERATOR_BEARER"] = bearer
+    os.environ["RAG_CONTENT_SAFETY_ENABLED"] = "true"
+    os.environ["RAG_SAFETY_LLM_MODE"] = "rules_only"
+    if manifest.get("commit_sha"):
+        os.environ["SOURCE_REVISION"] = str(manifest["commit_sha"])
+    if manifest.get("image_context_sha256"):
+        os.environ["SOURCE_CONTEXT_SHA256"] = str(manifest["image_context_sha256"])
+    if manifest.get("dirty") is not None:
+        os.environ["SOURCE_DIRTY"] = str(manifest["dirty"]).lower()
+    return 0, "", ""
+
+
+def _phase10d_unscoped_env() -> tuple[int, str, str]:
+    """Destroy the in-memory phase10d scoped env (restoration)."""
+    import os
+
+    for key in _PHASE10D_SCOPED_KEYS:
         os.environ.pop(key, None)
     return 0, "", ""
 
@@ -562,6 +704,10 @@ def _run_recorded_step(
         rc, out, err = _phase10c_scoped_env(reports)
     elif kind == "phase10c_unscoped_env":
         rc, out, err = _phase10c_unscoped_env()
+    elif kind == "phase10d_scoped_env":
+        rc, out, err = _phase10d_scoped_env(reports)
+    elif kind == "phase10d_unscoped_env":
+        rc, out, err = _phase10d_unscoped_env()
     elif kind == "curl_status":
         rc, out, err = _curl_status_step(step, reports)
     elif kind == "file_contains_lower":
@@ -601,6 +747,7 @@ def run_gate(gate: str, plan: str, reports_dir: str) -> int:
     restoration_steps = (
         PHASE10B_RESTORATION_STEPS if gate == "phase10b"
         else PHASE10C_RESTORATION_STEPS if gate == "phase10c"
+        else PHASE10D_RESTORATION_STEPS if gate == "phase10d"
         else RESTORATION_STEPS
     )
     ledger: list[dict[str, Any]] = []

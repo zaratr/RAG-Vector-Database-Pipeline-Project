@@ -499,3 +499,105 @@ def test_phase10c_unscoped_env_removes_all_scoped_keys(monkeypatch, tmp_path):
         assert os.environ.get(key) == pre_env.get(key), (
             f"{key} not restored: got {os.environ.get(key)!r}, expected {pre_env.get(key)!r}"
         )
+
+
+def test_phase10d_registry_kinds_produce_schema_valid_ledger():
+    """D-45: every step kind PRIMARY_STEPS['phase10d'] can emit must produce a
+    ledger row the closed command-ledger schema accepts."""
+    from scripts.run_recorded_gate import (
+        PRIMARY_STEPS,
+        _record_step,
+        validate_command_ledger,
+    )
+
+    ledger = []
+    for ordinal, step in enumerate(PRIMARY_STEPS["phase10d"]):
+        _record_step(ledger, ordinal, step, 0, "", "", phase="primary")
+    payload = {"schema": "phase10-command-ledger-v1", "gate_id": "phase10d",
+               "steps": ledger}
+    validate_command_ledger(payload)
+    kinds = {row["kind"] for row in ledger}
+    assert kinds <= {"subprocess", "assertion", "internal"}
+    assert "internal" in kinds
+    # Prior-phase validators run in a/b/c order before the 10D orchestrator.
+    argvs = [" ".join(row["argv"]) for row in ledger]
+    assert next(i for i, a in enumerate(argvs)
+                if "validate_phase10a" in a) < \
+           next(i for i, a in enumerate(argvs)
+                if "validate_phase10b" in a) < \
+           next(i for i, a in enumerate(argvs)
+                if "validate_phase10c" in a) < \
+           next(i for i, a in enumerate(argvs)
+                if "run_phase10d_gate" in a)
+
+
+def test_phase10d_restored_snapshots_compared_only_after_unscope():
+    """D-50: every restored-snapshot/cmp step must execute after the scoped
+    env is destroyed."""
+    from scripts.run_recorded_gate import PHASE10D_RESTORATION_STEPS, PRIMARY_STEPS
+
+    full_sequence = list(PRIMARY_STEPS["phase10d"]) + list(PHASE10D_RESTORATION_STEPS)
+    unscope_positions = [
+        i for i, step in enumerate(full_sequence)
+        if step.get("kind") == "phase10d_unscoped_env"
+    ]
+    assert unscope_positions, "phase10d must destroy the scoped env"
+    unscope_at = unscope_positions[0]
+
+    restored_markers = (
+        "phase10d-restored-deployment.json",
+        "phase10d-restored-expected-settings.json",
+        "phase10d-restored-running-settings.json",
+    )
+    for index, step in enumerate(full_sequence):
+        argv = " ".join(step.get("argv", []))
+        touches_restored = any(marker in argv for marker in restored_markers)
+        if touches_restored:
+            assert index > unscope_at, (
+                f"restored snapshot/cmp at index {index} runs before unscope"
+            )
+    assert not any(
+        step.get("kind") == "phase10d_unscoped_env"
+        for step in PRIMARY_STEPS["phase10d"]
+    )
+
+
+def test_phase10d_scoped_env_sets_all_eight_keys(monkeypatch, tmp_path):
+    """phase10d_scoped_env sets the five RAG_*/OPERATOR_* keys plus three
+    SOURCE_* keys from the phase10d manifest, with a fresh bearer."""
+    import os
+
+    monkeypatch.chdir(tmp_path)
+    reports_dir = tmp_path / ".hermes" / "reports"
+    reports_dir.mkdir(parents=True)
+
+    manifest = {
+        "commit_sha": "abc123def456" + "0" * 28,
+        "image_context_sha256": "f" * 64,
+        "dirty": "false",
+    }
+    (reports_dir / "phase10d-source-manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
+
+    from scripts.run_recorded_gate import (
+        _PHASE10D_SCOPED_KEYS,
+        _phase10d_scoped_env,
+        _phase10d_unscoped_env,
+    )
+
+    pre_env = {key: os.environ.get(key) for key in _PHASE10D_SCOPED_KEYS}
+    rc, out, err = _phase10d_scoped_env(reports_dir)
+    assert rc == 0 and out == "" and err == ""
+
+    assert os.environ["RAG_OPERATOR_API_ENABLED"] == "true"
+    assert os.environ["RAG_CONTENT_SAFETY_ENABLED"] == "true"
+    assert os.environ["RAG_SAFETY_LLM_MODE"] == "rules_only"
+    assert len(os.environ["RAG_OPERATOR_TOKEN"]) >= 32
+    assert os.environ["OPERATOR_BEARER"] == os.environ["RAG_OPERATOR_TOKEN"]
+    assert os.environ["SOURCE_REVISION"] == manifest["commit_sha"]
+    assert os.environ["SOURCE_CONTEXT_SHA256"] == "f" * 64
+    assert os.environ["SOURCE_DIRTY"] == "false"
+
+    _phase10d_unscoped_env()
+    for key in _PHASE10D_SCOPED_KEYS:
+        assert os.environ.get(key) == pre_env.get(key)
