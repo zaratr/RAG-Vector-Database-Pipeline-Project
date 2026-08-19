@@ -311,6 +311,11 @@ def resolve_redteam_config(env=None) -> RedteamConfig:
             raise ValueError(f"{label} database path is a symlink")
         if path.exists():
             raise ValueError(f"{label} database path already exists")
+        for suffix in ("-wal", "-shm"):
+            if Path(str(path) + suffix).exists():
+                raise ValueError(
+                    f"{label} database sidecar {path.name + suffix!r} "
+                    "already exists")
 
     if disabled_url == enabled_url or disabled_coll == enabled_coll:
         raise ValueError("disabled and enabled identities must differ")
@@ -336,15 +341,13 @@ def _uuid_tail(name: str) -> str:
 
 
 def _chroma_client():
-    import chromadb
+    # Single source of truth: the production client-resolution precedence
+    # (persist directory > host/port > ephemeral) so fingerprints, existence
+    # checks, and cleanup always target the same server the harness writes
+    # to, in every deployment shape (D-75).
+    from app.services.vector_store import _create_client
 
-    from app.config import get_settings
-
-    settings = get_settings()
-    if settings.chroma_host:
-        return chromadb.HttpClient(host=settings.chroma_host,
-                                   port=settings.chroma_port)
-    return chromadb.EphemeralClient()
+    return _create_client()
 
 
 def production_sql_fingerprint(production_database_url: str) -> str:
