@@ -22,6 +22,7 @@ _VOLATILE_KEYS = {
     "latency",
     "latency_ns",
     "host",
+    "host_path",
     "output_path",
 }
 
