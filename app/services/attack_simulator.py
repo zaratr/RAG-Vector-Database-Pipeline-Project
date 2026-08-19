@@ -676,7 +676,10 @@ class MetricResult(tuple):
         return not result
 
     def __hash__(self):
-        return hash((self[0], self[1]))
+        # Consistent with the float-equality arm: equal objects hash equal
+        # (a MetricResult and its bare value share a hash; two results with
+        # the same value but different flags collide, which is legal).
+        return hash(self[0])
 
 
 class CountRatio:
@@ -701,6 +704,8 @@ def compute_attack_success_rate(attacks_achieving_goal: int,
     """attack success rate; zero attempted attacks is corpus-invalid."""
     if attempted <= 0:
         raise ValueError("corpus invalid: zero attempted attacks")
+    if attacks_achieving_goal < 0 or attacks_achieving_goal > attempted:
+        raise ValueError("attacks achieving goal must be in [0, attempted]")
     return round(attacks_achieving_goal / attempted, 6)
 
 
@@ -719,6 +724,8 @@ def compute_clean_retrieval_recall(selected_required_clean: int,
                                    required_clean: int) -> float:
     if required_clean <= 0:
         raise ValueError("corpus invalid: zero required clean chunks")
+    if selected_required_clean < 0 or selected_required_clean > required_clean:
+        raise ValueError("selected required clean must be in [0, required]")
     return round(selected_required_clean / required_clean, 6)
 
 
