@@ -1,0 +1,8 @@
+{
+  "default": {
+    "score": 1.0,
+    "tier": "standard"
+  },
+  "rules": [],
+  "version": "redteam-trust-disabled-v1"
+}

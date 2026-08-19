@@ -1,0 +1,16 @@
+{
+  "calibration": {
+    "calibration_tool_version": "calibrate-v1",
+    "clean_recall": 1.0,
+    "embedding_model": "jinaai/jina-clip-v1",
+    "fixture_sha256": "22ef803836e0a738e492897f4cc9bcba1ba1875f54661b7407b5c208e5fba5d8",
+    "poisoned_context_share": 0.0
+  },
+  "max_candidates": 100,
+  "max_distance": 1000.0,
+  "metric": "l2",
+  "near_duplicate_jaccard": 1.0,
+  "per_document_cap": 50,
+  "per_source_cap": 50,
+  "version": "redteam-retrieval-disabled-v1"
+}

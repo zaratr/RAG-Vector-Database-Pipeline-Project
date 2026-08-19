@@ -1,0 +1,23 @@
+{
+  "default": {
+    "score": 0.2,
+    "tier": "untrusted"
+  },
+  "rules": [
+    {
+      "requires_operator": true,
+      "rule_id": "RT001",
+      "score": 1.0,
+      "source": "trusted-control",
+      "tier": "trusted"
+    },
+    {
+      "requires_operator": false,
+      "rule_id": "RT002",
+      "score": 0.0,
+      "source": "untrusted-attack",
+      "tier": "blocked"
+    }
+  ],
+  "version": "redteam-trust-enabled-v1"
+}

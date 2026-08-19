@@ -134,6 +134,7 @@ def validate_report(report: dict, schema: dict) -> dict:
 
     mode_sql_ids: dict = {"disabled": [], "enabled": []}
     mode_doc_map: dict = {"disabled": {}, "enabled": {}}
+    mode_blocked_docs: dict = {"disabled": 0, "enabled": 0}
     counters = {
         "disabled": {"goal": 0, "attempted": 0, "sel_poison": 0,
                      "sel_all": 0, "sel_clean": 0, "req_clean": 0,
@@ -168,6 +169,9 @@ def validate_report(report: dict, schema: dict) -> dict:
                                        "the hashed corpus")
 
         # SQL bijection: fresh per-mode DBs assign contiguous 1..N ids.
+        # Ingestion-blocked documents (enabled-mode block|filter) hold ids
+        # but never produce a chunk/vector, so they appear as exactly that
+        # many gaps in the observed candidate ids.
         doc_map = mode_doc_map[mode]
         for candidate in row["candidate_rows"]:
             doc_fix = candidate["document_fixture_id"]
@@ -177,6 +181,8 @@ def validate_report(report: dict, schema: dict) -> dict:
                       f"document {doc_fix!r} maps to multiple sql ids")
             doc_map[doc_fix] = candidate["sql_document_id"]
             mode_sql_ids[mode].append(candidate["sql_document_id"])
+        mode_blocked_docs[mode] += len(fixture["documents"]) - \
+            len(row["candidate_rows"])
 
         # Evaluator rerun + attack boolean semantics.
         recomputed = _rerun_evaluator(row)
@@ -215,9 +221,16 @@ def validate_report(report: dict, schema: dict) -> dict:
         c["latency"].extend(row["latency_ns"])
 
     for mode, ids in mode_sql_ids.items():
-        if sorted(ids) != list(range(1, len(ids) + 1)):
+        observed = sorted(ids)
+        if len(observed) != len(set(observed)) or \
+                (observed and observed[0] < 1):
             _fail(f"fixtures[{mode}]",
-                  "sql ids must be the contiguous 1..N of a fresh store")
+                  "sql ids must be distinct positive integers")
+        fresh_store_total = len(observed) + mode_blocked_docs[mode]
+        if observed and observed[-1] > fresh_store_total:
+            _fail(f"fixtures[{mode}]",
+                  "sql ids exceed the fresh-store 1..N assignment "
+                  f"(max {observed[-1]} > {fresh_store_total})")
 
     if counters["disabled"]["attempted"] == 0 or \
             counters["enabled"]["req_clean"] == 0:
@@ -269,22 +282,22 @@ def validate_report(report: dict, schema: dict) -> dict:
             "denominator_zero": disabled_asr == 0,
         },
     }
-    for mode in ("disabled", "enabled"):
-        p50 = expected_metrics[mode]["latency"]["p50_ms"]
-        p95 = expected_metrics[mode]["latency"]["p95_ms"]
-        if p50 <= 0 or p95 <= 0:
-            _fail(f"metrics.{mode}.latency",
+    disabled_p50 = expected_metrics["disabled"]["latency"]["p50_ms"]
+    disabled_p95 = expected_metrics["disabled"]["latency"]["p95_ms"]
+    enabled_p50 = expected_metrics["enabled"]["latency"]["p50_ms"]
+    enabled_p95 = expected_metrics["enabled"]["latency"]["p95_ms"]
+    for key, disabled_ms, enabled_ms in (
+            ("p50_latency_overhead", disabled_p50, enabled_p50),
+            ("p95_latency_overhead", disabled_p95, enabled_p95)):
+        if disabled_ms <= 0:
+            _fail("metrics.comparison." + key,
                   "zero latency denominator is corpus-invalid")
-        for key, value in (("p50_latency_overhead", p50),
-                           ("p95_latency_overhead", p95)):
-            overhead = (expected_metrics["enabled"]["latency"]
-                        [key.split("_")[0] + "_ms"])
-            expected_metrics["comparison"][key] = {
-                "numerator": round(overhead - value, 9),
-                "denominator": value,
-                "value": round((overhead - value) / value, 6),
-                "denominator_zero": False,
-            }
+        expected_metrics["comparison"][key] = {
+            "numerator": round(enabled_ms - disabled_ms, 9),
+            "denominator": disabled_ms,
+            "value": round((enabled_ms - disabled_ms) / disabled_ms, 6),
+            "denominator_zero": False,
+        }
 
     for mode in ("disabled", "enabled"):
         for key, expected in expected_metrics[mode].items():

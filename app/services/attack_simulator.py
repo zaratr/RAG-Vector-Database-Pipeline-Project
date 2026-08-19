@@ -476,25 +476,45 @@ def build_fixture_input_manifest(corpus_bytes: bytes, corpus: dict) -> str:
 class ModeEnvironment:
     """Apply one mode's guarded env overrides around a ``with`` block.
 
-    ``disabled`` observes but does not enforce the measured
-    content-safety control; ``enabled`` enforces it with the deterministic
-    rules-only detector. Baseline invariants (SQL authority, readiness,
-    bounded work, escaping, grounding) are untouched in both modes.
-    Measurement of the retrieval/context controls arrives with Task 10D.3.
+    ``disabled`` observes but does not enforce the measured controls —
+    content safety off, the corpus-faithful permissive source-trust
+    policy (every corpus source trusted), and the permissive retrieval
+    policy (no distance/duplicate/caps gating). ``enabled`` enforces
+    them: content safety on with the deterministic rules-only detector
+    plus the corpus-faithful enabled trust policy
+    (trusted-control→trusted, untrusted-attack→blocked, mirroring the
+    corpus source-spoofing scenario's server-side assignment) and the
+    production retrieval/context policies. Baseline invariants (SQL
+    authority, readiness, bounded work, escaping, grounding) are
+    untouched in both modes.
     """
 
-    _BASE_KEYS = ("RAG_DATABASE_URL", "RAG_CHROMA_COLLECTION",
-                  "RAG_CONTENT_SAFETY_ENABLED", "RAG_SAFETY_LLM_MODE")
+    _REPO_ROOT = Path(__file__).resolve().parents[2]
+    _POLICY_DIR = _REPO_ROOT / "app" / "tests" / "fixtures" / "redteam-policies"
+    _BASE_KEYS = (
+        "RAG_DATABASE_URL", "RAG_CHROMA_COLLECTION",
+        "RAG_CONTENT_SAFETY_ENABLED", "RAG_SAFETY_LLM_MODE",
+        "RAG_SOURCE_TRUST_POLICY_PATH", "RAG_RETRIEVAL_SECURITY_POLICY_PATH",
+    )
 
     def __init__(self, mode: str, database_url: str,
                  chroma_collection: str) -> None:
-        self._overrides = {
+        trust_policy = self._POLICY_DIR / (
+            "enabled-source-trust.json" if mode == "enabled"
+            else "disabled-source-trust.json")
+        overrides = {
             "RAG_DATABASE_URL": database_url,
             "RAG_CHROMA_COLLECTION": chroma_collection,
             "RAG_CONTENT_SAFETY_ENABLED":
                 "true" if mode == "enabled" else "false",
             "RAG_SAFETY_LLM_MODE": "rules_only",
+            "RAG_SOURCE_TRUST_POLICY_PATH": trust_policy.as_posix(),
         }
+        if mode == "disabled":
+            overrides["RAG_RETRIEVAL_SECURITY_POLICY_PATH"] = (
+                self._POLICY_DIR / "disabled-retrieval-security.json"
+            ).as_posix()
+        self._overrides = overrides
         self._saved: dict = {}
 
     def __enter__(self) -> "ModeEnvironment":
@@ -504,6 +524,7 @@ class ModeEnvironment:
             self._saved[key] = _os.environ.get(key)
         _os.environ.update(self._overrides)
         get_settings.cache_clear()
+        _reset_policy_caches()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -515,22 +536,48 @@ class ModeEnvironment:
             else:
                 _os.environ[key] = value
         get_settings.cache_clear()
+        _reset_policy_caches()
 
 
-def ingest_fixture_document(payload: dict, engine, store) -> dict:
+def _reset_policy_caches() -> None:
+    from app.services.context_security import (
+        reset_context_security_policy_cache,
+    )
+    from app.services.safety_policy import reset_safety_policy_cache
+
+    reset_context_security_policy_cache()
+    reset_safety_policy_cache()
+
+
+def ingest_fixture_document(payload: dict, engine, store,
+                            embedding_provider=None) -> dict:
     """Ingest ONE fixture payload through the exact production path.
 
-    Returns the binding: document_fixture_id, chunk_fixture_id,
-    sql_document_id, sql_chunk_id, vector_id, status. Raises SystemExit(2)
-    for corpus-invalid multiplicity (zero or multiple chunks).
+    Server-side trust is assigned from the ACTIVE mode's source-trust
+    policy exactly as the production API layer does (10B.2), so the
+    enabled mode's blocked-tier assignment and the disabled mode's
+    permissive observation are both real. The embedding provider may be
+    scenario-aware (the harness encodes the corpus L2 geometry into the
+    document vectors). Returns the binding: document_fixture_id,
+    chunk_fixture_id, sql_document_id, sql_chunk_id, vector_id, status.
+    Raises SystemExit(2) for corpus-invalid multiplicity.
     """
     from sqlalchemy import text as sa_text
 
     from app.services.ingestion import IngestionSafetyBlocked, ingest_text
+    from app.services.provenance import load_source_trust_policy
 
     fixture_doc_id = payload["document_fixture_id"]
     title = payload.get("title", fixture_doc_id)
     text = payload["text"]
+    from app.config import get_settings
+
+    trust_policy = load_source_trust_policy(
+        get_settings().source_trust_policy_path)
+    # The harness ingests in its guarded internal-operator capacity (the
+    # CLI is the only caller), so operator-gated trust tiers apply.
+    trust_tier, trust_score = trust_policy.assess(
+        payload.get("source"), is_operator=True)
     session = _session_from_engine(engine)
     try:
         try:
@@ -539,10 +586,14 @@ def ingest_fixture_document(payload: dict, engine, store) -> dict:
                 source=payload.get("source"),
                 tags=None,
                 text=text,
-                embedding_provider=_ConstantEmbeddingProvider(),
+                embedding_provider=embedding_provider
+                or _ConstantEmbeddingProvider(),
                 vector_store=store,
                 session=session,
                 graph_extractor=None,
+                trust_tier=trust_tier,
+                trust_score=trust_score,
+                trust_policy_version=trust_policy.version,
             ))
             document_id = result["document_id"]
             rows = session.execute(
