@@ -1,0 +1,1600 @@
+{
+  "$schema": "https://jsonschema-12/draft/2020-12/schema",
+  "$id": "phase10-redteam-report-v1",
+  "title": "Phase 10D red-team report (phase10-redteam-report-v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "source_state",
+    "image_ids",
+    "dependencies",
+    "policy_versions",
+    "seed",
+    "fixture_sha256",
+    "fixtures",
+    "metrics",
+    "timestamps",
+    "cleanup_complete",
+    "non_acceptance",
+    "acceptance",
+    "production_fingerprints"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "phase10-redteam-report-v1"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "not": {
+        "pattern": "^redteam-"
+      }
+    },
+    "source_state": {
+      "$ref": "#/$defs/SourceState"
+    },
+    "image_ids": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "api",
+        "migrate"
+      ],
+      "properties": {
+        "api": {
+          "type": "string",
+          "minLength": 1
+        },
+        "migrate": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "seed": {
+      "const": 42
+    },
+    "fixture_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/ScenarioResult"
+      }
+    },
+    "metrics": {
+      "$ref": "#/$defs/Metrics"
+    },
+    "timestamps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "started_at",
+        "completed_at"
+      ],
+      "properties": {
+        "started_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "completed_at": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "cleanup_complete": {
+      "type": "boolean"
+    },
+    "non_acceptance": {
+      "type": "boolean"
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "thresholds_passed",
+        "failure_codes"
+      ],
+      "properties": {
+        "thresholds_passed": {
+          "type": "boolean"
+        },
+        "failure_codes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "production_fingerprints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "before",
+        "per_fixture",
+        "post_cleanup"
+      ],
+      "properties": {
+        "before": {
+          "$ref": "#/$defs/Fingerprint"
+        },
+        "per_fixture": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "fixture_id",
+              "mode",
+              "sha256"
+            ],
+            "properties": {
+              "fixture_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "mode": {
+                "enum": [
+                  "disabled",
+                  "enabled"
+                ]
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        },
+        "post_cleanup": {
+          "$ref": "#/$defs/Fingerprint"
+        }
+      }
+    },
+    "dependencies": {
+      "$ref": "#/$defs/dependencies"
+    },
+    "policy_versions": {
+      "$ref": "#/$defs/policy_versions"
+    }
+  },
+  "$defs": {
+    "ShaOrPath": {
+      "type": "string",
+      "minLength": 1
+    },
+    "Labels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "source_context_sha256",
+        "source_dirty"
+      ],
+      "properties": {
+        "revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "source_context_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "source_dirty": {
+          "enum": [
+            "true",
+            "false"
+          ]
+        }
+      }
+    },
+    "SourceState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch",
+        "commit_sha",
+        "dirty",
+        "porcelain_sha256",
+        "manifest_sha256",
+        "delivery_tree_sha256",
+        "image_context_sha256",
+        "api_labels",
+        "migrate_labels"
+      ],
+      "properties": {
+        "branch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "commit_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "porcelain_sha256": {
+          "$ref": "#/$defs/ShaOrPath"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/ShaOrPath"
+        },
+        "delivery_tree_sha256": {
+          "$ref": "#/$defs/ShaOrPath"
+        },
+        "image_context_sha256": {
+          "$ref": "#/$defs/ShaOrPath"
+        },
+        "api_labels": {
+          "$ref": "#/$defs/Labels"
+        },
+        "migrate_labels": {
+          "$ref": "#/$defs/Labels"
+        }
+      }
+    },
+    "CountRatio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "numerator",
+        "denominator",
+        "value",
+        "denominator_zero"
+      ],
+      "properties": {
+        "numerator": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "denominator": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "value": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "denominator_zero": {
+          "type": "boolean"
+        }
+      },
+      "$comment": "numerator <= denominator is encoded for denominators 0..32 via if/then branches (the region this report's counted ratios occupy); validate_redteam_report enforces the general invariant plus value == round(numerator/denominator, 6) with 0.0 when denominator_zero.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 2
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 2
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 3
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 3
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 4
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 4
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 5
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 5
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 6
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 6
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 7
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 7
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 8
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 8
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 9
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 9
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 10
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 10
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 11
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 11
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 12
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 12
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 13
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 13
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 14
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 14
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 15
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 15
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 16
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 16
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 17
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 17
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 18
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 18
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 19
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 19
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 20
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 20
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 21
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 21
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 22
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 22
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 23
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 23
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 24
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 24
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 25
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 25
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 26
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 26
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 27
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 27
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 28
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 28
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 29
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 29
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 30
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 30
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 31
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 31
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 32
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "numerator": {
+                "maximum": 32
+              }
+            }
+          }
+        }
+      ]
+    },
+    "NumericRatio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "numerator",
+        "denominator",
+        "value",
+        "denominator_zero"
+      ],
+      "properties": {
+        "numerator": {
+          "type": "number"
+        },
+        "denominator": {
+          "type": "number",
+          "minimum": 0
+        },
+        "value": {
+          "type": "number"
+        },
+        "denominator_zero": {
+          "type": "boolean"
+        }
+      }
+    },
+    "LatencySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_count",
+        "p50_ms",
+        "p95_ms"
+      ],
+      "properties": {
+        "sample_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "p50_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "p95_ms": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "LatencyMethodology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clock",
+        "warmups_per_fixture",
+        "measured_repetitions_per_fixture",
+        "percentile_method"
+      ],
+      "properties": {
+        "clock": {
+          "const": "perf_counter_ns"
+        },
+        "warmups_per_fixture": {
+          "const": 3
+        },
+        "measured_repetitions_per_fixture": {
+          "const": 10
+        },
+        "percentile_method": {
+          "const": "nearest_rank"
+        }
+      }
+    },
+    "ModeMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attack_success_rate",
+        "poisoned_context_share",
+        "clean_retrieval_recall",
+        "false_positive_rate",
+        "graph_path_contamination",
+        "blocked_generation_count",
+        "unsafe_answers_after_block",
+        "latency"
+      ],
+      "properties": {
+        "attack_success_rate": {
+          "$ref": "#/$defs/CountRatio"
+        },
+        "poisoned_context_share": {
+          "$ref": "#/$defs/CountRatio"
+        },
+        "clean_retrieval_recall": {
+          "$ref": "#/$defs/CountRatio"
+        },
+        "false_positive_rate": {
+          "$ref": "#/$defs/CountRatio"
+        },
+        "graph_path_contamination": {
+          "$ref": "#/$defs/CountRatio"
+        },
+        "blocked_generation_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unsafe_answers_after_block": {
+          "$ref": "#/$defs/CountRatio"
+        },
+        "latency": {
+          "$ref": "#/$defs/LatencySummary"
+        }
+      }
+    },
+    "ComparisonMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relative_attack_reduction",
+        "p50_latency_overhead",
+        "p95_latency_overhead"
+      ],
+      "properties": {
+        "relative_attack_reduction": {
+          "$ref": "#/$defs/NumericRatio"
+        },
+        "p50_latency_overhead": {
+          "$ref": "#/$defs/NumericRatio"
+        },
+        "p95_latency_overhead": {
+          "$ref": "#/$defs/NumericRatio"
+        }
+      }
+    },
+    "Metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "methodology",
+        "disabled",
+        "enabled",
+        "comparison"
+      ],
+      "properties": {
+        "methodology": {
+          "$ref": "#/$defs/LatencyMethodology"
+        },
+        "disabled": {
+          "$ref": "#/$defs/ModeMetrics"
+        },
+        "enabled": {
+          "$ref": "#/$defs/ModeMetrics"
+        },
+        "comparison": {
+          "$ref": "#/$defs/ComparisonMetrics"
+        }
+      }
+    },
+    "ControlResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "control_id",
+        "would_trigger",
+        "enforced",
+        "outcome"
+      ],
+      "properties": {
+        "control_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "would_trigger": {
+          "type": "boolean"
+        },
+        "enforced": {
+          "type": "boolean"
+        },
+        "outcome": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "CandidateRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_fixture_id",
+        "chunk_fixture_id",
+        "sql_document_id",
+        "sql_chunk_id",
+        "is_poisoned",
+        "required_clean",
+        "selected",
+        "decision",
+        "reason_codes"
+      ],
+      "properties": {
+        "document_fixture_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "chunk_fixture_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sql_document_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sql_chunk_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "is_poisoned": {
+          "type": "boolean"
+        },
+        "required_clean": {
+          "type": "boolean"
+        },
+        "selected": {
+          "type": "boolean"
+        },
+        "decision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "PathRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path_id",
+        "selected",
+        "evidence_fixture_ids",
+        "contains_poisoned_evidence"
+      ],
+      "properties": {
+        "path_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "selected": {
+          "type": "boolean"
+        },
+        "evidence_fixture_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "contains_poisoned_evidence": {
+          "type": "boolean"
+        }
+      }
+    },
+    "EvaluatorCopy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "result"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "poisoned_chunk_selected",
+            "answer_contains_literal",
+            "graph_path_contains_poisoned_evidence",
+            "unsafe_answer_returned",
+            "control_not_triggered"
+          ]
+        },
+        "result": {
+          "type": "boolean"
+        },
+        "poisoned_document_id": {
+          "type": "string"
+        },
+        "literal": {
+          "type": "string"
+        },
+        "control_id": {
+          "type": "string"
+        }
+      },
+      "$comment": "The type-specific parameter must match the hashed corpus evaluator; validate_redteam_report enforces the exact parameter set per type (closed union semantics live in the validator)."
+    },
+    "Observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "poisoned_chunk_selected",
+            "answer_contains_literal",
+            "graph_path_contains_poisoned_evidence",
+            "unsafe_answer_returned",
+            "control_not_triggered"
+          ]
+        },
+        "target_chunk_fixture_id": {
+          "type": "string"
+        },
+        "selected_chunk_fixture_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "literal_sha256": {
+          "type": "string"
+        },
+        "returned_marker_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "matched_marker_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "match_start": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "match_end": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "poisoned_evidence_fixture_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "selected_path_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "selected_evidence_fixture_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "block_decision_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unsafe_marker_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "control_id": {
+          "type": "string"
+        },
+        "would_trigger": {
+          "type": "boolean"
+        },
+        "enforced": {
+          "type": "boolean"
+        },
+        "outcome": {
+          "type": "string"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "poisoned_chunk_selected"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "target_chunk_fixture_id",
+              "selected_chunk_fixture_ids"
+            ],
+            "properties": {
+              "type": {
+                "const": "poisoned_chunk_selected"
+              },
+              "target_chunk_fixture_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "selected_chunk_fixture_ids": {
+                "type": "array",
+                "minItems": 0,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "answer_contains_literal"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "literal_sha256",
+              "returned_marker_ids",
+              "matched_marker_id",
+              "match_start",
+              "match_end"
+            ],
+            "properties": {
+              "type": {
+                "const": "answer_contains_literal"
+              },
+              "literal_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "returned_marker_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "matched_marker_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "match_start": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "match_end": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "graph_path_contains_poisoned_evidence"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "poisoned_evidence_fixture_ids",
+              "selected_path_ids",
+              "selected_evidence_fixture_ids"
+            ],
+            "properties": {
+              "type": {
+                "const": "graph_path_contains_poisoned_evidence"
+              },
+              "poisoned_evidence_fixture_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "selected_path_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "selected_evidence_fixture_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "unsafe_answer_returned"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "block_decision_ids",
+              "unsafe_marker_ids"
+            ],
+            "properties": {
+              "type": {
+                "const": "unsafe_answer_returned"
+              },
+              "block_decision_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "unsafe_marker_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "control_not_triggered"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "control_id",
+              "would_trigger",
+              "enforced",
+              "outcome"
+            ],
+            "properties": {
+              "type": {
+                "const": "control_not_triggered"
+              },
+              "control_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "would_trigger": {
+                "type": "boolean"
+              },
+              "enforced": {
+                "type": "boolean"
+              },
+              "outcome": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ScenarioResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "category",
+        "kind",
+        "severity",
+        "mode",
+        "expected_safe_outcome",
+        "query_sha256",
+        "attack_succeeded",
+        "evaluator",
+        "control_results",
+        "candidate_rows",
+        "path_rows",
+        "required_clean_ids",
+        "selected_clean_ids",
+        "selected_poisoned_ids",
+        "benign_chunk_ids",
+        "rejected_benign_ids",
+        "evaluator_observations",
+        "block_decision_count",
+        "generation_blocked",
+        "unsafe_answer_returned",
+        "answer_sha256",
+        "latency_ns"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "benign",
+            "malicious"
+          ]
+        },
+        "severity": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "mode": {
+          "enum": [
+            "disabled",
+            "enabled"
+          ]
+        },
+        "expected_safe_outcome": {
+          "enum": [
+            "attack_blocked",
+            "benign_preserved"
+          ]
+        },
+        "query_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "attack_succeeded": {
+          "type": "boolean"
+        },
+        "evaluator": {
+          "$ref": "#/$defs/EvaluatorCopy"
+        },
+        "control_results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ControlResult"
+          }
+        },
+        "candidate_rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CandidateRow"
+          }
+        },
+        "path_rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PathRow"
+          }
+        },
+        "required_clean_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "selected_clean_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "selected_poisoned_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "benign_chunk_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "rejected_benign_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "evaluator_observations": {
+          "$ref": "#/$defs/Observations"
+        },
+        "block_decision_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "generation_blocked": {
+          "type": "boolean"
+        },
+        "unsafe_answer_returned": {
+          "type": "boolean"
+        },
+        "answer_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "latency_ns": {
+          "type": "array",
+          "minItems": 10,
+          "maxItems": 10,
+          "items": {
+            "type": "integer",
+            "exclusiveMinimum": 0
+          }
+        }
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "patternProperties": {
+        "^[A-Za-z0-9_.\\-]+$": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "minProperties": 1
+    },
+    "policy_versions": {
+      "type": "object",
+      "patternProperties": {
+        "^[a-z_]+$": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "minProperties": 1
+    },
+    "Fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sql_sha256",
+        "chroma_sha256"
+      ],
+      "properties": {
+        "sql_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "chroma_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}
