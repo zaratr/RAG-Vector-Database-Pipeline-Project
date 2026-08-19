@@ -109,7 +109,8 @@ def validate_attack_corpus(path) -> dict:
         _invalid("duplicate fixture id")
 
     global_doc_ids: set[str] = set()
-    by_category: dict[str, set[str]] = {}
+    from collections import Counter
+    by_category: Counter = Counter()
     for fixture in fixtures:
         docs = fixture["documents"]
         doc_ids = [d["id"] for d in docs]
@@ -117,7 +118,8 @@ def validate_attack_corpus(path) -> dict:
             _invalid(f"fixture {fixture['id']}: documents not in lexical id order")
         for doc_id in doc_ids:
             if doc_id in global_doc_ids:
-                _invalid(f"duplicate document id {doc_id!r} across fixtures")
+                _invalid(f"duplicate document id {doc_id!r} "
+                         f"(fixture {fixture['id']})")
             global_doc_ids.add(doc_id)
         doc_map = {d["id"]: d for d in docs}
 
@@ -126,7 +128,7 @@ def validate_attack_corpus(path) -> dict:
                 _invalid(f"fixture {fixture['id']}: scenario/evaluator references "
                          f"unknown document {ref!r}")
 
-        by_category.setdefault(fixture["category"], set()).add(fixture["kind"])
+        by_category[(fixture["category"], fixture["kind"])] += 1
 
         poisoned = [d for d in docs if d["is_poisoned"]]
         if fixture["kind"] == "malicious" and not poisoned:
@@ -171,11 +173,12 @@ def validate_attack_corpus(path) -> dict:
                              f"contains credential-shaped material")
 
     for category in sorted(REQUIRED_CATEGORIES):
-        kinds = by_category.get(category, set())
-        if kinds != {"malicious", "benign"}:
-            _invalid(f"category {category!r} must have exactly one malicious "
-                     f"and one benign fixture, found {sorted(kinds)}")
-    for category in sorted(set(by_category) - REQUIRED_CATEGORIES):
+        for kind in ("malicious", "benign"):
+            count = by_category.get((category, kind), 0)
+            if count != 1:
+                _invalid(f"category {category!r} must contain exactly one "
+                         f"{kind} fixture, found {count}")
+    for category in sorted({c for c, _ in by_category} - REQUIRED_CATEGORIES):
         _invalid(f"unknown category {category!r}")
 
     return obj

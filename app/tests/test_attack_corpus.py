@@ -49,9 +49,11 @@ def _mutate_corpus(mutation: str) -> dict:
     fixtures = bad["fixtures"]
     first = fixtures[0]
     if mutation == "duplicate_fixture_id":
+        # Insert the clone adjacent to the original so lexical order is
+        # preserved and the duplicate-id rule (not the order rule) fires.
         clone = copy.deepcopy(first)
         clone["description"] = clone["description"] + " duplicate"
-        fixtures.append(clone)
+        fixtures.insert(fixtures.index(first) + 1, clone)
     elif mutation == "duplicate_document_id":
         clone = copy.deepcopy(first["documents"][0])
         clone["text"] = clone["text"] + " different text"
@@ -90,6 +92,54 @@ def _mutate_corpus(mutation: str) -> dict:
         first["required_clean_document_ids"] = []
     elif mutation == "non_lexical_order":
         fixtures[0], fixtures[1] = fixtures[1], fixtures[0]
+    elif mutation == "scenario_unknown_type":
+        vector_eval = next(
+            f for f in fixtures if f["scenario"]["type"] == "vector_poisoning")
+        vector_eval["scenario"]["type"] = "zzz_unknown"
+    elif mutation == "scenario_missing_type":
+        vector_eval = next(
+            f for f in fixtures if f["scenario"]["type"] == "vector_poisoning")
+        del vector_eval["scenario"]["type"]
+    elif mutation == "evaluator_missing_type":
+        poisoned_eval = next(
+            f for f in fixtures
+            if f["evaluator"]["type"] == "poisoned_chunk_selected")
+        del poisoned_eval["evaluator"]["type"]
+    elif mutation == "duplicate_category_kind":
+        # Second malicious fixture in an already-paired category with every
+        # internal reference remapped to the cloned ids, inserted in lexical
+        # position: exactly-one-per-kind must be the rule that fires.
+        clone = copy.deepcopy(next(
+            f for f in fixtures
+            if f["kind"] == "malicious" and f["category"] == "vector_poisoning"))
+        clone["id"] = clone["id"] + "-second"
+        clone["description"] = clone["description"] + " second"
+
+        def _suffixed(doc_id: str) -> str:
+            return doc_id + "-second"
+
+        for doc in clone["documents"]:
+            doc["id"] = _suffixed(doc["id"])
+        clone["required_clean_document_ids"] = [
+            _suffixed(d) for d in clone["required_clean_document_ids"]]
+        clone["evaluator"]["poisoned_document_id"] = _suffixed(
+            clone["evaluator"]["poisoned_document_id"])
+        scenario = clone["scenario"]
+        if "candidate_order" in scenario:
+            scenario["candidate_order"] = [
+                _suffixed(d) for d in scenario["candidate_order"]]
+        if "l2_distances" in scenario:
+            scenario["l2_distances"] = {
+                _suffixed(d): v for d, v in scenario["l2_distances"].items()}
+        pos = next((i for i, f in enumerate(fixtures) if f["id"] > clone["id"]),
+                   len(fixtures))
+        fixtures.insert(pos, clone)
+    elif mutation == "two_clean_documents":
+        clean = first["documents"][0]
+        extra = copy.deepcopy(clean)
+        extra["id"] = clean["id"] + "-extra"
+        first["documents"].append(extra)
+        first["required_clean_document_ids"] = [clean["id"], extra["id"]]
     else:  # pragma: no cover - parametrization exhausts the list
         raise AssertionError(f"unknown mutation {mutation!r}")
     return bad
@@ -202,6 +252,10 @@ def test_required_clean_documents_exist_and_not_poisoned():
     "wrong_severity_for_kind", "evaluator_type_specific_param_mismatch",
     "scenario_type_param_mismatch", "unknown_top_level_key",
     "missing_required_clean_document_ids", "non_lexical_order",
+    # Regression additions beyond the appendix-pinned thirteen:
+    "scenario_unknown_type", "scenario_missing_type",
+    "evaluator_missing_type", "duplicate_category_kind",
+    "two_clean_documents",
 ])
 def test_corpus_rejects_each_semantic_invalid_mutation(mutation, tmp_path):
     bad = _mutate_corpus(mutation)

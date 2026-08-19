@@ -25,7 +25,7 @@
           "category": {
             "enum": [
               "vector_poisoning", "low_relevance_poisoning",
-              "exact_near_duplicate_flooding", "duplicate_flooding",
+              "duplicate_flooding",
               "source_spoofing", "retrieved_prompt_injection",
               "metadata_aliasing", "graph_relationship_poisoning",
               "entity_alias_collision", "context_flooding",
@@ -82,6 +82,16 @@
     "documentId": {"type": "string", "minLength": 1},
     "evaluator": {
       "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": [
+            "poisoned_chunk_selected", "answer_contains_literal",
+            "graph_path_contains_poisoned_evidence", "unsafe_answer_returned",
+            "control_not_triggered"
+          ]
+        }
+      },
       "allOf": [
         {
           "if": {
@@ -179,6 +189,18 @@
     },
     "scenario": {
       "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "enum": [
+            "benign_control", "context_flooding", "duplicate_flooding",
+            "entity_alias_collision", "graph_relationship_poisoning",
+            "low_relevance_poisoning", "metadata_aliasing",
+            "retrieved_prompt_injection", "safety_filter_evasion",
+            "source_spoofing", "vector_poisoning"
+          ]
+        }
+      },
       "allOf": [
         {
           "if": {
