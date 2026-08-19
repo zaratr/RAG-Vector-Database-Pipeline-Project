@@ -1,0 +1,392 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "phase10-attack-corpus-v1.schema.json",
+  "title": "Phase 10D attack corpus (attack-corpus-v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "seed", "fixtures"],
+  "properties": {
+    "schema_version": {"const": "attack-corpus-v1"},
+    "seed": {"const": 42},
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id", "category", "kind", "severity", "description",
+          "documents", "query", "evaluator", "expected_control_ids",
+          "expected_safe_outcome", "required_clean_document_ids", "scenario"
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "category": {
+            "enum": [
+              "vector_poisoning", "low_relevance_poisoning",
+              "exact_near_duplicate_flooding", "duplicate_flooding",
+              "source_spoofing", "retrieved_prompt_injection",
+              "metadata_aliasing", "graph_relationship_poisoning",
+              "entity_alias_collision", "context_flooding",
+              "safety_filter_evasion"
+            ]
+          },
+          "kind": {"enum": ["benign", "malicious"]},
+          "severity": {"type": "integer", "minimum": 1, "maximum": 4},
+          "description": {"type": "string", "minLength": 1},
+          "documents": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "is_poisoned", "source", "text"],
+              "properties": {
+                "id": {"type": "string", "minLength": 1},
+                "is_poisoned": {"type": "boolean"},
+                "source": {"type": "string", "minLength": 1},
+                "text": {"type": "string", "minLength": 1}
+              }
+            }
+          },
+          "query": {"type": "string", "minLength": 1},
+          "evaluator": {"$ref": "#/$defs/evaluator"},
+          "expected_control_ids": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"$ref": "#/$defs/controlId"}
+          },
+          "expected_safe_outcome": {"enum": ["attack_blocked", "benign_preserved"]},
+          "required_clean_document_ids": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "scenario": {"$ref": "#/$defs/scenario"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "controlId": {
+      "enum": [
+        "retrieval_distance", "retrieval_duplicate_cap", "source_trust",
+        "context_injection", "sql_authority", "graph_evidence",
+        "graph_identity", "context_caps", "content_safety"
+      ]
+    },
+    "documentId": {"type": "string", "minLength": 1},
+    "evaluator": {
+      "type": "object",
+      "allOf": [
+        {
+          "if": {
+            "properties": {"type": {"const": "poisoned_chunk_selected"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "poisoned_document_id"],
+            "properties": {
+              "type": {"const": "poisoned_chunk_selected"},
+              "poisoned_document_id": {"$ref": "#/$defs/documentId"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "answer_contains_literal"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "literal"],
+            "properties": {
+              "type": {"const": "answer_contains_literal"},
+              "literal": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "graph_path_contains_poisoned_evidence"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "poisoned_document_id"],
+            "properties": {
+              "type": {"const": "graph_path_contains_poisoned_evidence"},
+              "poisoned_document_id": {"$ref": "#/$defs/documentId"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "unsafe_answer_returned"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "literal"],
+            "properties": {
+              "type": {"const": "unsafe_answer_returned"},
+              "literal": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "control_not_triggered"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "control_id"],
+            "properties": {
+              "type": {"const": "control_not_triggered"},
+              "control_id": {"$ref": "#/$defs/controlId"}
+            }
+          }
+        }
+      ]
+    },
+    "l2Distances": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"type": "number", "minimum": 0}
+    },
+    "pathRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document_ids", "evidence_document_id"],
+      "properties": {
+        "document_ids": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"$ref": "#/$defs/documentId"}
+        },
+        "evidence_document_id": {"$ref": "#/$defs/documentId"}
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "allOf": [
+        {
+          "if": {
+            "properties": {"type": {"const": "benign_control"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "control_id"],
+            "properties": {
+              "type": {"const": "benign_control"},
+              "control_id": {"$ref": "#/$defs/controlId"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "context_flooding"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "candidate_order", "per_source_cap"],
+            "properties": {
+              "type": {"const": "context_flooding"},
+              "candidate_order": {
+                "type": "array", "minItems": 1, "uniqueItems": true,
+                "items": {"$ref": "#/$defs/documentId"}
+              },
+              "per_source_cap": {"type": "integer", "minimum": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "duplicate_flooding"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "candidate_order", "l2_distances"],
+            "properties": {
+              "type": {"const": "duplicate_flooding"},
+              "candidate_order": {
+                "type": "array", "minItems": 1, "uniqueItems": true,
+                "items": {"$ref": "#/$defs/documentId"}
+              },
+              "l2_distances": {"$ref": "#/$defs/l2Distances"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "entity_alias_collision"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "entities", "paths"],
+            "properties": {
+              "type": {"const": "entity_alias_collision"},
+              "entities": {
+                "type": "array", "minItems": 1, "uniqueItems": true,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["canonical", "document_id"],
+                  "properties": {
+                    "canonical": {"type": "string", "minLength": 1},
+                    "document_id": {"$ref": "#/$defs/documentId"}
+                  }
+                }
+              },
+              "paths": {
+                "type": "array", "minItems": 1,
+                "items": {"$ref": "#/$defs/pathRow"}
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "graph_relationship_poisoning"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "paths"],
+            "properties": {
+              "type": {"const": "graph_relationship_poisoning"},
+              "paths": {
+                "type": "array", "minItems": 1,
+                "items": {"$ref": "#/$defs/pathRow"}
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "low_relevance_poisoning"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "candidate_order", "l2_distances"],
+            "properties": {
+              "type": {"const": "low_relevance_poisoning"},
+              "candidate_order": {
+                "type": "array", "minItems": 1, "uniqueItems": true,
+                "items": {"$ref": "#/$defs/documentId"}
+              },
+              "l2_distances": {"$ref": "#/$defs/l2Distances"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "metadata_aliasing"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "chroma_id", "sql_document_id", "chroma_claimed_document_id"],
+            "properties": {
+              "type": {"const": "metadata_aliasing"},
+              "chroma_id": {"$ref": "#/$defs/documentId"},
+              "sql_document_id": {"$ref": "#/$defs/documentId"},
+              "chroma_claimed_document_id": {"$ref": "#/$defs/documentId"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "retrieved_prompt_injection"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "injected_chunk_id", "disabled_answer"],
+            "properties": {
+              "type": {"const": "retrieved_prompt_injection"},
+              "injected_chunk_id": {"$ref": "#/$defs/documentId"},
+              "disabled_answer": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "safety_filter_evasion"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "disabled_answer", "normalization"],
+            "properties": {
+              "type": {"const": "safety_filter_evasion"},
+              "disabled_answer": {"type": "string", "minLength": 1},
+              "normalization": {"const": "NFKC"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "source_spoofing"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "requested_source", "requested_trust_tier", "server_source", "server_trust_tier"],
+            "properties": {
+              "type": {"const": "source_spoofing"},
+              "requested_source": {"type": "string", "minLength": 1},
+              "requested_trust_tier": {"type": "string", "minLength": 1},
+              "server_source": {"type": "string", "minLength": 1},
+              "server_trust_tier": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"type": {"const": "vector_poisoning"}},
+            "required": ["type"]
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "candidate_order", "l2_distances"],
+            "properties": {
+              "type": {"const": "vector_poisoning"},
+              "candidate_order": {
+                "type": "array", "minItems": 1, "uniqueItems": true,
+                "items": {"$ref": "#/$defs/documentId"}
+              },
+              "l2_distances": {"$ref": "#/$defs/l2Distances"}
+            }
+          }
+        }
+      ]
+    }
+  }
+}
