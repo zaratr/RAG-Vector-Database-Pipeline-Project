@@ -50,6 +50,19 @@ class Settings(BaseSettings):
     chroma_host: Optional[str] = Field(default=None)
     chroma_port: int = Field(default=8000)
     chroma_persist_directory: Optional[str] = Field(default=None)
+    chroma_collection: str = Field(default="rag-collection")
+
+    # 10D.2 red-team isolation identities. Guarded internal CLI state
+    # (the run_redteam process env), never client-settable request
+    # parameters; defaults keep production behavior unchanged.
+    redteam_mode: Optional[str] = Field(default=None)
+    redteam_disabled_database_url: Optional[str] = Field(default=None)
+    redteam_disabled_chroma_collection: Optional[str] = Field(default=None)
+    redteam_enabled_database_url: Optional[str] = Field(default=None)
+    redteam_enabled_chroma_collection: Optional[str] = Field(default=None)
+    production_database_url: Optional[str] = Field(default=None)
+    production_chroma_collection: Optional[str] = Field(default=None)
+    redteam_keep_artifacts: Optional[str] = Field(default=None)
 
     model_config = SettingsConfigDict(env_prefix="RAG_", env_file=".env", extra="ignore")
 

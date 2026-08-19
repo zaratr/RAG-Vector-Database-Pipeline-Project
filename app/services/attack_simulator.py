@@ -182,3 +182,434 @@ def validate_attack_corpus(path) -> dict:
         _invalid(f"unknown category {category!r}")
 
     return obj
+
+
+# ======================================================================
+# Task 10D.2 — isolated two-mode harness machinery.
+#
+# Everything below runs the corpus through the exact production
+# ingestion path against disposable, UUID-named SQL databases and Chroma
+# collections. Production stores are only ever opened read-only for
+# fingerprints. Refusals happen before any mutation.
+# ======================================================================
+
+import asyncio  # noqa: E402
+import hashlib  # noqa: E402
+import os as _os  # noqa: E402
+import sqlite3 as _sqlite3  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+
+_DISPOSABLE_NAME_RE = re.compile(r"^redteam-[0-9a-f]{32}$")
+_DISPOSABLE_DB_BASENAME_RE = re.compile(r"^redteam-[0-9a-f]{32}\.db$")
+
+
+class _ConstantEmbeddingProvider:
+    """Deterministic embeddings for the harness (no external provider)."""
+
+    async def embed_texts(self, texts):
+        return [[1.0] * 8 for _ in texts]
+
+
+def _sqlite_abs_path(url: str, *, label: str) -> Path:
+    if not url.startswith("sqlite:///"):
+        raise ValueError(f"{label} must be a sqlite:/// URL")
+    raw = url[len("sqlite:///"):]
+    if not raw.startswith("/"):
+        raise ValueError(f"{label} must be an absolute sqlite:////path URL")
+    return Path(raw)
+
+
+@dataclass(frozen=True)
+class RedteamConfig:
+    """Validated disposable/production identities for one harness run."""
+
+    disabled_database_url: str
+    disabled_chroma_collection: str
+    enabled_database_url: str
+    enabled_chroma_collection: str
+    production_database_url: str
+    production_chroma_collection: str
+    keep_artifacts: bool
+
+    @property
+    def modes(self) -> dict:
+        return {
+            "disabled": (self.disabled_database_url,
+                         self.disabled_chroma_collection),
+            "enabled": (self.enabled_database_url,
+                        self.enabled_chroma_collection),
+        }
+
+    @property
+    def disposable_collections(self) -> tuple:
+        return (self.disabled_chroma_collection,
+                self.enabled_chroma_collection)
+
+    @property
+    def disposable_db_paths(self) -> tuple:
+        return (_sqlite_abs_path(self.disabled_database_url,
+                                 label="disabled database"),
+                _sqlite_abs_path(self.enabled_database_url,
+                                 label="enabled database"))
+
+
+def resolve_redteam_config(env=None) -> RedteamConfig:
+    """Resolve and REFUSE unsafe isolation identities before any mutation.
+
+    Raises ``ValueError`` (sanitized; no secrets) on any equality, symlink,
+    invalid-pattern, pre-existence, cross-mode reuse, or production-path
+    condition.
+    """
+    source = dict(_os.environ if env is None else env)
+    required = (
+        "RAG_REDTEAM_DISABLED_DATABASE_URL",
+        "RAG_REDTEAM_DISABLED_CHROMA_COLLECTION",
+        "RAG_REDTEAM_ENABLED_DATABASE_URL",
+        "RAG_REDTEAM_ENABLED_CHROMA_COLLECTION",
+        "RAG_PRODUCTION_DATABASE_URL",
+        "RAG_PRODUCTION_CHROMA_COLLECTION",
+    )
+    missing = [key for key in required if not source.get(key)]
+    if missing:
+        raise ValueError(f"missing red-team isolation variables: {missing}")
+
+    disabled_url = source["RAG_REDTEAM_DISABLED_DATABASE_URL"]
+    disabled_coll = source["RAG_REDTEAM_DISABLED_CHROMA_COLLECTION"]
+    enabled_url = source["RAG_REDTEAM_ENABLED_DATABASE_URL"]
+    enabled_coll = source["RAG_REDTEAM_ENABLED_CHROMA_COLLECTION"]
+    prod_url = source["RAG_PRODUCTION_DATABASE_URL"]
+    prod_coll = source["RAG_PRODUCTION_CHROMA_COLLECTION"]
+    keep = str(source.get("RAG_REDTEAM_KEEP_ARTIFACTS", "")).lower() == "true"
+
+    prod_db_path = _sqlite_abs_path(prod_url, label="production database")
+
+    for label, url, coll in (
+        ("disabled", disabled_url, disabled_coll),
+        ("enabled", enabled_url, enabled_coll),
+    ):
+        if url == prod_url:
+            raise ValueError(f"{label} database URL equals production")
+        if coll == prod_coll:
+            raise ValueError(f"{label} collection equals production")
+        if not _DISPOSABLE_NAME_RE.match(coll):
+            raise ValueError(
+                f"{label} collection {coll!r} does not match "
+                r"^redteam-[0-9a-f]{32}$")
+        path = _sqlite_abs_path(url, label=f"{label} database")
+        if not _DISPOSABLE_DB_BASENAME_RE.match(path.name):
+            raise ValueError(
+                f"{label} database basename {path.name!r} does not match "
+                r"^redteam-[0-9a-f]{32}\.db$")
+        resolved = Path(_os.path.realpath(path))
+        if str(resolved).startswith("/data"):
+            raise ValueError(
+                f"{label} database resolves under the production /data volume")
+        if resolved == prod_db_path:
+            raise ValueError(
+                f"{label} database resolves to the production database path")
+        if path.is_symlink():
+            raise ValueError(f"{label} database path is a symlink")
+        if path.exists():
+            raise ValueError(f"{label} database path already exists")
+
+    if disabled_url == enabled_url or disabled_coll == enabled_coll:
+        raise ValueError("disabled and enabled identities must differ")
+    if _uuid_tail(disabled_coll) == _uuid_tail(enabled_coll):
+        raise ValueError("disabled and enabled store UUIDs must differ")
+
+    return RedteamConfig(
+        disabled_database_url=disabled_url,
+        disabled_chroma_collection=disabled_coll,
+        enabled_database_url=enabled_url,
+        enabled_chroma_collection=enabled_coll,
+        production_database_url=prod_url,
+        production_chroma_collection=prod_coll,
+        keep_artifacts=keep,
+    )
+
+
+def _uuid_tail(name: str) -> str:
+    if not _DISPOSABLE_NAME_RE.match(name):
+        raise ValueError(f"disposable name {name!r} does not match "
+                         r"^redteam-[0-9a-f]{32}$")
+    return name[len("redteam-"):]
+
+
+def _chroma_client():
+    import chromadb
+
+    from app.config import get_settings
+
+    settings = get_settings()
+    if settings.chroma_host:
+        return chromadb.HttpClient(host=settings.chroma_host,
+                                   port=settings.chroma_port)
+    return chromadb.EphemeralClient()
+
+
+def production_sql_fingerprint(production_database_url: str) -> str:
+    """SHA-256 over canonical read-only SQL state (counts + PK columns)."""
+    path = _sqlite_abs_path(production_database_url,
+                            label="production database")
+    conn = _sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        tables = [
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'")
+        ]
+        snapshot = {"tables": []}
+        for table in sorted(tables):
+            count = conn.execute(
+                f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            pk_columns = sorted(
+                row[1] for row in conn.execute(
+                    f"PRAGMA table_info({table})") if row[5]) or ["rowid"]
+            snapshot["tables"].append(
+                {"name": table, "row_count": count,
+                 "pk_columns": pk_columns})
+        canonical = json.dumps(snapshot, sort_keys=True,
+                               separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    finally:
+        conn.close()
+
+
+def production_chroma_fingerprint(production_collection: str) -> str:
+    """SHA-256 over the sorted production Chroma IDs (read APIs only)."""
+    client = _chroma_client()
+    try:
+        try:
+            collection = client.get_collection(production_collection)
+            result = collection.get(include=[])
+            ids = sorted(result.get("ids", []))
+        except Exception:
+            ids = []
+        canonical = json.dumps({"ids": ids}, sort_keys=True,
+                               separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    finally:
+        _close_chroma_client(client)
+
+
+def collection_exists(collection_name: str) -> bool:
+    client = _chroma_client()
+    try:
+        names = [c.name if hasattr(c, "name") else str(c)
+                 for c in client.list_collections()]
+        return collection_name in names
+    finally:
+        _close_chroma_client(client)
+
+
+def delete_disposable_collection(collection_name: str) -> None:
+    """Delete a disposable collection; a missing one is not an error.
+
+    Any other failure propagates so the harness can surface exit 2 —
+    cleanup failures may never be silently masked.
+    """
+    client = _chroma_client()
+    try:
+        client.delete_collection(collection_name)
+    except Exception as exc:
+        if "NotFound" not in type(exc).__name__:
+            raise
+    finally:
+        _close_chroma_client(client)
+
+
+def delete_disposable_database(database_url: str) -> None:
+    path = _sqlite_abs_path(database_url, label="disposable database")
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(str(path) + suffix)
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _close_chroma_client(client) -> None:
+    api_client = getattr(client, "_api_client", None)
+    closer = getattr(api_client, "close", None)
+    if callable(closer):
+        try:
+            closer()
+        except Exception:
+            pass
+
+
+def build_fixture_input_manifest(corpus_bytes: bytes, corpus: dict) -> str:
+    """Canonical manifest derived solely from literal corpus bytes.
+
+    Both modes derive it from the same bytes, so byte-equality across modes
+    proves identical fixture inputs.
+    """
+    def _sha(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    manifest = {
+        "corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
+        "seed": corpus["seed"],
+        "schema_version": corpus["schema_version"],
+        "fixtures": [
+            {
+                "id": fixture["id"],
+                "documents": [
+                    {"id": doc["id"], "text_sha256": _sha(doc["text"]),
+                     "source": doc["source"],
+                     "is_poisoned": doc["is_poisoned"]}
+                    for doc in fixture["documents"]
+                ],
+                "query_sha256": _sha(fixture["query"]),
+                "scenario": fixture["scenario"],
+                "evaluator": fixture["evaluator"],
+            }
+            for fixture in corpus["fixtures"]
+        ],
+    }
+    return json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+
+
+class ModeEnvironment:
+    """Apply one mode's guarded env overrides around a ``with`` block.
+
+    ``disabled`` observes but does not enforce the measured
+    content-safety control; ``enabled`` enforces it with the deterministic
+    rules-only detector. Baseline invariants (SQL authority, readiness,
+    bounded work, escaping, grounding) are untouched in both modes.
+    Measurement of the retrieval/context controls arrives with Task 10D.3.
+    """
+
+    _BASE_KEYS = ("RAG_DATABASE_URL", "RAG_CHROMA_COLLECTION",
+                  "RAG_CONTENT_SAFETY_ENABLED", "RAG_SAFETY_LLM_MODE")
+
+    def __init__(self, mode: str, database_url: str,
+                 chroma_collection: str) -> None:
+        self._overrides = {
+            "RAG_DATABASE_URL": database_url,
+            "RAG_CHROMA_COLLECTION": chroma_collection,
+            "RAG_CONTENT_SAFETY_ENABLED":
+                "true" if mode == "enabled" else "false",
+            "RAG_SAFETY_LLM_MODE": "rules_only",
+        }
+        self._saved: dict = {}
+
+    def __enter__(self) -> "ModeEnvironment":
+        from app.config import get_settings
+
+        for key in self._BASE_KEYS:
+            self._saved[key] = _os.environ.get(key)
+        _os.environ.update(self._overrides)
+        get_settings.cache_clear()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        from app.config import get_settings
+
+        for key, value in self._saved.items():
+            if value is None:
+                _os.environ.pop(key, None)
+            else:
+                _os.environ[key] = value
+        get_settings.cache_clear()
+
+
+def ingest_fixture_document(payload: dict, engine, store) -> dict:
+    """Ingest ONE fixture payload through the exact production path.
+
+    Returns the binding: document_fixture_id, chunk_fixture_id,
+    sql_document_id, sql_chunk_id, vector_id, status. Raises SystemExit(2)
+    for corpus-invalid multiplicity (zero or multiple chunks).
+    """
+    from sqlalchemy import text as sa_text
+
+    from app.services.ingestion import IngestionSafetyBlocked, ingest_text
+
+    fixture_doc_id = payload["document_fixture_id"]
+    title = payload.get("title", fixture_doc_id)
+    text = payload["text"]
+    session = _session_from_engine(engine)
+    try:
+        try:
+            result = asyncio.run(ingest_text(
+                title=title,
+                source=payload.get("source"),
+                tags=None,
+                text=text,
+                embedding_provider=_ConstantEmbeddingProvider(),
+                vector_store=store,
+                session=session,
+                graph_extractor=None,
+            ))
+            document_id = result["document_id"]
+            rows = session.execute(
+                sa_text('SELECT id, "index", vector_id FROM chunks '
+                        'WHERE document_id = :d ORDER BY "index"'),
+                {"d": document_id},
+            ).fetchall()
+            if len(rows) != 1 or rows[0][1] != 0:
+                # Corpus-invalid multiplicity: refuse before measurement.
+                raise SystemExit(2)
+            chunk_id, _index, vector_id = rows[0]
+            status = session.execute(
+                sa_text("SELECT ingestion_status FROM documents "
+                        "WHERE id = :d"),
+                {"d": document_id},
+            ).scalar()
+            session.commit()
+            return {
+                "document_fixture_id": fixture_doc_id,
+                "chunk_fixture_id": f"{fixture_doc_id}:0",
+                "sql_document_id": document_id,
+                "sql_chunk_id": chunk_id,
+                "vector_id": vector_id,
+                "status": status,
+            }
+        except IngestionSafetyBlocked:
+            # Enabled-mode block|filter: the pipeline already persisted the
+            # failed document; no usable chunk/vector exists.
+            document_id = session.execute(
+                sa_text("SELECT id FROM documents WHERE title = :t"),
+                {"t": title},
+            ).scalar()
+            session.rollback()
+            return {
+                "document_fixture_id": fixture_doc_id,
+                "chunk_fixture_id": f"{fixture_doc_id}:0",
+                "sql_document_id": document_id,
+                "sql_chunk_id": None,
+                "vector_id": None,
+                "status": "failed",
+            }
+    finally:
+        session.close()
+
+
+def _session_from_engine(engine):
+    from sqlalchemy.orm import sessionmaker
+
+    return sessionmaker(bind=engine)()
+
+
+def open_mode_engine(database_url: str):
+    """FK-enforcing application engine over a migrated disposable DB."""
+    from app.core.db import create_database_engine
+
+    return create_database_engine(database_url)
+
+
+def open_mode_store(chroma_collection: str):
+    """Chroma store bound to the mode's disposable collection."""
+    from app.services.vector_store import ChromaVectorStore
+
+    return ChromaVectorStore(collection_name=chroma_collection)
+
+
+def ensure_unique_fixture_documents(payloads: list) -> None:
+    """Refuse aliasing/duplicate fixture document ids (corpus-invalid)."""
+    seen: set = set()
+    for payload in payloads:
+        key = payload["document_fixture_id"]
+        if key in seen:
+            raise SystemExit(2)
+        seen.add(key)

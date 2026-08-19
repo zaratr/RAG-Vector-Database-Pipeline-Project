@@ -147,4 +147,6 @@ class ChromaVectorStore:
 
 
 def get_vector_store() -> VectorStore:
-    return ChromaVectorStore()
+    from app.config import get_settings
+
+    return ChromaVectorStore(collection_name=get_settings().chroma_collection)
