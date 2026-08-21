@@ -133,6 +133,7 @@ def validate_report(report: dict, schema: dict) -> dict:
                           "disabled before enabled, one pair per fixture")
 
     mode_sql_ids: dict = {"disabled": [], "enabled": []}
+    mode_sql_chunk_ids: dict = {"disabled": [], "enabled": []}
     mode_doc_map: dict = {"disabled": {}, "enabled": {}}
     mode_blocked_docs: dict = {"disabled": 0, "enabled": 0}
     counters = {
@@ -173,16 +174,54 @@ def validate_report(report: dict, schema: dict) -> dict:
         # but never produce a chunk/vector, so they appear as exactly that
         # many gaps in the observed candidate ids.
         doc_map = mode_doc_map[mode]
+        seen_chunk_fixtures: set = set()
         for candidate in row["candidate_rows"]:
             doc_fix = candidate["document_fixture_id"]
+            if candidate["chunk_fixture_id"] != f"{doc_fix}:0":
+                _fail(base + "/candidate_rows",
+                      f"chunk_fixture_id must be canonical '<doc>:0' for "
+                      f"{doc_fix!r}")
+            if candidate["chunk_fixture_id"] in seen_chunk_fixtures:
+                _fail(base + "/candidate_rows",
+                      f"duplicate chunk fixture id "
+                      f"{candidate['chunk_fixture_id']!r} (one-chunk "
+                      "multiplicity violated)")
+            seen_chunk_fixtures.add(candidate["chunk_fixture_id"])
             if doc_fix in doc_map and \
                     doc_map[doc_fix] != candidate["sql_document_id"]:
                 _fail(base + "/candidate_rows",
                       f"document {doc_fix!r} maps to multiple sql ids")
             doc_map[doc_fix] = candidate["sql_document_id"]
             mode_sql_ids[mode].append(candidate["sql_document_id"])
+            mode_sql_chunk_ids[mode].append(candidate["sql_chunk_id"])
         mode_blocked_docs[mode] += len(fixture["documents"]) - \
             len(row["candidate_rows"])
+
+        # Chunk-id arrays resolve to corpus documents of this fixture.
+        known = {f"{doc['id']}:0" for doc in fixture["documents"]}
+        for key in ("required_clean_ids", "selected_clean_ids",
+                    "selected_poisoned_ids", "benign_chunk_ids",
+                    "rejected_benign_ids"):
+            for chunk_id in row[key]:
+                if chunk_id not in known:
+                    _fail(base + f"/{key}",
+                          f"chunk id {chunk_id!r} does not resolve to a "
+                          "corpus document")
+        expected_clean = {f"{d}:0"
+                          for d in fixture["required_clean_document_ids"]}
+        if set(row["required_clean_ids"]) != expected_clean:
+            _fail(base + "/required_clean_ids",
+                  "must equal the hashed corpus's required clean documents")
+        for path_row in row["path_rows"]:
+            for evidence in path_row["evidence_fixture_ids"]:
+                if evidence not in {d["id"] for d in fixture["documents"]}:
+                    _fail(base + "/path_rows",
+                          f"evidence {evidence!r} does not resolve to a "
+                          "corpus document")
+        control_ids = [c["control_id"] for c in row["control_results"]]
+        if control_ids != sorted(control_ids):
+            _fail(base + "/control_results",
+                  "must be sorted by control id")
 
         # Evaluator rerun + attack boolean semantics.
         recomputed = _rerun_evaluator(row)
@@ -231,6 +270,15 @@ def validate_report(report: dict, schema: dict) -> dict:
             _fail(f"fixtures[{mode}]",
                   "sql ids exceed the fresh-store 1..N assignment "
                   f"(max {observed[-1]} > {fresh_store_total})")
+        chunk_ids = mode_sql_chunk_ids[mode]
+        if len(chunk_ids) != len(set(chunk_ids)):
+            _fail(f"fixtures[{mode}]",
+                  "sql chunk ids must be distinct within the mode")
+        if chunk_ids and (max(chunk_ids) > fresh_store_total
+                          or min(chunk_ids) < 1):
+            _fail(f"fixtures[{mode}]",
+                  "sql chunk ids must stay within the fresh-store "
+                  "1..N assignment")
 
     if counters["disabled"]["attempted"] == 0 or \
             counters["enabled"]["req_clean"] == 0:

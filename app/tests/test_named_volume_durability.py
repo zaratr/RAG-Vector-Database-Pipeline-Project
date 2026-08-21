@@ -6,11 +6,47 @@ wrapper idempotency, fingerprint equality, cleanup.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_stores(monkeypatch, tmp_path):
+    """Run the in-process durability checks against isolated stores.
+
+    The pinned tests exercise the REAL setup/verify/cleanup helpers; on
+    the production /data volume a mocked-away cleanup would leak real
+    sentinels (D-81). Every in-process test therefore gets a migrated
+    disposable SQLite database and an ephemeral Chroma client. The
+    real-subprocess argv test is unaffected (it runs the script in a
+    fresh interpreter against the real deployment and cleans up after
+    itself).
+    """
+    import scripts.validate_named_volume_durability as mod
+    from app.services import vector_store
+
+    db = tmp_path / "durability-isolated.db"
+    db.write_bytes(b"")
+    env = dict(os.environ)
+    env["RAG_DATABASE_URL"] = f"sqlite:///{db}"
+    subprocess.run([sys.executable, "-m", "app.core.migrations"],
+                   env=env, check=True, capture_output=True)
+    monkeypatch.setattr(mod, "_database_path", lambda: db)
+
+    import chromadb
+
+    monkeypatch.setattr(vector_store, "_create_client",
+                        lambda: chromadb.EphemeralClient())
+    from app.services import attack_simulator
+
+    monkeypatch.setattr(attack_simulator, "_chroma_client",
+                        lambda: chromadb.EphemeralClient())
 
 
 def _run_validator(monkeypatch, out):

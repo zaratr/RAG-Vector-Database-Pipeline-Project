@@ -634,7 +634,7 @@ def run_harness(fixtures_path=DEFAULT_FIXTURES, run_id=None) -> dict:
 
 _REPORT_COMPAT_KEYS = (
     "manifests", "disabled", "enabled", "production_sql_fingerprints",
-    "production_chroma_fingerprints", "exit_code",
+    "production_chroma_fingerprints", "exit_code", "source_binding_sha256",
 )
 
 
