@@ -24,6 +24,10 @@ _VOLATILE_KEYS = {
     "host",
     "host_path",
     "output_path",
+    # Wall-clock-derived comparison ratios: two live runs of the same
+    # immutable image can never byte-equal while these remain.
+    "p50_latency_overhead",
+    "p95_latency_overhead",
 }
 
 

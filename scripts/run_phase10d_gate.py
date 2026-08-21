@@ -154,10 +154,17 @@ def main(argv=None) -> int:
     parser.add_argument("--source-binding", required=True)
     args = parser.parse_args(argv)
 
-    output = Path(args.output)
+    # Resolve once: the normalize child runs with cwd=scripts/, so any
+    # relative --output (the plan/registry invocation) must be anchored
+    # to the orchestrator's own working directory before child argv.
+    output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    binding_path = Path(args.source_binding)
-    manifest_path = Path(args.source_manifest)
+    binding_path = Path(args.source_binding).resolve() \
+        if Path(args.source_binding).is_absolute() else \
+        Path(_REPO_ROOT, args.source_binding)
+    manifest_path = Path(args.source_manifest).resolve() \
+        if Path(args.source_manifest).is_absolute() else \
+        Path(_REPO_ROOT, args.source_manifest)
 
     # Refusals before any container child runs.
     try:
@@ -208,8 +215,11 @@ def main(argv=None) -> int:
             == normalized_files[1].read_bytes())
         if not normalized_equal and first_exit == 0:
             first_exit = 2
-    elif first_exit == 0:
-        first_exit = 2
+    else:
+        # Missing normalized outputs are a failure, never a pass.
+        normalized_equal = False
+        if first_exit == 0:
+            first_exit = 2
 
     cleanup_complete = True
     production_unchanged = True

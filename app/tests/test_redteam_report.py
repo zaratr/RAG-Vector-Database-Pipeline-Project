@@ -614,3 +614,71 @@ def test_normalized_reports_byte_equal_for_identical_runs(monkeypatch, tmp_path)
     n1 = _normalize(r1)
     n2 = _normalize(r2)
     assert n1.read_bytes() == n2.read_bytes()
+
+
+def test_run_phase10d_gate_relative_output_writes_normalized(monkeypatch, tmp_path):
+    """D-85: the registry invokes the gate with a RELATIVE --output; the
+    normalize child (cwd=scripts/) must still resolve the report paths."""
+    import os
+    import subprocess as _sp
+    from scripts import run_phase10d_gate
+
+    workdir = tmp_path / "rel-out"
+    workdir.mkdir()
+    runs = {"n": 0}
+
+    def fake_run(argv, **kw):
+        joined = " ".join(str(a) for a in argv)
+        if "run_redteam" in joined:
+            runs["n"] += 1
+            alias = "run1" if runs["n"] == 1 else "run2"
+            (workdir / f"{alias}.json").write_text(
+                json.dumps(_valid_report(run_id=alias)))
+            return _sp.CompletedProcess(argv, 0, "{}", "")
+        if "normalize_redteam_report" in joined:
+            # Real child semantics: the positional report path must
+            # resolve from the orchestrator cwd even with a relative
+            # --output; write the normalized view beside it.
+            report_path = Path(argv[3])
+            assert report_path.is_absolute() and report_path.is_file(), (
+                f"normalize child received unresolvable path {argv[3]!r}")
+            payload = json.loads(report_path.read_text())
+            from scripts.normalize_redteam_report import normalize_report
+            Path(argv[5]).write_text(json.dumps(
+                normalize_report(payload), sort_keys=True,
+                separators=(",", ":")))
+            return _sp.CompletedProcess(argv, 0, "", "")
+        return _sp.CompletedProcess(argv, 0, "{}", "")
+
+    monkeypatch.setattr(_sp, "run", fake_run)
+    monkeypatch.chdir(tmp_path)
+    rc = run_phase10d_gate.main(
+        ["--output", "rel-out",
+         "--source-manifest", "m.json", "--source-binding", "b.json"])
+    assert rc in (0, 1, 2)
+
+
+def test_normalize_strips_latency_overhead_ratios(tmp_path):
+    """D-86: wall-clock comparison ratios must not survive normalization —
+    two live runs of the same image normalize byte-identically."""
+    from scripts.normalize_redteam_report import normalize_report
+    base = _valid_report(run_id="a" * 32)
+    other = _valid_report(run_id="b" * 32)
+    base["metrics"]["comparison"]["p50_latency_overhead"] = {
+        "numerator": 1.5, "denominator": 10.0, "value": 0.15,
+        "denominator_zero": False}
+    other["metrics"]["comparison"]["p50_latency_overhead"] = {
+        "numerator": 42.0, "denominator": 8.0, "value": 5.25,
+        "denominator_zero": False}
+    base["metrics"]["comparison"]["p95_latency_overhead"] = {
+        "numerator": 2.0, "denominator": 10.0, "value": 0.2,
+        "denominator_zero": False}
+    other["metrics"]["comparison"]["p95_latency_overhead"] = {
+        "numerator": 7.0, "denominator": 9.0, "value": 0.777778,
+        "denominator_zero": False}
+    n1 = normalize_report(base)
+    n2 = normalize_report(other)
+    assert "p50_latency_overhead" not in n1["metrics"]["comparison"]
+    assert "p95_latency_overhead" not in n1["metrics"]["comparison"]
+    assert json.dumps(n1, sort_keys=True) == json.dumps(
+        n2, sort_keys=True)
