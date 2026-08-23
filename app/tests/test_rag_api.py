@@ -406,6 +406,74 @@ def test_query_excludes_non_ready_documents():
         assert item.get("metadata", {}).get("document_id") != doc_id
 
 
+# ── 10A.6 /query retrieval-mode tests (phase10-test-specifications appendix) ──
+
+
+def test_query_hybrid_mode_returns_200_with_context():
+    response = client.post("/query", json={
+        "query": "FastAPI", "top_k": 3, "retrieval_mode": "hybrid",
+        "graph_max_hops": 2,
+    })
+    assert response.status_code == 200
+    payload = response.json()
+    assert "answer" in payload
+    assert isinstance(payload["context"], list)
+
+
+def test_query_graph_mode_returns_200_without_embedding_dependency():
+    response = client.post("/query", json={
+        "query": "FastAPI", "top_k": 3, "retrieval_mode": "graph",
+        "graph_max_hops": 1,
+    })
+    # graph mode may return empty context if no graph data, but must be 200
+    assert response.status_code == 200
+
+
+def test_query_hybrid_with_unsupported_filter_returns_422():
+    response = client.post("/query", json={
+        "query": "FastAPI", "retrieval_mode": "hybrid",
+        "filters": {"unknown_key": 1},
+    })
+    assert response.status_code == 422
+
+
+def test_query_graph_with_unsupported_filter_returns_422():
+    response = client.post("/query", json={
+        "query": "FastAPI", "retrieval_mode": "graph",
+        "filters": {"document_id": "not-an-int"},
+    })
+    assert response.status_code == 422
+
+
+def test_query_vector_mode_accepts_filters_and_remains_default():
+    response = client.post("/query", json={
+        "query": "FastAPI", "filters": {"document_id": 1},
+    })
+    # default mode is vector; 200 even if no hits match the filter
+    assert response.status_code == 200
+
+
+def test_query_hybrid_traversal_limit_returns_503(monkeypatch):
+    """If retrieve_graph_paths raises GraphTraversalLimitError, /query
+    must return 503 (mapped in routes_query.py)."""
+    from app.services import rag
+    from app.services.graph_retrieval import GraphTraversalLimitError
+
+    # retrieve_graph_paths is synchronous in production; the appendix's
+    # ``async def _boom(**kwargs)`` shape is adapted to the sync signature
+    # (and ``session`` is passed positionally), preserving the patch point,
+    # the raised exception, and the asserted 503.
+    def _boom(*args, **kwargs):
+        raise GraphTraversalLimitError("cap exceeded")
+    # retrieval.py wires retrieve_graph_paths (not retrieve_graph_contexts)
+    # into hybrid/graph candidate building, so that is the patch point.
+    monkeypatch.setattr(rag.retrieval, "retrieve_graph_paths", _boom)
+    response = client.post("/query", json={
+        "query": "FastAPI", "retrieval_mode": "hybrid",
+    })
+    assert response.status_code == 503
+
+
 def test_post_image_documents_vector_failure_returns_503_with_stable_detail(monkeypatch):
     """W1: image ingestion vector failure maps to the same stable 503 detail
     as the text route (10A.4 HTTP behavior contract)."""

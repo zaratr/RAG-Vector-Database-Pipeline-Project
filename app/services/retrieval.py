@@ -262,7 +262,10 @@ async def retrieve_contexts(
                 metadata["graph_score"] = graph_score
 
     for key, context in fused.items():
-        context["metadata"]["hybrid_score"] = round(rrf_scores[key], 6)
+        # Exact RRF-60 sum, never rounded: the plan pins hybrid_score as the
+        # sum of 1/(60+rank) over the candidate's sides, and rounding would
+        # perturb that arithmetic (and could fabricate ties).
+        context["metadata"]["hybrid_score"] = rrf_scores[key]
     return sorted(
         fused.values(),
         key=lambda item: (

@@ -131,8 +131,9 @@ def _rrf_score(ranks: dict) -> float:
 
     ``ranks`` maps side name -> 1-based rank of one candidate on that side;
     a candidate retrieved by a side at rank ``r`` contributes 1/(RRF_K + r).
+    Production emits the exact sum (no rounding), so the mirror does too.
     """
-    return round(sum(1.0 / (RRF_K + rank) for rank in ranks.values()), 6)
+    return sum(1.0 / (RRF_K + rank) for rank in ranks.values())
 
 
 def _entity(name, entity_type="concept"):

@@ -463,8 +463,8 @@ def test_rrf_constant_is_sixty():
 
     # A chunk ranked 1st on the vector side and 2nd on the graph side fuses to
     # 1/(60+1) + 1/(60+2): the plan 10A.6 fusion constant is pinned at 60.
-    # Production rounds fused scores to 6 decimals; the helper mirrors that.
+    # Production emits the exact RRF sum (no rounding); the helper mirrors it.
     assert validator._rrf_score({"vector": 1, "graph": 2}) == pytest.approx(
-        round(1 / 61 + 1 / 62, 6)
+        1 / 61 + 1 / 62
     )
     assert validator.RRF_K == 60

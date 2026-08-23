@@ -81,6 +81,18 @@ def _validate_filters(filters: dict | None) -> dict:
         raise UnsupportedGraphFilter(
             "Hybrid graph filters support only scalar document_id, title, source, and tags"
         )
+    # Validate document_id's scalar type up front: the SQL-side check in
+    # apply_document_filters is skipped when traversal short-circuits (no
+    # seeds/empty evidence), and an unsupported filter must be rejected,
+    # never silently ignored, regardless of graph content (plan 10A.6).
+    if "document_id" in filters and (
+        isinstance(filters["document_id"], bool)
+        or not isinstance(filters["document_id"], int)
+    ):
+        raise UnsupportedGraphFilter(
+            "document_id filter must be an integer; booleans and "
+            "non-integer forms are rejected"
+        )
     return filters
 
 
