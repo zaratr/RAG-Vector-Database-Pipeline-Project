@@ -30,6 +30,7 @@ from app.services.embeddings import EmbeddingProvider, ImageEmbeddingProvider
 from app.services.graph_extraction import (
     PROMPT_VERSION,
     SCHEMA_VERSION,
+    DisabledGraphExtractor,
     GraphExtractionError,
     GraphExtractor,
 )
@@ -63,6 +64,12 @@ async def ingest_text(
     graph_extraction_model: str = "unknown",
 ) -> dict:
     """Ingest raw text into the system following the 10A.4 state machine."""
+    # A disabled extractor passed directly (service level) is treated exactly
+    # like the route does: no provider call, extraction recorded as skipped
+    # with reason extraction_disabled — never mislabeled as an empty provider
+    # result (plan 10A.4: "no disabled run is labeled empty").
+    if isinstance(graph_extractor, DisabledGraphExtractor):
+        graph_extractor = None
     normalized = " ".join(text.split())
     logger.info("Chunking document '%s'", title)
     chunk_payloads = chunk_text(normalized)
@@ -168,7 +175,9 @@ async def ingest_text(
         existing_ids = set(await vector_store.list_ids())
         missing = [vid for vid in vector_ids if vid not in existing_ids]
         if missing:
-            raise VectorIndexIncomplete(f"vector index missing {len(missing)} required ids")
+            raise VectorIndexIncomplete(
+                f"vector index incomplete: missing {len(missing)} required ids"
+            )
 
         # Step 6b: every eligible extraction must be terminal succeeded/empty.
         terminal = all(

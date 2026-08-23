@@ -78,6 +78,16 @@ async def create_document(
                         vector_store = vector_store,
                         session = session
                 )
+            except VectorIndexIncomplete as exc:
+                raise HTTPException(
+                    status_code=503, detail="Vector index unavailable"
+                ) from exc
+            except RuntimeError as exc:
+                # Vector-store/embedding failures (VectorIndexIncomplete is a
+                # RuntimeError) share the text route's stable public detail.
+                raise HTTPException(
+                    status_code=503, detail="Vector index unavailable"
+                ) from exc
             finally:
                 Path(tmp_path).unlink(missing_ok=True)
             return DocumentCreateResponse(**result)
@@ -137,6 +147,13 @@ async def create_document(
     except GraphExtractionError as exc:
         raise HTTPException(
             status_code=502, detail="Graph extraction provider failed"
+        ) from exc
+    except RuntimeError as exc:
+        # Remaining vector-store failures (e.g. upsert/list raised by the
+        # backend) map to the plan's stable public detail; the internal
+        # exception type is already stored as the bounded failure code.
+        raise HTTPException(
+            status_code=503, detail="Vector index unavailable"
         ) from exc
     return DocumentCreateResponse(**result)
 

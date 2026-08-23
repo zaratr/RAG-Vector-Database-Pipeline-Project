@@ -257,3 +257,184 @@ def test_ingest_valid_pdf_no_extractable_text_returns_400():
     )
     assert response.status_code == 400
     assert "No text content" in response.json()["detail"]
+
+
+# ── 10A.4 HTTP behavior tests (phase10-test-specifications appendix) ──
+# Adapted to the implemented API surface: routes are mounted without an
+# /api/v1 prefix, /documents takes Form fields, and the graph extractor is
+# injected via app.dependency_overrides (the established pattern above).
+
+
+def test_post_documents_provider_unavailable_returns_503():
+    """Provider unavailable → HTTP 503; failed doc not query-visible."""
+    from app.services.graph_extraction import GraphProviderUnavailable
+
+    class UnavailableExtractor:
+        async def extract(self, text):
+            raise GraphProviderUnavailable("unavailable")
+
+    app.dependency_overrides[get_graph_extractor] = lambda: UnavailableExtractor()
+    try:
+        response = client.post(
+            "/documents",
+            data={"title": "503 Test", "source": "test", "text": "Alice works at Acme."},
+        )
+    finally:
+        app.dependency_overrides[get_graph_extractor] = lambda: DisabledGraphExtractor()
+
+    assert response.status_code == 503
+
+
+def test_post_documents_invalid_provider_output_returns_502():
+    """Invalid provider output → HTTP 502; failed state persists."""
+    from app.services.graph_extraction import GraphProviderOutputError
+
+    class InvalidOutputExtractor:
+        async def extract(self, text):
+            raise GraphProviderOutputError("bad output")
+
+    app.dependency_overrides[get_graph_extractor] = lambda: InvalidOutputExtractor()
+    try:
+        response = client.post(
+            "/documents",
+            data={"title": "502 Test", "source": "test", "text": "Alice works at Acme."},
+        )
+    finally:
+        app.dependency_overrides[get_graph_extractor] = lambda: DisabledGraphExtractor()
+
+    assert response.status_code == 502
+
+
+def test_post_documents_vector_failure_returns_503_with_stable_detail(monkeypatch):
+    """Vector failure → HTTP 503 with detail 'Vector index unavailable'."""
+    class FailingStore:
+        async def upsert_embeddings(self, *args, **kwargs):
+            raise RuntimeError("chroma connection refused")
+
+        async def list_ids(self):
+            return []
+
+        async def delete(self, ids):
+            return None
+
+    monkeypatch.setattr(
+        routes_documents, "get_vector_store", lambda: FailingStore()
+    )
+
+    response = client.post(
+        "/documents",
+        data={"title": "Vector 503", "source": "test", "text": "Alice works at Acme."},
+    )
+
+    assert response.status_code == 503
+    assert "Vector index unavailable" in response.json().get("detail", "")
+
+
+def test_post_documents_success_returns_201_with_document_id_chunks_relations():
+    """Success → HTTP 201 with document_id, chunks, relations; document ready."""
+    response = client.post(
+        "/documents",
+        data={"title": "Success API", "source": "test", "text": "Alice works at Acme."},
+    )
+
+    assert response.status_code == 201
+    data = response.json()
+    assert "document_id" in data
+    assert "chunks" in data
+    assert "relations" in data
+
+
+def test_post_documents_disabled_extraction_returns_201_relations_zero_skipped():
+    """Disabled extraction → 201, relations 0, extraction status skipped (not empty)."""
+    # The module-level dependency override already installs DisabledGraphExtractor.
+    response = client.post(
+        "/documents",
+        data={"title": "Disabled API", "source": "test", "text": "Alice works at Acme."},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["relations"] == 0
+
+    session = TestSessionLocal()
+    try:
+        doc = session.query(models.Document).filter_by(title="Disabled API").one()
+        assert doc.ingestion_status == "ready"
+        extraction = (
+            session.query(models.GraphExtraction)
+            .filter_by(chunk_id=doc.chunks[0].id)
+            .one()
+        )
+        assert extraction.status == "skipped"
+        assert extraction.error_code == "extraction_disabled"
+        session.delete(doc)
+        session.commit()
+    finally:
+        session.close()
+
+
+def test_query_excludes_non_ready_documents():
+    """Non-ready documents are excluded from query results."""
+    # Ingest a document, mark it failed, query should not return it
+    response = client.post(
+        "/documents",
+        data={
+            "title": "Will Fail",
+            "source": "test",
+            "text": "Unique search text xyz123.",
+        },
+    )
+    assert response.status_code == 201
+    doc_id = response.json()["document_id"]
+
+    # Manually mark as failed via direct DB access (simulating crash)
+    session = TestSessionLocal()
+    try:
+        doc = session.get(models.Document, doc_id)
+        doc.ingestion_status = "failed"
+        session.commit()
+    finally:
+        session.close()
+
+    query_response = client.post(
+        "/query", json={"query": "Unique search text xyz123.", "retrieval_mode": "vector"}
+    )
+    assert query_response.status_code == 200
+
+    # The failed document's chunks must not appear in results
+    results = query_response.json()
+    for item in results.get("context", []):
+        assert item.get("metadata", {}).get("document_id") != doc_id
+
+
+def test_post_image_documents_vector_failure_returns_503_with_stable_detail(monkeypatch):
+    """W1: image ingestion vector failure maps to the same stable 503 detail
+    as the text route (10A.4 HTTP behavior contract)."""
+    class FakeImageProvider:
+        async def embed_images(self, paths):
+            return [[0.1] * 10]
+
+    class FailingStore:
+        async def upsert_embeddings(self, *args, **kwargs):
+            raise RuntimeError("chroma connection refused")
+
+        async def list_ids(self):
+            return []
+
+        async def delete(self, ids):
+            return None
+
+    monkeypatch.setattr(
+        routes_documents, "get_image_embedding_provider", lambda: FakeImageProvider()
+    )
+    monkeypatch.setattr(
+        routes_documents, "get_vector_store", lambda: FailingStore()
+    )
+
+    response = client.post(
+        "/documents",
+        data={"title": "Image Vector 503", "source": "test"},
+        files={"file": ("pic.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 32, "image/png")},
+    )
+
+    assert response.status_code == 503
+    assert "Vector index unavailable" in response.json().get("detail", "")
