@@ -141,3 +141,167 @@ def test_graph_rag_cli_does_not_emit_legacy_context_objects(tmp_path):
     # legacy shape would be a list of dicts with top-level "metadata"
     assert "metadata" not in payload[0]
     assert "graph" not in payload[0]
+
+
+def _seed_two_document_db(db_path: Path) -> tuple[int, int]:
+    """Seed two ready documents sharing the ``User`` seed entity.
+
+    Document A holds the canonical 3-hop chain; document B holds a
+    distractor edge from the same ``User`` entity, so a document filter
+    has a real candidate to exclude.
+    """
+    db_url = f"sqlite:///{db_path}"
+    engine = create_engine(db_url)
+
+    @event.listens_for(engine, "connect")
+    def _fk(dbapi_connection, connection_record):
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    document_a = models.Document(title="Access chain", source="unit", tags="graph")
+    document_b = models.Document(title="Refund flow", source="distractor", tags="billing")
+    session.add_all([document_a, document_b])
+    session.flush()
+    triples = [
+        ("User", "purchases", "Subscription", "User purchases Subscription."),
+        ("Subscription", "grants", "PremiumAccess", "Subscription grants PremiumAccess."),
+        ("PremiumAccess", "unlocks", "Dashboard", "PremiumAccess unlocks Dashboard."),
+    ]
+    for index, (source, predicate, target, text) in enumerate(triples):
+        chunk = models.Chunk(document_id=document_a.id, index=index, text=text,
+                             start_offset=0, end_offset=len(text),
+                             vector_id=f"chunk:{document_a.id}:{index}")
+        session.add(chunk)
+        session.flush()
+        persist_chunk_extraction(session, chunk=chunk,
+                                 relations=[_relation(source, predicate, target, text)],
+                                 provider="ollama", model="gemma4:latest")
+    distractor_text = "User cancels Refund."
+    distractor_chunk = models.Chunk(
+        document_id=document_b.id, index=0, text=distractor_text,
+        start_offset=0, end_offset=len(distractor_text),
+        vector_id=f"chunk:{document_b.id}:0",
+    )
+    session.add(distractor_chunk)
+    session.flush()
+    persist_chunk_extraction(
+        session, chunk=distractor_chunk,
+        relations=[_relation("User", "cancels", "Refund", distractor_text)],
+        provider="ollama", model="gemma4:latest",
+    )
+    session.commit()
+    doc_a_id, doc_b_id = document_a.id, document_b.id
+    session.close()
+    engine.dispose()
+    return doc_a_id, doc_b_id
+
+
+def _run_cli(env: dict, *cli_args: str) -> subprocess.CompletedProcess:
+    argv = [sys.executable, str(CLI), *cli_args]
+    return subprocess.run(argv, env=env, capture_output=True, text=True,
+                          cwd=PROJECT_ROOT, check=False)
+
+
+def test_graph_rag_cli_document_id_filter_restricts_results(tmp_path):
+    """--filters document_id=<int> must be accepted and applied: the
+    distractor document's paths disappear while document A's remain."""
+    db_path = tmp_path / "graph-rag-cli-docid.db"
+    doc_a_id, doc_b_id = _seed_two_document_db(db_path)
+    env = {**os.environ, "RAG_DATABASE_URL": f"sqlite:///{db_path}"}
+
+    unfiltered = _run_cli(env, "Explain User", "--hops", "1")
+    assert unfiltered.returncode == 0, unfiltered.stderr
+    unfiltered_paths = json.loads(unfiltered.stdout)
+    assert unfiltered_paths, "control run must return paths"
+    seen_documents = {s["document_id"] for p in unfiltered_paths for s in p["steps"]}
+    assert doc_b_id in seen_documents, "control run must include the distractor"
+
+    filtered = _run_cli(env, "Explain User", "--hops", "1",
+                        "--filters", f"document_id={doc_a_id}")
+    assert filtered.returncode == 0, filtered.stderr
+    filtered_paths = json.loads(filtered.stdout)
+    assert filtered_paths, "filtered run must still return document A paths"
+    assert all(s["document_id"] == doc_a_id
+               for p in filtered_paths for s in p["steps"])
+    assert not any(s["predicate"] == "cancels"
+                   for p in filtered_paths for s in p["steps"])
+
+
+@pytest.mark.parametrize(
+    ("filter_arg",),
+    [
+        ("title=Access chain",),
+        ("source=unit",),
+        ("tags=graph",),
+    ],
+)
+def test_graph_rag_cli_scalar_title_source_tags_filters_restrict_results(
+        filter_arg, tmp_path):
+    """Each scalar matrix key is accepted and applied end-to-end."""
+    db_path = tmp_path / "graph-rag-cli-scalar.db"
+    doc_a_id, doc_b_id = _seed_two_document_db(db_path)
+    env = {**os.environ, "RAG_DATABASE_URL": f"sqlite:///{db_path}"}
+
+    result = _run_cli(env, "Explain User", "--hops", "1",
+                      "--filters", filter_arg)
+    assert result.returncode == 0, result.stderr
+    paths = json.loads(result.stdout)
+    assert paths, f"filter {filter_arg!r} must keep document A paths"
+    step_documents = {s["document_id"] for p in paths for s in p["steps"]}
+    assert step_documents == {doc_a_id}
+    assert doc_b_id not in step_documents
+
+
+def test_graph_rag_cli_accepts_repeated_filters(tmp_path):
+    """Appendix 10A.5: --filters takes repeated key=value occurrences."""
+    db_path = tmp_path / "graph-rag-cli-repeated.db"
+    doc_a_id, doc_b_id = _seed_two_document_db(db_path)
+    env = {**os.environ, "RAG_DATABASE_URL": f"sqlite:///{db_path}"}
+
+    result = _run_cli(env, "Explain User", "--hops", "1",
+                      "--filters", "title=Access chain", "--filters", "tags=graph")
+    assert result.returncode == 0, result.stderr
+    paths = json.loads(result.stdout)
+    assert paths
+    step_documents = {s["document_id"] for p in paths for s in p["steps"]}
+    assert step_documents == {doc_a_id}
+
+
+def test_graph_rag_cli_unknown_filter_key_surfaces_mapped_error(tmp_path):
+    """Unknown keys raise UnsupportedGraphFilter in the service; the CLI
+    must surface that mapped error via its convention (exit 2)."""
+    db_path = tmp_path / "graph-rag-cli-unknown.db"
+    _seed_two_document_db(db_path)
+    env = {**os.environ, "RAG_DATABASE_URL": f"sqlite:///{db_path}"}
+
+    result = _run_cli(env, "Explain User", "--hops", "1",
+                      "--filters", "theme=dark")
+    assert result.returncode == 2, result.stderr
+    assert "Hybrid graph filters support only scalar document_id, title, source, and tags" \
+        in result.stderr
+
+
+def test_graph_rag_cli_non_integer_document_id_surfaces_mapped_error(tmp_path):
+    """document_id=abc is an invalid integer form: the plan-pinned
+    UnsupportedGraphFilter message must surface with exit 2."""
+    db_path = tmp_path / "graph-rag-cli-badint.db"
+    _seed_two_document_db(db_path)
+    env = {**os.environ, "RAG_DATABASE_URL": f"sqlite:///{db_path}"}
+
+    result = _run_cli(env, "Explain User", "--hops", "1",
+                      "--filters", "document_id=abc")
+    assert result.returncode == 2, result.stderr
+    assert "document_id filter must be an integer" in result.stderr
+
+
+def test_graph_rag_cli_malformed_filter_value_rejected(tmp_path):
+    """A --filters token without '=' is malformed and rejected by the
+    CLI's argparse convention (exit 2, usage error naming --filters)."""
+    db_path = tmp_path / "graph-rag-cli-malformed.db"
+    _seed_two_document_db(db_path)
+    env = {**os.environ, "RAG_DATABASE_URL": f"sqlite:///{db_path}"}
+
+    result = _run_cli(env, "Explain User", "--hops", "1", "--filters", "title")
+    assert result.returncode == 2, result.stderr
+    assert "--filters" in result.stderr
