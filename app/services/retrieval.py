@@ -12,6 +12,7 @@ from app.services.embeddings import EmbeddingProvider
 from app.services.vector_store import VectorStore
 from app.services.graph_retrieval import (
     GraphTraversalLimitError,
+    apply_document_filters,
     retrieve_graph_contexts,
     retrieve_graph_paths,
 )
@@ -65,8 +66,16 @@ def _context_key(context: dict) -> tuple:
     return ("text", context.get("text", ""))
 
 
-def _ready_vector_contexts(session: Session, contexts: list[dict]) -> list[dict]:
-    """Hydrate Chroma hits from SQL and discard stale/non-ready vectors."""
+def _ready_vector_contexts(
+    session: Session, contexts: list[dict], filters: dict | None = None
+) -> list[dict]:
+    """Hydrate Chroma hits from SQL and discard stale/non-ready vectors.
+
+    Scalar filters are re-applied against SQL here so the same filter value
+    yields identical candidate semantics in vector, graph, and hybrid modes
+    (Chroma metadata is an index hint, never the provenance authority — the
+    tags membership filter cannot be expressed as a Chroma where clause).
+    """
     requested_ids: list[int] = []
     for context in contexts:
         try:
@@ -82,8 +91,33 @@ def _ready_vector_contexts(session: Session, contexts: list[dict]) -> list[dict]
             models.Chunk.id.in_(requested_ids),
             models.Document.ingestion_status == "ready",
         )
-        .all()
     )
+    # 10D union (red-team harness scope): the exact Chroma-native operator
+    # form ``{"document_id": {"$in": [<int>, ...]}}`` is pushed to the vector
+    # index by ``vector_store.query`` and used by the Phase 10D red-team
+    # harness to scope a fixture's candidates before ranking. SQL remains
+    # the authority, so the operator is re-applied here as an exact integer
+    # membership with the same strict W5 typing ``apply_document_filters``
+    # enforces for scalars: booleans and non-integer elements are rejected,
+    # never coerced (falling through to the scalar rejection below). Every
+    # other key/value keeps its scalar-matrix handling untouched, and graph
+    # and hybrid modes still reject operator forms via
+    # ``graph_retrieval._validate_filters``.
+    sql_filters = dict(filters or {})
+    scope = sql_filters.get("document_id")
+    if (
+        isinstance(scope, dict)
+        and set(scope) == {"$in"}
+        and isinstance(scope["$in"], list)
+        and scope["$in"]
+        and all(
+            not isinstance(item, bool) and isinstance(item, int)
+            for item in scope["$in"]
+        )
+    ):
+        chunks = chunks.filter(models.Document.id.in_(scope["$in"]))
+        del sql_filters["document_id"]
+    chunks = apply_document_filters(chunks, sql_filters, session).all()
     by_id = {chunk.id: chunk for chunk in chunks}
     hydrated = []
     seen_chunk_ids: set[int] = set()
@@ -225,7 +259,7 @@ async def retrieve_contexts_detailed(
             top_k=top_k,
             filters=filters,
         )
-        vector_contexts = _ready_vector_contexts(session, vector_contexts)
+        vector_contexts = _ready_vector_contexts(session, vector_contexts, filters)
         for context in vector_contexts:
             metadata = context.setdefault("metadata", {})
             metadata["retrieval_sources"] = ["vector"]
@@ -291,7 +325,10 @@ async def retrieve_contexts_detailed(
                 metadata["graph_score"] = graph_score
 
     for key, context in fused.items():
-        context["metadata"]["hybrid_score"] = round(rrf_scores[key], 6)
+        # Exact RRF-60 sum, never rounded: the plan pins hybrid_score as the
+        # sum of 1/(60+rank) over the candidate's sides, and rounding would
+        # perturb that arithmetic (and could fabricate ties).
+        context["metadata"]["hybrid_score"] = rrf_scores[key]
     hybrid_results = sorted(
         fused.values(),
         key=lambda item: (

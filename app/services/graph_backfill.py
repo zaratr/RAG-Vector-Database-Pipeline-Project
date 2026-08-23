@@ -227,7 +227,6 @@ async def backfill(
             lease_lost += 1
             continue
 
-        processed += 1
         try:
             try:
                 result_relations = await extractor.extract(chunk.text)
@@ -240,6 +239,7 @@ async def backfill(
                     expected_attempt_count=lease.lease_attempt_count,
                 )
                 session.commit()
+                processed += 1
                 failed += 1
                 continue
             complete_chunk_extraction(
@@ -247,14 +247,21 @@ async def backfill(
                 expected_attempt_count=lease.lease_attempt_count,
             )
             session.commit()
+            processed += 1
             if result_relations:
                 succeeded += 1
                 relations += len(result_relations)
             else:
                 empty += 1
         except (InvalidExtractionTransition, ExtractionLeaseLost):
-            # Concurrent winner completed first or lease was reclaimed; this
-            # worker loses the lease.
+            # The lease was lost AFTER the provider call started: another
+            # worker reclaimed the expired lease (expiry-during-processing)
+            # or terminalized the identity first, so complete/fail raised.
+            # The chunk must count ONLY in lease_lost — never additionally
+            # in processed — so the plan's conservation equations hold in
+            # every interleaving: eligible = processed + lease_lost,
+            # processed = succeeded + empty + failed, and scanned = skipped
+            # + processed + lease_lost.
             lease_lost += 1
             session.rollback()
 

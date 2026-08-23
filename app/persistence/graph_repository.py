@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -26,6 +27,15 @@ from app.services.graph_extraction import (
 )
 
 _LEASE_DEFAULT_SECONDS = 600
+
+# The only reason codes a skipped extraction may record; mirrors the W4
+# lifecycle CHECK (``ck_graph_extractions_lifecycle``) so an invalid code is
+# rejected with a typed repository error before any DB write instead of a raw
+# IntegrityError at flush time. ``safety_blocked`` is the 10C.4 ingestion-scope
+# skip reason carried by d9b5f7c1e4a3.
+_SKIP_REASON_CODES = frozenset(
+    {"extraction_disabled", "unsupported_media_type", "safety_blocked"}
+)
 
 
 class InvalidExtractionTransition(RuntimeError):
@@ -134,6 +144,13 @@ def begin_chunk_extraction(
 
     Returns an :class:`ExtractionLease`. The caller branches only on
     ``should_call_provider``. See the state-transition table in the plan.
+
+    When two workers begin the same absent identity concurrently, the partial
+    unique index ``uq_graph_extractions_identity_owner`` admits exactly one
+    insert. The insert runs inside a savepoint so the loser's IntegrityError
+    is contained without poisoning the caller's open transaction (a failed
+    bare flush would leave the whole Session requiring rollback); the loser
+    reloads the winner's row and must not start a second provider call.
     """
     now = _normalize_dt((now_utc or _default_now_utc)())
     identity = derive_extraction_identity(
@@ -146,25 +163,43 @@ def begin_chunk_extraction(
     existing = _find_owner(session, identity)
 
     if existing is None:
-        extraction = models.GraphExtraction(
-            chunk_id=identity.chunk_id,
-            provider=identity.provider,
-            model=identity.model,
-            prompt_version=identity.prompt_version,
-            schema_version=identity.schema_version,
-            input_sha256=identity.input_sha256,
-            status="pending",
-            attempt_count=1,
-            attempt_started_at=now,
-            completed_at=None,
-            error_code=None,
-            error_detail=None,
-            is_identity_owner=True,
-        )
-        session.add(extraction)
-        session.flush()
-        return ExtractionLease(extraction, identity, should_call_provider=True,
-                               lease_attempt_count=extraction.attempt_count)
+        try:
+            with session.begin_nested():
+                extraction = models.GraphExtraction(
+                    chunk_id=identity.chunk_id,
+                    provider=identity.provider,
+                    model=identity.model,
+                    prompt_version=identity.prompt_version,
+                    schema_version=identity.schema_version,
+                    input_sha256=identity.input_sha256,
+                    status="pending",
+                    attempt_count=1,
+                    attempt_started_at=now,
+                    completed_at=None,
+                    error_code=None,
+                    error_detail=None,
+                    is_identity_owner=True,
+                )
+                session.add(extraction)
+            return ExtractionLease(extraction, identity, should_call_provider=True,
+                                   lease_attempt_count=extraction.attempt_count)
+        except IntegrityError:
+            # Concurrent same-identity begin: the partial unique index
+            # uq_graph_extractions_identity_owner rejected this insert because
+            # another worker won the race and created the pending row. The
+            # savepoint above rolled the failed insert back; cooperatively
+            # reload the winner's row. The loser must NOT start a second
+            # provider call (plan: "exactly one caller obtains
+            # should_call_provider=True, losers reload the winner and do not
+            # call the provider").
+            winner = _find_owner(session, identity)
+            if winner is None:
+                # The violation was not a same-identity race the caller can
+                # recover from (or the winner's row is not visible in this
+                # transaction); surface the original error, never swallow it.
+                raise
+            return ExtractionLease(winner, identity, should_call_provider=False,
+                                   lease_attempt_count=winner.attempt_count)
 
     status = existing.status
 
@@ -345,6 +380,11 @@ def skip_chunk_extraction(
     now_utc: Callable[[], datetime] | None = None,
 ) -> ExtractionLease:
     """Create or reload the complete skipped identity; never calls the provider."""
+    if reason_code not in _SKIP_REASON_CODES:
+        raise ValueError(
+            f"invalid skip reason_code {reason_code!r}; must be one of "
+            f"{sorted(_SKIP_REASON_CODES)} (ck_graph_extractions_lifecycle)"
+        )
     now = _normalize_dt((now_utc or _default_now_utc)())
     identity = derive_extraction_identity(
         chunk=chunk,

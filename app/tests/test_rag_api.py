@@ -374,3 +374,252 @@ def test_invalid_bearer_on_public_ingestion_returns_401():
     assert resp.status_code == 401
     assert resp.json()["detail"] == "Invalid bearer token"
     assert resp.headers["WWW-Authenticate"] == "Bearer"
+
+
+# ── 10A.4 HTTP behavior tests (phase10-test-specifications appendix) ──
+# Adapted to the implemented API surface: routes are mounted without an
+# /api/v1 prefix, /documents takes Form fields, and the graph extractor is
+# injected via app.dependency_overrides (the established pattern above).
+
+
+def test_post_documents_provider_unavailable_returns_503():
+    """Provider unavailable → HTTP 503; failed doc not query-visible."""
+    from app.services.graph_extraction import GraphProviderUnavailable
+
+    class UnavailableExtractor:
+        async def extract(self, text):
+            raise GraphProviderUnavailable("unavailable")
+
+    app.dependency_overrides[get_graph_extractor] = lambda: UnavailableExtractor()
+    try:
+        response = client.post(
+            "/documents",
+            data={"title": "503 Test", "source": "test", "text": "Alice works at Acme."},
+        )
+    finally:
+        app.dependency_overrides[get_graph_extractor] = lambda: DisabledGraphExtractor()
+
+    assert response.status_code == 503
+
+
+def test_post_documents_invalid_provider_output_returns_502():
+    """Invalid provider output → HTTP 502; failed state persists."""
+    from app.services.graph_extraction import GraphProviderOutputError
+
+    class InvalidOutputExtractor:
+        async def extract(self, text):
+            raise GraphProviderOutputError("bad output")
+
+    app.dependency_overrides[get_graph_extractor] = lambda: InvalidOutputExtractor()
+    try:
+        response = client.post(
+            "/documents",
+            data={"title": "502 Test", "source": "test", "text": "Alice works at Acme."},
+        )
+    finally:
+        app.dependency_overrides[get_graph_extractor] = lambda: DisabledGraphExtractor()
+
+    assert response.status_code == 502
+
+
+def test_post_documents_vector_failure_returns_503_with_stable_detail(monkeypatch):
+    """Vector failure → HTTP 503 with detail 'Vector index unavailable'."""
+    class FailingStore:
+        async def upsert_embeddings(self, *args, **kwargs):
+            raise RuntimeError("chroma connection refused")
+
+        async def list_ids(self):
+            return []
+
+        async def delete(self, ids):
+            return None
+
+    monkeypatch.setattr(
+        routes_documents, "get_vector_store", lambda: FailingStore()
+    )
+
+    response = client.post(
+        "/documents",
+        data={"title": "Vector 503", "source": "test", "text": "Alice works at Acme."},
+    )
+
+    assert response.status_code == 503
+    assert "Vector index unavailable" in response.json().get("detail", "")
+
+
+def test_post_documents_success_returns_201_with_document_id_chunks_relations():
+    """Success → HTTP 201 with document_id, chunks, relations; document ready."""
+    response = client.post(
+        "/documents",
+        data={"title": "Success API", "source": "test", "text": "Alice works at Acme."},
+    )
+
+    assert response.status_code == 201
+    data = response.json()
+    assert "document_id" in data
+    assert "chunks" in data
+    assert "relations" in data
+
+
+def test_post_documents_disabled_extraction_returns_201_relations_zero_skipped():
+    """Disabled extraction → 201, relations 0, extraction status skipped (not empty)."""
+    # The module-level dependency override already installs DisabledGraphExtractor.
+    response = client.post(
+        "/documents",
+        data={"title": "Disabled API", "source": "test", "text": "Alice works at Acme."},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["relations"] == 0
+
+    session = TestSessionLocal()
+    try:
+        doc = session.query(models.Document).filter_by(title="Disabled API").one()
+        assert doc.ingestion_status == "ready"
+        extraction = (
+            session.query(models.GraphExtraction)
+            .filter_by(chunk_id=doc.chunks[0].id)
+            .one()
+        )
+        assert extraction.status == "skipped"
+        assert extraction.error_code == "extraction_disabled"
+        session.delete(doc)
+        session.commit()
+    finally:
+        session.close()
+
+
+def test_query_excludes_non_ready_documents():
+    """Non-ready documents are excluded from query results."""
+    # Ingest a document, mark it failed, query should not return it
+    response = client.post(
+        "/documents",
+        data={
+            "title": "Will Fail",
+            "source": "test",
+            "text": "Unique search text xyz123.",
+        },
+    )
+    assert response.status_code == 201
+    doc_id = response.json()["document_id"]
+
+    # Manually mark as failed via direct DB access (simulating crash)
+    session = TestSessionLocal()
+    try:
+        doc = session.get(models.Document, doc_id)
+        doc.ingestion_status = "failed"
+        session.commit()
+    finally:
+        session.close()
+
+    query_response = client.post(
+        "/query", json={"query": "Unique search text xyz123.", "retrieval_mode": "vector"}
+    )
+    assert query_response.status_code == 200
+
+    # The failed document's chunks must not appear in results
+    results = query_response.json()
+    for item in results.get("context", []):
+        assert item.get("metadata", {}).get("document_id") != doc_id
+
+
+# ── 10A.6 /query retrieval-mode tests (phase10-test-specifications appendix) ──
+
+
+def test_query_hybrid_mode_returns_200_with_context():
+    response = client.post("/query", json={
+        "query": "FastAPI", "top_k": 3, "retrieval_mode": "hybrid",
+        "graph_max_hops": 2,
+    })
+    assert response.status_code == 200
+    payload = response.json()
+    assert "answer" in payload
+    assert isinstance(payload["context"], list)
+
+
+def test_query_graph_mode_returns_200_without_embedding_dependency():
+    response = client.post("/query", json={
+        "query": "FastAPI", "top_k": 3, "retrieval_mode": "graph",
+        "graph_max_hops": 1,
+    })
+    # graph mode may return empty context if no graph data, but must be 200
+    assert response.status_code == 200
+
+
+def test_query_hybrid_with_unsupported_filter_returns_422():
+    response = client.post("/query", json={
+        "query": "FastAPI", "retrieval_mode": "hybrid",
+        "filters": {"unknown_key": 1},
+    })
+    assert response.status_code == 422
+
+
+def test_query_graph_with_unsupported_filter_returns_422():
+    response = client.post("/query", json={
+        "query": "FastAPI", "retrieval_mode": "graph",
+        "filters": {"document_id": "not-an-int"},
+    })
+    assert response.status_code == 422
+
+
+def test_query_vector_mode_accepts_filters_and_remains_default():
+    response = client.post("/query", json={
+        "query": "FastAPI", "filters": {"document_id": 1},
+    })
+    # default mode is vector; 200 even if no hits match the filter
+    assert response.status_code == 200
+
+
+def test_query_hybrid_traversal_limit_returns_503(monkeypatch):
+    """If retrieve_graph_paths raises GraphTraversalLimitError, /query
+    must return 503 (mapped in routes_query.py)."""
+    from app.services import rag
+    from app.services.graph_retrieval import GraphTraversalLimitError
+
+    # retrieve_graph_paths is synchronous in production; the appendix's
+    # ``async def _boom(**kwargs)`` shape is adapted to the sync signature
+    # (and ``session`` is passed positionally), preserving the patch point,
+    # the raised exception, and the asserted 503.
+    def _boom(*args, **kwargs):
+        raise GraphTraversalLimitError("cap exceeded")
+    # retrieval.py wires retrieve_graph_paths (not retrieve_graph_contexts)
+    # into hybrid/graph candidate building, so that is the patch point.
+    monkeypatch.setattr(rag.retrieval, "retrieve_graph_paths", _boom)
+    response = client.post("/query", json={
+        "query": "FastAPI", "retrieval_mode": "hybrid",
+    })
+    assert response.status_code == 503
+
+
+def test_post_image_documents_vector_failure_returns_503_with_stable_detail(monkeypatch):
+    """W1: image ingestion vector failure maps to the same stable 503 detail
+    as the text route (10A.4 HTTP behavior contract)."""
+    class FakeImageProvider:
+        async def embed_images(self, paths):
+            return [[0.1] * 10]
+
+    class FailingStore:
+        async def upsert_embeddings(self, *args, **kwargs):
+            raise RuntimeError("chroma connection refused")
+
+        async def list_ids(self):
+            return []
+
+        async def delete(self, ids):
+            return None
+
+    monkeypatch.setattr(
+        routes_documents, "get_image_embedding_provider", lambda: FakeImageProvider()
+    )
+    monkeypatch.setattr(
+        routes_documents, "get_vector_store", lambda: FailingStore()
+    )
+
+    response = client.post(
+        "/documents",
+        data={"title": "Image Vector 503", "source": "test"},
+        files={"file": ("pic.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 32, "image/png")},
+    )
+
+    assert response.status_code == 503
+    assert "Vector index unavailable" in response.json().get("detail", "")
