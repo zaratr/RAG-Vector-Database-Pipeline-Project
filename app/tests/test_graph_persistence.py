@@ -8,6 +8,7 @@ migrated ``b7f3d5a9c2e1`` physical schema).
 """
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -398,6 +399,7 @@ def test_successful_empty_differs_from_failed_and_skipped():
 
 
 def test_concurrent_same_identity_creation_does_not_duplicate_rows():
+    """Requirement 6: two begins on same identity produce one row, one provider call."""
     session, engine = _session()
     _, chunk = _document_chunk(session)
 
@@ -417,6 +419,127 @@ def test_concurrent_same_identity_creation_does_not_duplicate_rows():
 
     session.close()
     engine.dispose()
+
+
+def test_concurrent_begin_two_sessions_single_winner_loser_reloads(tmp_path):
+    """Genuine two-session race on one extraction identity (F3 regression).
+
+    Schedule — the production loser interleave (statement-level READ COMMITTED
+    snapshot, as under Postgres), forced deterministically at the engine
+    boundary so the losing branch is exercised on every run:
+
+      1. session A (winner, own engine) holds real uncommitted DML in its open
+         transaction (as ingestion does: staged document/chunk writes precede
+         the extraction begins), then begins: lookup misses, INSERT of the
+         pending identity-owner row inside the savepoint succeeds, nothing
+         committed yet.
+      2. session B (loser, own engine) begins: its lookup runs before A
+         commits, so it misses; its INSERT is parked just before execution
+         until A commits.
+      3. A commits.
+      4. B's INSERT executes against A's committed row and violates the
+         partial unique index ``uq_graph_extractions_identity_owner``.
+
+    The loser must roll back to its savepoint, reload the winner's pending
+    row, and return ``should_call_provider=False`` — no raw IntegrityError
+    escaping the repository, no second row, no second provider call, and no
+    reclaim of the winner's live attempt.
+    """
+    db_path = (tmp_path / "begin-race.db").as_posix()
+    engine_a = create_engine(f"sqlite:///{db_path}")
+    engine_b = create_engine(f"sqlite:///{db_path}")
+
+    loser_insert_attempted = threading.Event()
+    winner_committed = threading.Event()
+
+    @event.listens_for(engine_b, "before_cursor_execute")
+    def _park_loser_insert(conn, cursor, statement, parameters, context,
+                           executemany):
+        if statement.lstrip().upper().startswith("INSERT INTO GRAPH_EXTRACTIONS"):
+            loser_insert_attempted.set()
+            if not winner_committed.wait(timeout=15):
+                raise TimeoutError("loser INSERT parked but winner never committed")
+
+    Base.metadata.create_all(engine_a)
+    factory_a = sessionmaker(bind=engine_a)
+    factory_b = sessionmaker(bind=engine_b)
+
+    session_a = factory_a()
+    _, chunk = _document_chunk(session_a)
+    session_a.commit()
+    chunk_id = chunk.id
+
+    # Winner: open the write transaction with real uncommitted DML first —
+    # ingestion stages document/chunk inserts before its extraction begins in
+    # the same transaction — then begin and hold everything uncommitted (the
+    # provider call happens outside the SQL transaction).
+    session_a.add(models.Document(title="winner staging", source="unit"))
+    session_a.flush()
+    lease_a = begin_chunk_extraction(
+        session_a, chunk=chunk, provider="ollama", model="gemma4:latest",
+        prompt_version="graph-v1", schema_version="graph-relations-v1",
+    )
+    assert lease_a.should_call_provider is True
+    winner_attempt_started_at = lease_a.extraction.attempt_started_at
+
+    outcome = {}
+
+    def _loser():
+        session_b = factory_b()
+        try:
+            chunk_b = session_b.get(models.Chunk, chunk_id)
+            lease_b = begin_chunk_extraction(
+                session_b, chunk=chunk_b, provider="ollama", model="gemma4:latest",
+                prompt_version="graph-v1", schema_version="graph-relations-v1",
+            )
+            session_b.commit()
+            # Capture while instances are still bound (session closes below).
+            outcome["lease"] = {
+                "should_call_provider": lease_b.should_call_provider,
+                "id": lease_b.extraction.id,
+                "status": lease_b.extraction.status,
+                "attempt_count": lease_b.extraction.attempt_count,
+                "lease_attempt_count": lease_b.lease_attempt_count,
+                "attempt_started_at": lease_b.extraction.attempt_started_at,
+            }
+        except Exception as exc:  # noqa: BLE001 - surfaced by the assertion below
+            outcome["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            session_b.close()
+
+    loser = threading.Thread(target=_loser)
+    loser.start()
+    # The loser's identity lookup has already executed (program order: the
+    # lookup precedes the INSERT we park on), so committing now guarantees
+    # the loser misses on lookup and collides on insert.
+    assert loser_insert_attempted.wait(timeout=15), "loser never attempted its INSERT"
+    session_a.commit()
+    winner_committed.set()
+    loser.join(timeout=15)
+    assert not loser.is_alive(), "loser thread hung"
+
+    assert "error" not in outcome, f"loser raised: {outcome.get('error')}"
+    lease_b = outcome["lease"]
+    assert lease_b["should_call_provider"] is False
+    assert lease_b["id"] == lease_a.extraction.id
+    assert lease_b["status"] == "pending"
+    assert lease_b["attempt_count"] == 1
+    assert lease_b["lease_attempt_count"] == 1
+    # The loser reloaded the winner's attempt untouched (no reclaim).
+    assert lease_b["attempt_started_at"] == winner_attempt_started_at
+
+    # Exactly one row exists; the loser created no second row.
+    verify = factory_a()
+    rows = verify.query(models.GraphExtraction).all()
+    assert len(rows) == 1
+    assert rows[0].id == lease_a.extraction.id
+    assert rows[0].status == "pending"
+    assert rows[0].is_identity_owner is True
+    verify.close()
+
+    session_a.close()
+    engine_a.dispose()
+    engine_b.dispose()
 
 
 def test_begin_on_failed_without_retry_returns_failed_without_provider_call():
@@ -611,6 +734,28 @@ def test_skip_with_unsupported_media_type_reason_code():
 
     assert lease.extraction.status == "skipped"
     assert lease.extraction.error_code == "unsupported_media_type"
+
+    session.close()
+    engine.dispose()
+
+
+def test_skip_chunk_extraction_rejects_invalid_reason_code_with_typed_error():
+    """An invalid reason_code raises the repository's typed ValueError before
+    any DB write instead of surfacing the W4 lifecycle CHECK
+    (``skipped -> error_code IN ('extraction_disabled',
+    'unsupported_media_type')``) as a raw IntegrityError at flush time."""
+    session, engine = _session()
+    _, chunk = _document_chunk(session)
+
+    with pytest.raises(ValueError, match="reason_code"):
+        skip_chunk_extraction(
+            session, chunk=chunk, provider="ollama", model="gemma4:latest",
+            prompt_version="graph-v1", schema_version="graph-relations-v1",
+            reason_code="not_a_valid_skip_reason",
+        )
+
+    session.rollback()
+    assert session.query(models.GraphExtraction).count() == 0
 
     session.close()
     engine.dispose()
