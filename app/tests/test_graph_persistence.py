@@ -711,6 +711,46 @@ def test_direct_sql_rejects_short_input_sha256():
     engine.dispose()
 
 
+def test_direct_sql_rejects_long_input_sha256():
+    """Plan acceptance #7: the 64-hex CHECK also rejects values longer than 64."""
+    session, engine = _session()
+    _, chunk = _document_chunk(session)
+
+    with pytest.raises(IntegrityError):
+        session.execute(text(
+            "INSERT INTO graph_extractions (chunk_id, provider, model, "
+            "prompt_version, schema_version, status, input_sha256, "
+            "attempt_count, is_identity_owner) "
+            "VALUES (:cid, 'ollama', 'm', 'v1', 's1', 'succeeded', "
+            ":sha, 1, 1)"
+        ), {"cid": chunk.id, "sha": "a" * 65})
+        session.commit()
+
+    session.rollback()
+    session.close()
+    engine.dispose()
+
+
+def test_direct_sql_rejects_punctuation_input_sha256():
+    """Plan acceptance #7: the 64-hex CHECK rejects punctuation inside the value."""
+    session, engine = _session()
+    _, chunk = _document_chunk(session)
+
+    with pytest.raises(IntegrityError):
+        session.execute(text(
+            "INSERT INTO graph_extractions (chunk_id, provider, model, "
+            "prompt_version, schema_version, status, input_sha256, "
+            "attempt_count, is_identity_owner) "
+            "VALUES (:cid, 'ollama', 'm', 'v1', 's1', 'succeeded', "
+            ":sha, 1, 1)"
+        ), {"cid": chunk.id, "sha": "a" * 32 + "!" + "a" * 31})
+        session.commit()
+
+    session.rollback()
+    session.close()
+    engine.dispose()
+
+
 def test_partial_unique_index_prevents_duplicate_identity_owner_rows():
     session, engine = _session()
     _, chunk = _document_chunk(session)
@@ -719,16 +759,18 @@ def test_partial_unique_index_prevents_duplicate_identity_owner_rows():
     session.execute(text(
         "INSERT INTO graph_extractions (chunk_id, provider, model, "
         "prompt_version, schema_version, status, input_sha256, "
-        "attempt_count, is_identity_owner) "
-        "VALUES (:cid, 'ollama', 'm', 'v1', 's1', 'succeeded', :sha, 1, 1)"
+        "attempt_count, is_identity_owner, completed_at) "
+        "VALUES (:cid, 'ollama', 'm', 'v1', 's1', 'succeeded', :sha, 1, 1, "
+        "'2026-08-22T00:00:00+00:00')"
     ), {"cid": chunk.id, "sha": sha})
 
     with pytest.raises(IntegrityError):
         session.execute(text(
             "INSERT INTO graph_extractions (chunk_id, provider, model, "
             "prompt_version, schema_version, status, input_sha256, "
-            "attempt_count, is_identity_owner) "
-            "VALUES (:cid, 'ollama', 'm', 'v1', 's1', 'empty', :sha, 1, 1)"
+            "attempt_count, is_identity_owner, completed_at) "
+            "VALUES (:cid, 'ollama', 'm', 'v1', 's1', 'empty', :sha, 1, 1, "
+            "'2026-08-22T00:00:00+00:00')"
         ), {"cid": chunk.id, "sha": sha})
         session.commit()
 
@@ -745,14 +787,16 @@ def test_non_owner_rows_allowed_with_same_identity():
     session.execute(text(
         "INSERT INTO graph_extractions (chunk_id, provider, model, "
         "prompt_version, schema_version, status, input_sha256, "
-        "attempt_count, is_identity_owner) "
-        "VALUES (:cid, 'ollama', 'm', 'v1', 's1', 'succeeded', :sha, 1, 1)"
+        "attempt_count, is_identity_owner, completed_at) "
+        "VALUES (:cid, 'ollama', 'm', 'v1', 's1', 'succeeded', :sha, 1, 1, "
+        "'2026-08-22T00:00:00+00:00')"
     ), {"cid": chunk.id, "sha": sha})
     session.execute(text(
         "INSERT INTO graph_extractions (chunk_id, provider, model, "
         "prompt_version, schema_version, status, input_sha256, "
-        "attempt_count, is_identity_owner) "
-        "VALUES (:cid, 'ollama', 'm', 'v1', 's1', 'empty', :sha, 1, 0)"
+        "attempt_count, is_identity_owner, completed_at) "
+        "VALUES (:cid, 'ollama', 'm', 'v1', 's1', 'empty', :sha, 1, 0, "
+        "'2026-08-22T00:00:00+00:00')"
     ), {"cid": chunk.id, "sha": sha})
     session.commit()
 
