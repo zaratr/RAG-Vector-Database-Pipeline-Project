@@ -123,7 +123,16 @@ class ChromaVectorStore:
 
     async def query(self, embedding: List[float], top_k: int, filters: dict | None = None) -> List[RetrievedChunk]:
         logger.info("Querying vector store with top_k=%s", top_k)
-        where_clause = filters if filters else None
+        # Plan 10A.5 pins `tags` as exact membership after splitting the stored
+        # comma-separated tags; a Chroma where clause cannot express membership
+        # over the indexed list tags metadata (raw equality silently matches
+        # nothing). `tags` is therefore never pushed to Chroma and is enforced
+        # authoritatively against SQL Document.tags during hydration
+        # (retrieval._ready_vector_contexts) for parity with graph retrieval.
+        where_clause = None
+        if filters:
+            expressible = {key: value for key, value in filters.items() if key != "tags"}
+            where_clause = expressible or None
         result = await run_in_threadpool(
             self.collection.query, query_embeddings=[embedding], n_results=top_k, where=where_clause
         )

@@ -76,6 +76,34 @@ def _validate_filters(filters: dict | None) -> dict:
     return filters
 
 
+def split_document_tags(stored_tags: str | None) -> list[str]:
+    """Split stored comma-separated document tags and trim whitespace.
+
+    Plan 10A.5 scalar filter matrix: ``tags`` is "one scalar tag; exact
+    membership after splitting stored comma-separated tags and trimming
+    whitespace". Empty elements are dropped. Mirrors the split performed by
+    ``Chunk.get_chunk_metadata`` and is shared by graph retrieval and vector
+    hydration so every side applies identical semantics.
+    """
+    if not stored_tags:
+        return []
+    return [tag.strip() for tag in stored_tags.split(",") if tag.strip()]
+
+
+def document_ids_matching_tag(session: Session, tag: str) -> list[int]:
+    """Return sorted ids of documents whose split+trimmed tags contain ``tag``."""
+    rows = (
+        session.query(models.Document.id, models.Document.tags)
+        .filter(models.Document.tags.isnot(None))
+        .all()
+    )
+    return sorted(
+        document_id
+        for document_id, stored_tags in rows
+        if tag in split_document_tags(stored_tags)
+    )
+
+
 def retrieve_graph_contexts(
     session: Session,
     *,
@@ -127,18 +155,7 @@ def retrieve_graph_contexts(
         )
         .filter(models.Document.ingestion_status == "ready")
     )
-    if "document_id" in filters:
-        try:
-            document_id = int(filters["document_id"])
-        except (TypeError, ValueError) as exc:
-            raise UnsupportedGraphFilter("document_id filter must be an integer") from exc
-        evidence_query = evidence_query.filter(models.Document.id == document_id)
-    if "title" in filters:
-        evidence_query = evidence_query.filter(models.Document.title == str(filters["title"]))
-    if "source" in filters:
-        evidence_query = evidence_query.filter(models.Document.source == str(filters["source"]))
-    if "tags" in filters:
-        evidence_query = evidence_query.filter(models.Document.tags == str(filters["tags"]))
+    evidence_query = apply_document_filters(evidence_query, filters, session)
 
     evidence_rows = evidence_query.limit(MAX_EVIDENCE_ROWS + 1).all()
     if len(evidence_rows) > MAX_EVIDENCE_ROWS:
@@ -229,8 +246,17 @@ def retrieve_graph_contexts(
 # ---------------------------------------------------------------------------
 
 
-def _apply_path_filters(query, filters: dict | None):
-    """Apply the scalar document filters to a ready-document evidence query."""
+def apply_document_filters(query, filters: dict | None, session: Session):
+    """Apply the plan 10A.5 scalar filter matrix to a Document-joined query.
+
+    ``document_id`` is integer equality with booleans rejected, ``title`` and
+    ``source`` are exact case-sensitive SQL equality, and ``tags`` is exact
+    membership after splitting the stored comma-separated tags and trimming
+    whitespace. Shared by graph traversal and vector hydration so identical
+    filter values yield identical candidate semantics on both sides.
+    """
+    if not filters:
+        return query
     if "document_id" in filters:
         try:
             document_id = int(filters["document_id"])
@@ -244,7 +270,8 @@ def _apply_path_filters(query, filters: dict | None):
     if "source" in filters:
         query = query.filter(models.Document.source == str(filters["source"]))
     if "tags" in filters:
-        query = query.filter(models.Document.tags == str(filters["tags"]))
+        matching_ids = document_ids_matching_tag(session, str(filters["tags"]))
+        query = query.filter(models.Document.id.in_(matching_ids))
     return query
 
 
@@ -263,7 +290,7 @@ def _ready_evidence_rows(session: Session, filters: dict):
         )
         .filter(models.Document.ingestion_status == "ready")
     )
-    query = _apply_path_filters(query, filters)
+    query = apply_document_filters(query, filters, session)
     return query.all()
 
 
@@ -293,7 +320,7 @@ def resolve_graph_seeds(
             .filter(models.GraphExtraction.chunk_id.in_(seed_chunk_ids))
             .filter(models.Document.ingestion_status == "ready")
         )
-        mentioned = _apply_path_filters(mentioned, filters or {})
+        mentioned = apply_document_filters(mentioned, filters or {}, session)
         seeds.update(entity_id for (entity_id,) in mentioned.distinct().all())
     if len(seeds) > MAX_SEEDS:
         raise GraphTraversalLimitError(

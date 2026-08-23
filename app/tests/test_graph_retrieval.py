@@ -364,3 +364,56 @@ def test_retrieve_graph_paths_no_seeds_returns_empty():
     finally:
         session.close()
         engine.dispose()
+
+
+def test_retrieve_graph_paths_scalar_tags_filter_matches_membership():
+    session, engine, document, chunks = _session_with_chain()
+    try:
+        # document.tags == "graph"; tags filter splits stored CSV and trims
+        matched = retrieve_graph_paths(session, query="Explain User", max_hops=1,
+                                       direction="outbound", limit=10,
+                                       filters={"tags": "graph"})
+        assert matched
+        assert retrieve_graph_paths(session, query="Explain User", max_hops=1,
+                                    direction="outbound", limit=10,
+                                    filters={"tags": "absent"}) == []
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_retrieve_graph_paths_tags_filter_membership_after_csv_split_and_trim():
+    """Plan 10A.5 matrix: `tags` is "one scalar tag; exact membership after
+    splitting stored comma-separated tags and trimming whitespace" — not
+    whole-column equality."""
+    session, engine, document, chunks = _session_with_chain()
+    try:
+        document.tags = "alpha, graph ,beta"
+        session.commit()
+        # membership: each trimmed CSV element matches exactly
+        for present in ("graph", "alpha", "beta"):
+            assert retrieve_graph_paths(session, query="Explain User", max_hops=1,
+                                        direction="outbound", limit=10,
+                                        filters={"tags": present})
+        # exact membership, not substring and not whole-column equality
+        for absent in ("alph", "absent", "alpha, graph ,beta", "graph "):
+            assert retrieve_graph_paths(session, query="Explain User", max_hops=1,
+                                        direction="outbound", limit=10,
+                                        filters={"tags": absent}) == []
+        # the legacy contexts entry point applies the same membership semantics
+        assert retrieve_graph_contexts(session, query="Explain User", max_hops=1,
+                                       limit=10, filters={"tags": "graph"})
+        assert retrieve_graph_contexts(session, query="Explain User", max_hops=1,
+                                       limit=10, filters={"tags": "alph"}) == []
+        # chunk-derived seeds are admitted only through matching documents
+        assert retrieve_graph_paths(session, query="zzznoentzzz", max_hops=1,
+                                    direction="outbound", limit=10,
+                                    filters={"tags": "graph"},
+                                    seed_chunk_ids=[chunks[0].id])
+        assert retrieve_graph_paths(session, query="zzznoentzzz", max_hops=1,
+                                    direction="outbound", limit=10,
+                                    filters={"tags": "absent"},
+                                    seed_chunk_ids=[chunks[0].id]) == []
+    finally:
+        session.close()
+        engine.dispose()

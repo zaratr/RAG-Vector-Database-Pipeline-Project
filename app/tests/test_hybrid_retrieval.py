@@ -265,3 +265,57 @@ async def test_vector_only_rejects_alias_id_and_deduplicates_sql_chunk():
     assert contexts[0]["score"] == 0.2
     session.close()
     engine.dispose()
+
+
+async def test_hybrid_filters_apply_identically_to_vector_and_graph_candidates():
+    """Filter parity: a document_id filter excludes both vector and graph
+    candidates from foreign documents identically."""
+    session, engine, document, graph_chunk, vector_chunk = _graph_session()
+    try:
+        embedding = FixedEmbeddingProvider()
+        vector = FixedVectorStore([
+            RetrievedChunk(text=graph_chunk.text, score=0.1, vector_id=graph_chunk.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": graph_chunk.id}),
+        ])
+        # filter to a non-existent document → both sides empty
+        contexts = await retrieve_contexts(
+            query="Explain User", embedding_provider=embedding,
+            vector_store=vector, session=session, mode="hybrid",
+            top_k=5, graph_max_hops=1, filters={"document_id": 999999})
+        assert contexts == []
+    finally:
+        session.close()
+        engine.dispose()
+
+
+async def test_tags_filter_membership_applies_identically_across_vector_graph_and_hybrid():
+    """F4 parity: `tags` is membership-after-split of the stored CSV in every
+    mode; the vector side must not push tags as a raw Chroma where clause."""
+    session, engine, document, graph_chunk, vector_chunk = _graph_session()
+    try:
+        document.tags = "alpha, graph ,beta"
+        session.commit()
+        embedding = FixedEmbeddingProvider()
+        vector = FixedVectorStore([
+            RetrievedChunk(text=graph_chunk.text, score=0.1, vector_id=graph_chunk.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": graph_chunk.id}),
+            RetrievedChunk(text=vector_chunk.text, score=0.2, vector_id=vector_chunk.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": vector_chunk.id}),
+        ])
+        # one scalar tag present in the split+trimmed CSV matches everywhere
+        for mode in ("vector", "graph", "hybrid"):
+            contexts = await retrieve_contexts(
+                query="Explain User", embedding_provider=embedding,
+                vector_store=vector, session=session, mode=mode,
+                top_k=5, graph_max_hops=1, filters={"tags": "graph"})
+            assert contexts, mode
+        # a tag absent from the stored CSV excludes candidates everywhere
+        for mode in ("vector", "graph", "hybrid"):
+            contexts = await retrieve_contexts(
+                query="Explain User", embedding_provider=embedding,
+                vector_store=vector, session=session, mode=mode,
+                top_k=5, graph_max_hops=1, filters={"tags": "absent"})
+            assert contexts == [], mode
+    finally:
+        session.close()
+        engine.dispose()
