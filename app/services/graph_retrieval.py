@@ -15,6 +15,14 @@ MAX_GRAPH_HOPS = 3
 MAX_SEEDS = 20
 MAX_EVIDENCE_ROWS = 5000
 MAX_RETURNED_PATHS = 50
+# Per-seed fair candidate budget (W2): every accepted seed contributes up to
+# this many candidate paths to the global deterministic sort. Plan 10A.5
+# selection semantics consider all seeds (up to MAX_SEEDS) and pick the top
+# ``limit`` (<= MAX_RETURNED_PATHS) paths by the documented sort key, so no
+# seed may be silently dropped because an earlier seed produced many paths.
+# The budget keeps total candidates bounded at MAX_SEEDS * this value while
+# preserving the plan's seed and returned-path caps.
+MAX_SEED_CANDIDATE_PATHS = MAX_RETURNED_PATHS * 4
 
 TraversalDirection = Literal["outbound", "inbound", "both"]
 
@@ -73,7 +81,47 @@ def _validate_filters(filters: dict | None) -> dict:
         raise UnsupportedGraphFilter(
             "Hybrid graph filters support only scalar document_id, title, source, and tags"
         )
+    # Validate document_id's scalar type up front: the SQL-side check in
+    # apply_document_filters is skipped when traversal short-circuits (no
+    # seeds/empty evidence), and an unsupported filter must be rejected,
+    # never silently ignored, regardless of graph content (plan 10A.6).
+    if "document_id" in filters and (
+        isinstance(filters["document_id"], bool)
+        or not isinstance(filters["document_id"], int)
+    ):
+        raise UnsupportedGraphFilter(
+            "document_id filter must be an integer; booleans and "
+            "non-integer forms are rejected"
+        )
     return filters
+
+
+def split_document_tags(stored_tags: str | None) -> list[str]:
+    """Split stored comma-separated document tags and trim whitespace.
+
+    Plan 10A.5 scalar filter matrix: ``tags`` is "one scalar tag; exact
+    membership after splitting stored comma-separated tags and trimming
+    whitespace". Empty elements are dropped. Mirrors the split performed by
+    ``Chunk.get_chunk_metadata`` and is shared by graph retrieval and vector
+    hydration so every side applies identical semantics.
+    """
+    if not stored_tags:
+        return []
+    return [tag.strip() for tag in stored_tags.split(",") if tag.strip()]
+
+
+def document_ids_matching_tag(session: Session, tag: str) -> list[int]:
+    """Return sorted ids of documents whose split+trimmed tags contain ``tag``."""
+    rows = (
+        session.query(models.Document.id, models.Document.tags)
+        .filter(models.Document.tags.isnot(None))
+        .all()
+    )
+    return sorted(
+        document_id
+        for document_id, stored_tags in rows
+        if tag in split_document_tags(stored_tags)
+    )
 
 
 def retrieve_graph_contexts(
@@ -127,18 +175,7 @@ def retrieve_graph_contexts(
         )
         .filter(models.Document.ingestion_status == "ready")
     )
-    if "document_id" in filters:
-        try:
-            document_id = int(filters["document_id"])
-        except (TypeError, ValueError) as exc:
-            raise UnsupportedGraphFilter("document_id filter must be an integer") from exc
-        evidence_query = evidence_query.filter(models.Document.id == document_id)
-    if "title" in filters:
-        evidence_query = evidence_query.filter(models.Document.title == str(filters["title"]))
-    if "source" in filters:
-        evidence_query = evidence_query.filter(models.Document.source == str(filters["source"]))
-    if "tags" in filters:
-        evidence_query = evidence_query.filter(models.Document.tags == str(filters["tags"]))
+    evidence_query = apply_document_filters(evidence_query, filters, session)
 
     evidence_rows = evidence_query.limit(MAX_EVIDENCE_ROWS + 1).all()
     if len(evidence_rows) > MAX_EVIDENCE_ROWS:
@@ -229,22 +266,34 @@ def retrieve_graph_contexts(
 # ---------------------------------------------------------------------------
 
 
-def _apply_path_filters(query, filters: dict | None):
-    """Apply the scalar document filters to a ready-document evidence query."""
+def apply_document_filters(query, filters: dict | None, session: Session):
+    """Apply the plan 10A.5 scalar filter matrix to a Document-joined query.
+
+    ``document_id`` is integer equality with booleans and non-integer forms
+    (strings like ``"7"``, floats like ``7.0``) rejected rather than coerced
+    (W5), ``title`` and ``source`` are exact case-sensitive SQL equality, and
+    ``tags`` is exact membership after splitting the stored comma-separated
+    tags and trimming whitespace. Shared by graph traversal and vector
+    hydration so identical filter values yield identical candidate semantics
+    on both sides.
+    """
+    if not filters:
+        return query
     if "document_id" in filters:
-        try:
-            document_id = int(filters["document_id"])
-        except (TypeError, ValueError) as exc:
-            raise UnsupportedGraphFilter("document_id filter must be an integer") from exc
-        if isinstance(filters["document_id"], bool):
-            raise UnsupportedGraphFilter("document_id filter rejects booleans")
+        document_id = filters["document_id"]
+        if isinstance(document_id, bool) or not isinstance(document_id, int):
+            raise UnsupportedGraphFilter(
+                "document_id filter must be an integer; booleans and "
+                "non-integer forms are rejected"
+            )
         query = query.filter(models.Document.id == document_id)
     if "title" in filters:
         query = query.filter(models.Document.title == str(filters["title"]))
     if "source" in filters:
         query = query.filter(models.Document.source == str(filters["source"]))
     if "tags" in filters:
-        query = query.filter(models.Document.tags == str(filters["tags"]))
+        matching_ids = document_ids_matching_tag(session, str(filters["tags"]))
+        query = query.filter(models.Document.id.in_(matching_ids))
     return query
 
 
@@ -263,7 +312,7 @@ def _ready_evidence_rows(session: Session, filters: dict):
         )
         .filter(models.Document.ingestion_status == "ready")
     )
-    query = _apply_path_filters(query, filters)
+    query = apply_document_filters(query, filters, session)
     return query.all()
 
 
@@ -293,7 +342,7 @@ def resolve_graph_seeds(
             .filter(models.GraphExtraction.chunk_id.in_(seed_chunk_ids))
             .filter(models.Document.ingestion_status == "ready")
         )
-        mentioned = _apply_path_filters(mentioned, filters or {})
+        mentioned = apply_document_filters(mentioned, filters or {}, session)
         seeds.update(entity_id for (entity_id,) in mentioned.distinct().all())
     if len(seeds) > MAX_SEEDS:
         raise GraphTraversalLimitError(
@@ -391,11 +440,14 @@ def retrieve_graph_paths(
             )
         )
 
+    # Every accepted seed (<= MAX_SEEDS) contributes candidates to the global
+    # sort; a seed is never silently dropped because an earlier seed produced
+    # many paths (W2). Boundedness comes from the per-seed budget inside
+    # _bfs_paths, so the worst case is MAX_SEEDS * MAX_SEED_CANDIDATE_PATHS
+    # candidates before the deterministic sort selects min(limit, 50).
     paths: list[GraphPath] = []
     for seed in seeds:
         paths.extend(_bfs_paths(seed, max_hops, direction, evidence_by_source))
-        if len(paths) > MAX_RETURNED_PATHS * 4:
-            break
 
     # Deduplicate by ordered evidence-ID sequence.
     seen: set[tuple[int, ...]] = set()
@@ -425,16 +477,25 @@ def _bfs_paths(
     direction: TraversalDirection,
     evidence_by_source: dict[int, list[models.GraphEdgeEvidence]],
 ) -> list[GraphPath]:
-    """Breadth-first expansion from ``seed`` yielding complete GraphPath objects."""
+    """Breadth-first expansion from ``seed`` yielding complete GraphPath objects.
+
+    Results are capped at ``MAX_SEED_CANDIDATE_PATHS`` per seed (W2 fair
+    budget). The cap is deterministic because both the per-entity evidence
+    lists and the FIFO queue are explored in sorted order.
+    """
     results: list[GraphPath] = []
     # Each frontier item: (current_entity, steps_so_far, visited_edges, visited_entities)
     initial = (seed, [], set(), {seed})
     queue: deque = deque([initial])
     while queue:
+        if len(results) >= MAX_SEED_CANDIDATE_PATHS:
+            break
         current, steps, visited_edges, visited_entities = queue.popleft()
         if len(steps) >= max_hops:
             continue
         for evidence in evidence_by_source.get(current, []):
+            if len(results) >= MAX_SEED_CANDIDATE_PATHS:
+                break
             if evidence.id in visited_edges:
                 continue
             edge = evidence.edge

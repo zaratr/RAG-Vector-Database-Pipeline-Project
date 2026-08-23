@@ -1,5 +1,7 @@
 """Production-path tests for Alembic schema migrations."""
 from __future__ import annotations
+import hashlib
+import json
 
 import os
 import shutil
@@ -23,7 +25,13 @@ from app.persistence import models
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
 BASELINE_REVISION = "dee48bc24a7f"
+GRAPH_REVISION = "4c9a8d7e6f5b"
+# Merged chain head: the 10C safety-review revision d9 on top of the 10B
+# security/provenance revision c8, which sits on the 10A.3 b7 lifecycle
+# rebuild of graph_extractions.
 REVISION = "d9b5f7c1e4a3"
+PREDECESSOR_HEAD = "a6e2c4f8b1d9"
+NEW_HEAD = "b7f3d5a9c2e1"
 HEAD_TABLES = {
     "alembic_version",
     "chunks",
@@ -1098,3 +1106,725 @@ def test_d9_provenance_check_rejects_wrong_scope_column_combination(tmp_path):
                 "'safety-v1', 'det-1', 'skipped', 'audit-1', 1)"
             ), {"sha": sha})
     engine.dispose()
+
+
+def test_b7_migration_advances_head_from_a6_to_b7(tmp_path):
+    """Requirement 8: existing a6... database upgrades to b7... with all rows preserved."""
+    db_url = _db_url(tmp_path / "upgrade.db")
+    command.upgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            'INSERT INTO chunks (id, document_id, "index", text, start_offset, end_offset, vector_id) '
+            "VALUES (1, 1, 0, 'preserved text', 0, 14, 'chunk:1')"
+        ))
+        conn.execute(text(
+            'INSERT INTO graph_extractions (id, chunk_id, provider, model, '
+            'prompt_version, schema_version, status, created_at) '
+            "VALUES (1, 1, 'ollama', 'gemma4', 'graph-v1', 'graph-relations-v1', 'succeeded', '2026-01-01')"
+        ))
+    engine.dispose()
+
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+
+    engine = create_engine(db_url)
+    assert _revision(engine) == NEW_HEAD
+
+    with engine.connect() as conn:
+        chunk = conn.execute(text("SELECT text FROM chunks WHERE id = 1")).one()
+        assert chunk[0] == "preserved text"
+
+        ext = conn.execute(text(
+            "SELECT status, input_sha256, attempt_count, is_identity_owner "
+            "FROM graph_extractions WHERE id = 1"
+        )).one()
+        assert ext[0] == "succeeded"
+        assert ext[1] is not None and len(ext[1]) == 64
+        assert ext[2] == 1
+        assert ext[3] == 1
+
+    engine.dispose()
+
+
+
+def test_b7_migration_adds_input_sha256_column_to_graph_extractions(tmp_path):
+    db_url = _db_url(tmp_path / "schema.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    insp = inspect(engine)
+
+    cols = {c["name"]: c for c in insp.get_columns("graph_extractions")}
+    assert "input_sha256" in cols
+    assert cols["input_sha256"]["nullable"] is False
+    assert str(cols["input_sha256"]["type"]) == "VARCHAR(64)"
+
+    engine.dispose()
+
+
+def test_b7_migration_adds_attempt_count_column_with_check(tmp_path):
+    db_url = _db_url(tmp_path / "schema.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    insp = inspect(engine)
+
+    cols = {c["name"]: c for c in insp.get_columns("graph_extractions")}
+    assert "attempt_count" in cols
+    assert cols["attempt_count"]["nullable"] is False
+
+    checks = {c["sqltext"] for c in insp.get_check_constraints("graph_extractions")}
+    assert any("attempt_count >= 0" in c for c in checks)
+
+    engine.dispose()
+
+
+def test_b7_migration_adds_completed_at_and_attempt_started_at_columns(tmp_path):
+    db_url = _db_url(tmp_path / "schema.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    insp = inspect(engine)
+
+    cols = {c["name"] for c in insp.get_columns("graph_extractions")}
+    assert "completed_at" in cols
+    assert "attempt_started_at" in cols
+
+    engine.dispose()
+
+
+def test_b7_migration_adds_is_identity_owner_column_with_check(tmp_path):
+    db_url = _db_url(tmp_path / "schema.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    insp = inspect(engine)
+
+    cols = {c["name"]: c for c in insp.get_columns("graph_extractions")}
+    assert "is_identity_owner" in cols
+    assert cols["is_identity_owner"]["nullable"] is False
+
+    checks = {c["sqltext"] for c in insp.get_check_constraints("graph_extractions")}
+    assert any("is_identity_owner IN (0,1)" in c for c in checks)
+
+    engine.dispose()
+
+
+def test_b7_migration_adds_skipped_to_status_check(tmp_path):
+    db_url = _db_url(tmp_path / "schema.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    insp = inspect(engine)
+
+    checks = {c["sqltext"] for c in insp.get_check_constraints("graph_extractions")}
+    status_check = next(c for c in checks if "status" in c and "pending" in c)
+    assert "skipped" in status_check
+
+    engine.dispose()
+
+
+def test_b7_migration_adds_partial_unique_index_for_identity_owner(tmp_path):
+    db_url = _db_url(tmp_path / "schema.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    insp = inspect(engine)
+
+    indexes = {i["name"]: i for i in insp.get_indexes("graph_extractions")}
+    assert "uq_graph_extractions_identity_owner" in indexes
+    # The SQLite inspector reports uniqueness as 0/1, matching this file's
+    # established index-assertion convention.
+    assert indexes["uq_graph_extractions_identity_owner"]["unique"] == 1
+
+    engine.dispose()
+
+
+def test_b7_migration_adds_media_type_to_chunks(tmp_path):
+    db_url = _db_url(tmp_path / "schema.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    insp = inspect(engine)
+
+    cols = {c["name"]: c for c in insp.get_columns("chunks")}
+    assert "media_type" in cols
+    assert cols["media_type"]["nullable"] is False
+
+    engine.dispose()
+
+
+def test_b7_migration_backfills_existing_chunk_media_type_to_text_plain(tmp_path):
+    db_url = _db_url(tmp_path / "backfill.db")
+    command.upgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset) "
+            "VALUES (1, 1, 0, 'text', 0, 4)"
+        ))
+    engine.dispose()
+
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+    engine = create_engine(db_url)
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT media_type FROM chunks WHERE id = 1")).one()
+        assert result[0] == "text/plain"
+    engine.dispose()
+
+
+def test_b7_migration_backfills_input_sha256_from_chunk_text(tmp_path):
+    db_url = _db_url(tmp_path / "backfill-sha.db")
+    command.upgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+    chunk_text = "Alice works at Acme Corp."
+    expected_sha = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()
+
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset) "
+            "VALUES (1, 1, 0, :text, 0, :len)"
+        ), {"text": chunk_text, "len": len(chunk_text)})
+        conn.execute(text(
+            "INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+            "prompt_version, schema_version, status, created_at) "
+            "VALUES (1, 1, 'ollama', 'gemma4', 'v1', 's1', 'succeeded', '2026-01-01')"
+        ))
+    engine.dispose()
+
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+    engine = create_engine(db_url)
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT input_sha256 FROM graph_extractions WHERE id = 1")).one()
+        assert result[0] == expected_sha
+    engine.dispose()
+
+
+@pytest.mark.parametrize("predecessor_status", ["succeeded", "empty", "failed", "pending"])
+def test_b7_migration_preserves_each_predecessor_status_row(tmp_path, predecessor_status):
+    """Requirement 11: one fixture per valid predecessor status upgrades correctly."""
+    db_url = _db_url(tmp_path / f"status-{predecessor_status}.db")
+    command.upgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset) "
+            "VALUES (1, 1, 0, 'text content', 0, 12)"
+        ))
+        if predecessor_status == "failed":
+            columns = "status, error_code, created_at"
+            values = f"'{predecessor_status}', 'predecessor_error', '2026-01-01'"
+        else:
+            columns = "status, created_at"
+            values = f"'{predecessor_status}', '2026-01-01'"
+        conn.execute(text(
+            f"INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+            f"prompt_version, schema_version, {columns}) "
+            f"VALUES (1, 1, 'ollama', 'gemma4', 'v1', 's1', {values})"
+        ))
+    engine.dispose()
+
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+    engine = create_engine(db_url)
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT status, input_sha256, attempt_count, completed_at, is_identity_owner "
+            "FROM graph_extractions WHERE id = 1"
+        )).one()
+        assert row[0] == predecessor_status
+        assert row[1] is not None and len(row[1]) == 64
+        assert row[2] == 1
+        assert row[4] == 1  # single row is owner
+
+        if predecessor_status == "pending":
+            assert row[3] is None  # completed_at NULL for pending
+        else:
+            assert row[3] is not None  # terminal has completed_at
+
+    engine.dispose()
+
+
+def test_b7_migration_assigns_synthetic_error_to_failed_with_null_error_code(tmp_path):
+    """Predecessor failed row with NULL error_code gets synthetic code."""
+    db_url = _db_url(tmp_path / "failed-null-err.db")
+    command.upgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset) "
+            "VALUES (1, 1, 0, 'text', 0, 4)"
+        ))
+        conn.execute(text(
+            "INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+            "prompt_version, schema_version, status, created_at) "
+            "VALUES (1, 1, 'ollama', 'gemma4', 'v1', 's1', 'failed', '2026-01-01')"
+        ))
+    engine.dispose()
+
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+    engine = create_engine(db_url)
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT error_code, error_detail FROM graph_extractions WHERE id = 1"
+        )).one()
+        assert row[0] is not None
+        assert row[0] == "predecessor_failed"
+        # Plan conversion matrix: the synthetic detail accompanies the synthetic code.
+        assert row[1] == "unknown pre-b7 failure"
+    engine.dispose()
+
+
+def test_b7_migration_clears_error_fields_for_terminal_predecessor_rows(tmp_path):
+    """Plan conversion matrix: succeeded/empty rows must end with BOTH error fields NULL."""
+    db_url = _db_url(tmp_path / "terminal-error-clear.db")
+    command.upgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset) "
+            "VALUES (1, 1, 0, 'text', 0, 4)"
+        ))
+        for row_id, status in ((1, "succeeded"), (2, "empty")):
+            conn.execute(text(
+                f"INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+                f"prompt_version, schema_version, status, error_code, error_detail, created_at) "
+                f"VALUES ({row_id}, 1, 'ollama', 'gemma{row_id}', 'v1', 's{row_id}', "
+                f"'{status}', 'stale_code', 'stale detail', '2026-01-01')"
+            ))
+    engine.dispose()
+
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+    engine = create_engine(db_url)
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT error_code, error_detail FROM graph_extractions ORDER BY id"
+        )).fetchall()
+        assert rows == [(None, None), (None, None)]
+    engine.dispose()
+
+
+def test_b7_migration_collision_group_selects_owner_by_precedence(tmp_path):
+    """Multiple rows with same identity → one owner by succeeded > empty > failed > pending."""
+    db_url = _db_url(tmp_path / "collision.db")
+    command.upgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset) "
+            "VALUES (1, 1, 0, 'same text', 0, 9)"
+        ))
+        for i, status in enumerate(["failed", "empty", "succeeded", "pending"]):
+            conn.execute(text(
+                f"INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+                f"prompt_version, schema_version, status, created_at) "
+                f"VALUES ({i + 1}, 1, 'ollama', 'gemma4', 'v1', 's1', '{status}', '2026-01-0{i + 1}')"
+            ))
+    engine.dispose()
+
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+    engine = create_engine(db_url)
+    with engine.connect() as conn:
+        owners = conn.execute(text(
+            "SELECT id, status, is_identity_owner FROM graph_extractions "
+            "WHERE is_identity_owner = 1 ORDER BY id"
+        )).fetchall()
+        assert len(owners) == 1
+        assert owners[0][1] == "succeeded"  # highest precedence wins
+
+        non_owners = conn.execute(text(
+            "SELECT count(*) FROM graph_extractions WHERE is_identity_owner = 0"
+        )).scalar()
+        assert non_owners == 3
+    engine.dispose()
+
+
+def test_b7_downgrade_refused_when_skipped_rows_exist(tmp_path):
+    """Requirement 9: downgrade refused with 'downgrade_skipped_rows_present'."""
+    db_url = _db_url(tmp_path / "downgrade-skip.db")
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset, media_type) "
+            "VALUES (1, 1, 0, 'text', 0, 4, 'text/plain')"
+        ))
+        conn.execute(text(
+            "INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+            "prompt_version, schema_version, status, input_sha256, "
+            "attempt_count, completed_at, error_code, is_identity_owner) "
+            "VALUES (1, 1, 'ollama', 'gemma4', 'v1', 's1', 'skipped', "
+            ":sha, 0, '2026-01-01', 'extraction_disabled', 1)"
+        ), {"sha": "a" * 64})
+    engine.dispose()
+
+    with pytest.raises(Exception, match="downgrade_skipped_rows_present"):
+        command.downgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+
+
+def test_b7_downgrade_after_skipped_removal_preserves_predecessor_schema(tmp_path):
+    """After removing skipped rows, downgrade restores predecessor schema."""
+    db_url = _db_url(tmp_path / "downgrade-clean.db")
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset, media_type) "
+            "VALUES (1, 1, 0, 'text', 0, 4, 'text/plain')"
+        ))
+        conn.execute(text(
+            "INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+            "prompt_version, schema_version, status, input_sha256, "
+            "attempt_count, completed_at, is_identity_owner) "
+            "VALUES (1, 1, 'ollama', 'gemma4', 'v1', 's1', 'succeeded', "
+            ":sha, 1, '2026-01-01', 1)"
+        ), {"sha": "a" * 64})
+    engine.dispose()
+
+    command.downgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+
+    engine = create_engine(db_url)
+    insp = inspect(engine)
+    cols = {c["name"] for c in insp.get_columns("graph_extractions")}
+    assert "input_sha256" not in cols
+    assert "is_identity_owner" not in cols
+    assert _revision(engine) == PREDECESSOR_HEAD
+
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT status FROM graph_extractions WHERE id = 1")).one()
+        assert row[0] == "succeeded"
+    engine.dispose()
+
+
+def test_b7_reupgrade_after_downgrade_is_lossless(tmp_path):
+    """Downgrade then re-upgrade preserves all rows."""
+    db_url = _db_url(tmp_path / "reupgrade.db")
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset, media_type) "
+            "VALUES (1, 1, 0, 'preserved', 0, 9, 'text/plain')"
+        ))
+        conn.execute(text(
+            "INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+            "prompt_version, schema_version, status, input_sha256, "
+            "attempt_count, completed_at, is_identity_owner) "
+            "VALUES (1, 1, 'ollama', 'gemma4', 'v1', 's1', 'succeeded', "
+            ":sha, 1, '2026-01-01', 1)"
+        ), {"sha": "a" * 64})
+    engine.dispose()
+
+    command.downgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+
+    engine = create_engine(db_url)
+    with engine.connect() as conn:
+        chunk = conn.execute(text("SELECT text FROM chunks WHERE id = 1")).one()
+        assert chunk[0] == "preserved"
+        ext = conn.execute(text("SELECT status FROM graph_extractions WHERE id = 1")).one()
+        assert ext[0] == "succeeded"
+    engine.dispose()
+
+
+def test_b7_orm_metadata_matches_migrated_physical_schema(tmp_path):
+    """Requirement 10: ORM metadata matches migrated schema exactly."""
+    db_url = _db_url(tmp_path / "metadata-match.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+
+    from app.persistence.models import GraphExtraction, Chunk
+    from app.core.db import Base
+
+    migrated_insp = inspect(engine)
+
+    # Check graph_extractions columns match ORM
+    orm_cols = {c.name for c in GraphExtraction.__table__.columns}
+    migrated_cols = {c["name"] for c in migrated_insp.get_columns("graph_extractions")}
+    assert orm_cols == migrated_cols
+
+    # Check chunks has media_type
+    chunk_cols = {c.name for c in Chunk.__table__.columns}
+    migrated_chunk_cols = {c["name"] for c in migrated_insp.get_columns("chunks")}
+    assert chunk_cols == migrated_chunk_cols
+
+    engine.dispose()
+
+
+def test_b7_migration_fails_on_unrecognized_predecessor_status(tmp_path):
+    """F2c: rows with a status outside the predecessor enum must fail the upgrade
+    explicitly (no silent coercion), leaving the database untouched."""
+    db_url = _db_url(tmp_path / "unknown-status.db")
+    command.upgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+
+    database_path = tmp_path / "unknown-status.db"
+    with sqlite3.connect(database_path) as connection:
+        # Simulate a drifted predecessor whose status CHECK was stripped so that
+        # an unrecognized status row exists in practice.
+        connection.execute("ALTER TABLE graph_extractions RENAME TO ge_drift")
+        connection.execute(
+            "CREATE TABLE graph_extractions ("
+            "id INTEGER NOT NULL, chunk_id INTEGER NOT NULL, "
+            "provider VARCHAR(100) NOT NULL, model VARCHAR(255) NOT NULL, "
+            "prompt_version VARCHAR(50) NOT NULL, schema_version VARCHAR(50) NOT NULL, "
+            "status VARCHAR(20) NOT NULL, error_code VARCHAR(100), error_detail TEXT, "
+            "created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, "
+            "PRIMARY KEY (id), "
+            "FOREIGN KEY(chunk_id) REFERENCES chunks (id) ON DELETE CASCADE)"
+        )
+        connection.execute(
+            "INSERT INTO graph_extractions SELECT * FROM ge_drift"
+        )
+        connection.execute("DROP TABLE ge_drift")
+        connection.execute("CREATE INDEX ix_graph_extractions_id ON graph_extractions (id)")
+        connection.execute(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset) "
+            "VALUES (1, 1, 0, 'text', 0, 4)"
+        )
+        connection.execute(
+            "INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+            "prompt_version, schema_version, status, created_at) "
+            "VALUES (1, 1, 'ollama', 'gemma4', 'v1', 's1', 'mystery', '2026-01-01')"
+        )
+
+    with pytest.raises(RuntimeError, match="unrecognized status"):
+        command.upgrade(_alembic_config(db_url), NEW_HEAD)
+
+    # The failed upgrade must leave the database at the predecessor state.
+    engine = create_engine(db_url)
+    assert _revision(engine) == PREDECESSOR_HEAD
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT status FROM graph_extractions WHERE id = 1"
+        )).one()
+        assert row[0] == "mystery"
+        leftover = conn.execute(text(
+            "SELECT count(*) FROM sqlite_master WHERE name LIKE '_b7%'"
+        )).scalar()
+        assert leftover == 0
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("status", "input_sha256", "attempt_count", "completed_at", "error_code"),
+    [
+        ("pending", "a" * 64, 1, "2026-01-01", None),          # pending must have NULL completed_at
+        ("succeeded", "a" * 64, 1, None, None),                # succeeded requires completed_at
+        ("empty", "b" * 64, 1, None, None),                    # empty requires completed_at
+        ("failed", "c" * 64, 1, "2026-01-01", None),           # failed requires error_code
+        ("skipped", "d" * 64, 1, "2026-01-01", "extraction_disabled"),  # skipped requires attempt_count = 0
+        ("skipped", "e" * 64, 0, "2026-01-01", "bogus_reason"),  # skipped reason must be whitelisted
+    ],
+)
+def test_b7_migrated_schema_rejects_lifecycle_violations(
+    tmp_path, status, input_sha256, attempt_count, completed_at, error_code
+):
+    """W4: the migrated table enforces the plan's exact per-status lifecycle CHECKs."""
+    db_url = _db_url(tmp_path / f"lifecycle-{status}-{attempt_count}-{completed_at}.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset) "
+            "VALUES (1, 1, 0, 'text', 0, 4)"
+        ))
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO graph_extractions (chunk_id, provider, model, "
+                    "prompt_version, schema_version, status, input_sha256, "
+                    "attempt_count, completed_at, error_code, is_identity_owner) "
+                    "VALUES (1, 'ollama', 'gemma4', 'v1', 's1', :status, :sha, "
+                    ":attempts, :completed, :code, 1)"
+                ),
+                {
+                    "status": status,
+                    "sha": input_sha256,
+                    "attempts": attempt_count,
+                    "completed": completed_at,
+                    "code": error_code,
+                },
+            )
+    engine.dispose()
+
+
+def test_b7_mid_upgrade_failure_rolls_back_completely_and_retry_succeeds(tmp_path):
+    """BD-1: a data-driven failure after the staging swap must roll back the
+    entire upgrade atomically, and a retry after the data fix must succeed.
+
+    The genuine failure condition is an orphan graph_extractions row (FK
+    enforcement is off by default in raw sqlite3), which makes the migration's
+    post-swap PRAGMA foreign_key_check assertion fail after the DROP/RENAME.
+    """
+    db_path = tmp_path / "atomic-rollback.db"
+    db_url = _db_url(db_path)
+    command.upgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset) "
+            "VALUES (1, 1, 0, 'kept text', 0, 9)"
+        ))
+        conn.execute(text(
+            "INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+            "prompt_version, schema_version, status, created_at) "
+            "VALUES (1, 1, 'ollama', 'gemma4', 'v1', 's1', 'succeeded', '2026-01-01')"
+        ))
+    engine.dispose()
+
+    with sqlite3.connect(db_path) as raw:
+        raw.execute(
+            "INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+            "prompt_version, schema_version, status, created_at) "
+            "VALUES (2, 999, 'ollama', 'gemma4', 'v1', 's1', 'pending', '2026-01-02')"
+        )
+
+    with pytest.raises(RuntimeError, match="foreign_key_check"):
+        command.upgrade(_alembic_config(db_url), NEW_HEAD)
+
+    engine = create_engine(db_url)
+    assert _revision(engine) == PREDECESSOR_HEAD
+    with engine.connect() as conn:
+        # No staging leftovers of any kind.
+        leftovers = conn.execute(text(
+            "SELECT name FROM sqlite_master WHERE substr(name, 1, 3) = '_b7'"
+        )).fetchall()
+        assert leftovers == []
+
+        # Predecessor schema fully restored: new columns absent.
+        cols = {r[1] for r in conn.execute(text("PRAGMA table_info(graph_extractions)"))}
+        assert "input_sha256" not in cols
+        assert "is_identity_owner" not in cols
+
+        # The chunks batch add rolled back too.
+        chunk_cols = {r[1] for r in conn.execute(text("PRAGMA table_info(chunks)"))}
+        assert "media_type" not in chunk_cols
+
+        # Data intact, including the orphan row that caused the failure.
+        statuses = conn.execute(text(
+            "SELECT id, status FROM graph_extractions ORDER BY id"
+        )).fetchall()
+        assert statuses == [(1, "succeeded"), (2, "pending")]
+        chunk_text = conn.execute(text("SELECT text FROM chunks WHERE id = 1")).one()
+        assert chunk_text[0] == "kept text"
+    engine.dispose()
+
+    # Recovery: the operator removes the orphan; the retry upgrades losslessly.
+    with sqlite3.connect(db_path) as raw:
+        raw.execute("DELETE FROM graph_extractions WHERE id = 2")
+
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+
+    engine = create_engine(db_url)
+    assert _revision(engine) == NEW_HEAD
+    with engine.connect() as conn:
+        ext = conn.execute(text(
+            "SELECT status, attempt_count, is_identity_owner FROM graph_extractions WHERE id = 1"
+        )).one()
+        assert tuple(ext) == ("succeeded", 1, 1)
+        media_type = conn.execute(text("SELECT media_type FROM chunks WHERE id = 1")).one()
+        assert media_type[0] == "text/plain"
+    engine.dispose()
+
+
+def test_export_unrepresentable_rows_exports_skipped_rows_preserving_database(
+    tmp_path, capsys
+):
+    """Plan B-14 (10A.3 half): the b7 downgrade-refusal export is deterministic,
+    exports exactly the skipped rows, and preserves every database row."""
+    from scripts.export_unrepresentable_rows import export_unrepresentable_rows
+
+    db_path = tmp_path / "export.db"
+    db_url = _db_url(db_path)
+    command.upgrade(_alembic_config(db_url), NEW_HEAD)
+
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO chunks (id, document_id, \"index\", text, start_offset, end_offset, media_type) "
+            "VALUES (1, 1, 0, 'text', 0, 4, 'text/plain')"
+        ))
+        conn.execute(text(
+            "INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+            "prompt_version, schema_version, status, input_sha256, "
+            "attempt_count, completed_at, error_code, is_identity_owner) "
+            "VALUES (1, 1, 'ollama', 'gemma4', 'v1', 's1', 'succeeded', "
+            ":sha, 1, '2026-01-01', NULL, 1)"
+        ), {"sha": "a" * 64})
+        conn.execute(text(
+            "INSERT INTO graph_extractions (id, chunk_id, provider, model, "
+            "prompt_version, schema_version, status, input_sha256, "
+            "attempt_count, completed_at, error_code, is_identity_owner) "
+            "VALUES (2, 1, 'ollama', 'gemma4', 'v2', 's2', 'skipped', "
+            ":sha, 0, '2026-01-02', 'extraction_disabled', 1), "
+            "(3, 1, 'ollama', 'gemma4', 'v3', 's3', 'skipped', "
+            ":sha, 0, '2026-01-03', 'unsupported_media_type', 1)"
+        ), {"sha": "b" * 64})
+    engine.dispose()
+
+    output_path = tmp_path / "unrepresentable.json"
+    payload = export_unrepresentable_rows(
+        database_url=db_url,
+        revision=NEW_HEAD,
+        output_path=output_path,
+    )
+
+    # Exactly the skipped rows, deterministically ordered by id.
+    assert payload["revision"] == NEW_HEAD
+    assert payload["row_count"] == 2
+    assert [row["id"] for row in payload["rows"]] == [2, 3]
+    assert all(row["status"] == "skipped" for row in payload["rows"])
+
+    document = output_path.read_text(encoding="utf-8")
+    assert document == json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    assert document.endswith("\n") and "\r" not in document
+
+    # Determinism: a second export produces byte-identical output.
+    second_path = tmp_path / "unrepresentable-again.json"
+    export_unrepresentable_rows(
+        database_url=db_url, revision=NEW_HEAD, output_path=second_path
+    )
+    assert second_path.read_bytes() == output_path.read_bytes()
+
+    # Dry-run prints the payload without writing a file.
+    dry_run_path = tmp_path / "dry-run.json"
+    dry_payload = export_unrepresentable_rows(
+        database_url=db_url, revision=NEW_HEAD, output_path=dry_run_path, dry_run=True
+    )
+    assert dry_payload == payload
+    assert not dry_run_path.exists()
+    assert capsys.readouterr().out == document
+
+    engine = create_engine(db_url)
+    with engine.connect() as conn:
+        # Preservation: the export mutates nothing; every row survives, so the
+        # downgrade still refuses.
+        rows = conn.execute(text(
+            "SELECT id, status FROM graph_extractions ORDER BY id"
+        )).fetchall()
+    assert rows == [(1, "succeeded"), (2, "skipped"), (3, "skipped")]
+    engine.dispose()
+
+    with pytest.raises(Exception, match="downgrade_skipped_rows_present"):
+        command.downgrade(_alembic_config(db_url), PREDECESSOR_HEAD)
+
+
+@pytest.mark.parametrize(
+    ("revision", "database_at"),
+    [
+        ("c8a4e6b0d3f2", NEW_HEAD),   # unsupported revision
+        (NEW_HEAD, PREDECESSOR_HEAD),  # database not at the selected revision
+    ],
+)
+def test_export_unrepresentable_rows_requires_explicit_revision_match(
+    tmp_path, revision, database_at
+):
+    from scripts.export_unrepresentable_rows import ExportError, export_unrepresentable_rows
+
+    db_url = _db_url(tmp_path / "revision-guard.db")
+    command.upgrade(_alembic_config(db_url), database_at)
+
+    with pytest.raises(ExportError):
+        export_unrepresentable_rows(
+            database_url=db_url,
+            revision=revision,
+            output_path=tmp_path / "never-written.json",
+        )
+    assert not (tmp_path / "never-written.json").exists()

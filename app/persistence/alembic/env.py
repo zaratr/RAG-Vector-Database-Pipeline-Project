@@ -6,7 +6,7 @@ from logging.config import fileConfig
 from pathlib import Path
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, event, pool
 
 # Ensure the project root is on sys.path so app.* imports work
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -48,10 +48,27 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
 
+    is_sqlite = connectable.dialect.name == "sqlite"
+    if is_sqlite:
+        # SQLAlchemy pysqlite transactional-DDL recipe: the driver's legacy
+        # isolation opens a transaction only before DML, which leaves every
+        # CREATE/ALTER/DROP running in autocommit. Switch the DBAPI to
+        # autocommit and issue an explicit BEGIN when SQLAlchemy starts a
+        # transaction, so alembic's migration transaction covers DDL and DML
+        # alike and a mid-migration failure rolls back atomically.
+        @event.listens_for(connectable, "connect")
+        def _sqlite_transactional_connect(dbapi_connection, connection_record):
+            dbapi_connection.isolation_level = None
+
+        @event.listens_for(connectable, "begin")
+        def _sqlite_transactional_begin(connection):
+            connection.exec_driver_sql("BEGIN")
+
     with connectable.connect() as connection:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
+            transactional_ddl=is_sqlite,
         )
         with context.begin_transaction():
             context.run_migrations()

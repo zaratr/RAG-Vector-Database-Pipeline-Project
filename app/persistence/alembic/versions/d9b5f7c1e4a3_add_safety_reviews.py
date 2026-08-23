@@ -9,9 +9,10 @@ Task 10C.4 sole forward owner of all 10C physical changes:
 * creates ``safety_review_runs`` and ``safety_findings`` with the exact
   columns/checks/indexes/partial uniques of the 10C.4 contract;
 * deterministically rebuilds ``graph_extractions`` with the exact b7 layout
-  but adds the closed skip-reason vocabulary
-  ``extraction_disabled|unsupported_media_type|safety_blocked`` (skipped rows
-  require ``attempt_count = 0``);
+  including the plan-exact ``ck_graph_extractions_lifecycle`` CHECK, extended
+  only in its skipped branch by the closed skip-reason vocabulary addition
+  ``safety_blocked`` (skipped rows still require ``completed_at IS NOT NULL``
+  and ``attempt_count = 0``);
 * deterministically rebuilds ``retrieval_candidate_decisions`` with the exact
   c8 layout but expands the decision vocabulary to include
   ``rejected_safety``.
@@ -63,19 +64,51 @@ _GE_COMMON_CONSTRAINTS = (
     "    CONSTRAINT ck_graph_extractions_attempt_count CHECK "
     "(attempt_count >= 0),\n"
     "    CONSTRAINT ck_graph_extractions_is_identity_owner CHECK "
-    "(is_identity_owner IN (0, 1)),\n"
+    "(is_identity_owner IN (0,1)),\n"
     "    CONSTRAINT ck_graph_extractions_input_sha256_hex CHECK "
     "(length(input_sha256) = 64 AND input_sha256 NOT GLOB '*[^0-9a-f]*')"
 )
 
-_GE_SKIP_CONSTRAINT_D9 = (
-    ",\n    CONSTRAINT ck_graph_extractions_skip_reason CHECK "
-    "(status != 'skipped' OR (error_code IN ('extraction_disabled', "
-    "'unsupported_media_type', 'safety_blocked') AND attempt_count = 0))"
+# b7's plan-exact lifecycle CHECK (W4), restored verbatim by the downgrade.
+# Token-identical to b7f3d5a9c2e1's ``_LIFECYCLE_CHECK_SQL``.
+_GE_LIFECYCLE_B7 = (
+    ",\n    CONSTRAINT ck_graph_extractions_lifecycle CHECK "
+    "(CASE status "
+    "WHEN 'pending' THEN completed_at IS NULL AND error_code IS NULL "
+    "AND error_detail IS NULL AND attempt_count >= 1 "
+    "WHEN 'succeeded' THEN completed_at IS NOT NULL AND error_code IS NULL "
+    "AND error_detail IS NULL AND attempt_count >= 1 "
+    "WHEN 'empty' THEN completed_at IS NOT NULL AND error_code IS NULL "
+    "AND error_detail IS NULL AND attempt_count >= 1 "
+    "WHEN 'failed' THEN completed_at IS NOT NULL AND error_code IS NOT NULL "
+    "AND attempt_count >= 1 "
+    "WHEN 'skipped' THEN completed_at IS NOT NULL AND error_code IN "
+    "('extraction_disabled', 'unsupported_media_type') AND attempt_count = 0 "
+    "ELSE 0 END)"
+)
+
+# Head state: the same lifecycle CHECK with 10C.4's ``safety_blocked`` added
+# to the skipped error_code vocabulary; mirrors the merged
+# app.persistence.models.GraphExtraction CHECK of the same name.
+_GE_LIFECYCLE_D9 = (
+    ",\n    CONSTRAINT ck_graph_extractions_lifecycle CHECK "
+    "(CASE status "
+    "WHEN 'pending' THEN completed_at IS NULL AND error_code IS NULL "
+    "AND error_detail IS NULL AND attempt_count >= 1 "
+    "WHEN 'succeeded' THEN completed_at IS NOT NULL AND error_code IS NULL "
+    "AND error_detail IS NULL AND attempt_count >= 1 "
+    "WHEN 'empty' THEN completed_at IS NOT NULL AND error_code IS NULL "
+    "AND error_detail IS NULL AND attempt_count >= 1 "
+    "WHEN 'failed' THEN completed_at IS NOT NULL AND error_code IS NOT NULL "
+    "AND attempt_count >= 1 "
+    "WHEN 'skipped' THEN completed_at IS NOT NULL AND error_code IN "
+    "('extraction_disabled', 'unsupported_media_type', 'safety_blocked') "
+    "AND attempt_count = 0 "
+    "ELSE 0 END)"
 )
 
 
-def _graph_extractions_ddl(skip_constraint: str) -> str:
+def _graph_extractions_ddl(lifecycle_constraint: str) -> str:
     return (
         "CREATE TABLE graph_extractions_d9_new (\n"
         "    id INTEGER NOT NULL,\n"
@@ -88,21 +121,20 @@ def _graph_extractions_ddl(skip_constraint: str) -> str:
         "    error_code VARCHAR(100),\n"
         "    error_detail TEXT,\n"
         "    created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),\n"
-        "    input_sha256 VARCHAR(64) NOT NULL "
-        "DEFAULT '0000000000000000000000000000000000000000000000000000000000000000',\n"
+        "    input_sha256 VARCHAR(64) NOT NULL,\n"
         "    attempt_count INTEGER NOT NULL DEFAULT '0',\n"
         "    completed_at DATETIME,\n"
         "    attempt_started_at DATETIME,\n"
         "    is_identity_owner BOOLEAN NOT NULL DEFAULT '1',\n"
         "    PRIMARY KEY (id),\n"
         "    FOREIGN KEY(chunk_id) REFERENCES chunks (id) ON DELETE CASCADE,\n"
-        f"{_GE_COMMON_CONSTRAINTS}{skip_constraint}\n"
+        f"{_GE_COMMON_CONSTRAINTS}{lifecycle_constraint}\n"
         ")"
     )
 
 
-_GRAPH_EXTRACTIONS_D9_DDL = _graph_extractions_ddl(_GE_SKIP_CONSTRAINT_D9)
-_GRAPH_EXTRACTIONS_B7_DDL = _graph_extractions_ddl("")
+_GRAPH_EXTRACTIONS_D9_DDL = _graph_extractions_ddl(_GE_LIFECYCLE_D9)
+_GRAPH_EXTRACTIONS_B7_DDL = _graph_extractions_ddl(_GE_LIFECYCLE_B7)
 
 _GRAPH_EXTRACTIONS_INDEXES = (
     "CREATE INDEX ix_graph_extractions_id ON graph_extractions (id)",
