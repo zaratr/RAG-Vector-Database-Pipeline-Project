@@ -16,6 +16,13 @@ import argparse
 import asyncio
 import json
 import sys
+from pathlib import Path
+
+from pydantic import ValidationError
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from app.config import get_settings
 from app.services.graph_extraction import (
@@ -29,11 +36,14 @@ FIXTURE_TEXT = "Aria manages Project Helios. Project Helios uses Vector Engine."
 
 
 def _run(text: str) -> int:
-    settings = get_settings()
-    provider = "ollama" if settings.llm_provider == "ollama" else settings.llm_provider
-    model = settings.graph_extraction_model or settings.llm_model
-    extractor = get_graph_extractor()
+    provider = "unknown"
     try:
+        settings = get_settings()
+        provider = (
+            "ollama" if settings.llm_provider == "ollama" else settings.llm_provider
+        )
+        model = settings.graph_extraction_model or settings.llm_model
+        extractor = get_graph_extractor()
         relations = asyncio.run(extractor.extract(text))
     except GraphProviderUnavailable as exc:
         _emit_error(provider, "provider_unavailable", exc)
@@ -43,6 +53,9 @@ def _run(text: str) -> int:
         return 2
     except GraphExtractionError as exc:
         _emit_error(provider, "extraction_error", exc)
+        return 2
+    except ValidationError as exc:
+        _emit_error(provider, "configuration_error", exc)
         return 2
 
     if not relations:
