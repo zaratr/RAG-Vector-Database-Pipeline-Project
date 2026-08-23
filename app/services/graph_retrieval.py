@@ -249,21 +249,23 @@ def retrieve_graph_contexts(
 def apply_document_filters(query, filters: dict | None, session: Session):
     """Apply the plan 10A.5 scalar filter matrix to a Document-joined query.
 
-    ``document_id`` is integer equality with booleans rejected, ``title`` and
-    ``source`` are exact case-sensitive SQL equality, and ``tags`` is exact
-    membership after splitting the stored comma-separated tags and trimming
-    whitespace. Shared by graph traversal and vector hydration so identical
-    filter values yield identical candidate semantics on both sides.
+    ``document_id`` is integer equality with booleans and non-integer forms
+    (strings like ``"7"``, floats like ``7.0``) rejected rather than coerced
+    (W5), ``title`` and ``source`` are exact case-sensitive SQL equality, and
+    ``tags`` is exact membership after splitting the stored comma-separated
+    tags and trimming whitespace. Shared by graph traversal and vector
+    hydration so identical filter values yield identical candidate semantics
+    on both sides.
     """
     if not filters:
         return query
     if "document_id" in filters:
-        try:
-            document_id = int(filters["document_id"])
-        except (TypeError, ValueError) as exc:
-            raise UnsupportedGraphFilter("document_id filter must be an integer") from exc
-        if isinstance(filters["document_id"], bool):
-            raise UnsupportedGraphFilter("document_id filter rejects booleans")
+        document_id = filters["document_id"]
+        if isinstance(document_id, bool) or not isinstance(document_id, int):
+            raise UnsupportedGraphFilter(
+                "document_id filter must be an integer; booleans and "
+                "non-integer forms are rejected"
+            )
         query = query.filter(models.Document.id == document_id)
     if "title" in filters:
         query = query.filter(models.Document.title == str(filters["title"]))
