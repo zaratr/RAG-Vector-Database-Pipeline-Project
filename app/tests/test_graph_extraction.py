@@ -6,6 +6,11 @@ contract under test lives in ``app/services/graph_extraction.py``.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import httpx
 import pytest
@@ -453,18 +458,36 @@ async def test_provider_repair_succeeds_on_second_attempt():
 
 @pytest.mark.asyncio
 async def test_provider_error_string_excludes_source_text_and_payload():
-    """Error messages must not include raw source text or provider response payload."""
+    """Error messages must not include raw source text or provider response payload.
+
+    Pydantic ``ValidationError`` strings embed raw input values, so a payload
+    marker must never reach ``str``, ``repr``, or ``args`` of the surfaced
+    ``GraphProviderOutputError`` — neither via a schema-violating payload nor
+    via a malformed-JSON payload.
+    """
     source = "Alice works at Acme Corp. SECRET_DATA_HERE"
-    content = json.dumps({"relations": [{"bad": "schema"}]})
+    payload_marker = "P4YL04D-M4RK3R-7c31f0"
+    contents = [
+        # Schema-valid JSON whose relation carries an unknown extra field
+        # (extra="forbid" -> ValidationError repr embeds the input value).
+        json.dumps({"relations": [_valid_relation(unexpected_field=payload_marker)]}),
+        # Malformed JSON containing the marker (json_invalid also embeds input).
+        '{"relations": [{"predicate": "' + payload_marker + '"',
+    ]
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return _response(content)
+    for content in contents:
 
-    with pytest.raises(GraphProviderOutputError) as exc_info:
-        await _extractor(handler).extract(source)
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _response(content)
 
-    error_str = str(exc_info.value)
-    assert "SECRET_DATA_HERE" not in error_str
+        with pytest.raises(GraphProviderOutputError) as exc_info:
+            await _extractor(handler).extract(source)
+
+        error = exc_info.value
+        assert str(error).startswith("Invalid graph extraction output")
+        for surfaced in (str(error), repr(error), " ".join(str(a) for a in error.args)):
+            assert "SECRET_DATA_HERE" not in surfaced
+            assert payload_marker not in surfaced
 
 
 @pytest.mark.asyncio
@@ -509,3 +532,161 @@ async def test_provider_exponential_backoff_uses_powers_of_two():
     assert len(sleep_calls) == 2
     assert sleep_calls[0] == pytest.approx(0.25)
     assert sleep_calls[1] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# 10A.2 — live acceptance script CLI contract (appendix exit codes 0/1/2)
+# ---------------------------------------------------------------------------
+
+_SCRIPT_PATH = (
+    Path(__file__).resolve().parents[2] / "scripts" / "validate_graph_extraction.py"
+)
+_SCRIPT_FIXTURE_TEXT = "Aria manages Project Helios. Project Helios uses Vector Engine."
+
+# Startup shim loaded via PYTHONPATH inside the subprocess. It patches
+# OllamaGraphExtractor.extract as soon as the script itself has imported
+# app.services.graph_extraction. It deliberately does NOT put the repository
+# root on sys.path: the script must bootstrap its own imports, and cwd is an
+# unrelated tmp_path to prove the bootstrap is __file__-relative.
+_SITECUSTOMIZE = textwrap.dedent(
+    """
+    import builtins
+    import os
+    import sys
+
+    _mode = os.environ.get("GRAPH_EXTRACTION_TEST_MODE")
+    _real_import = builtins.__import__
+    _patched = False
+
+
+    def _patch(module):
+        if not _mode:
+            return
+        if _mode == "empty":
+
+            async def extract(self, text):
+                return []
+
+        elif _mode == "unavailable":
+
+            async def extract(self, text):
+                raise module.GraphProviderUnavailable("connection refused")
+
+        else:
+
+            async def extract(self, text):
+                return [
+                    module.ExtractedRelation(
+                        source=module.ExtractedEntity(
+                            name="Aria",
+                            canonical_name="aria",
+                            entity_type="person",
+                        ),
+                        predicate="manages",
+                        target=module.ExtractedEntity(
+                            name="Project Helios",
+                            canonical_name="project helios",
+                            entity_type="project",
+                        ),
+                        evidence="Aria manages Project Helios",
+                        evidence_start=0,
+                        evidence_end=27,
+                        confidence=0.9,
+                    )
+                ]
+
+        module.OllamaGraphExtractor.extract = extract
+
+
+    def _patching_import(name, *args, **kwargs):
+        module = _real_import(name, *args, **kwargs)
+        global _patched
+        if not _patched:
+            target = sys.modules.get("app.services.graph_extraction")
+            # Only patch once the module body has finished executing; during
+            # its own nested imports the class attribute does not exist yet.
+            if target is not None and hasattr(target, "OllamaGraphExtractor"):
+                _patched = True
+                _patch(target)
+        return module
+
+
+    builtins.__import__ = _patching_import
+    """
+)
+
+
+def _run_validation_script(monkeypatch, tmp_path, mode="grounded", provider="ollama"):
+    (tmp_path / "sitecustomize.py").write_text(_SITECUSTOMIZE, encoding="utf-8")
+    monkeypatch.setenv("RAG_LLM_PROVIDER", provider)
+    monkeypatch.setenv("RAG_GRAPH_EXTRACTION_ENABLED", "true")
+    monkeypatch.setenv("GRAPH_EXTRACTION_TEST_MODE", mode)
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+    return subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPT_PATH),
+            "--text",
+            _SCRIPT_FIXTURE_TEXT,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        env=env,
+    )
+
+
+def test_validate_graph_extraction_exits_0_with_grounded_relation(monkeypatch, tmp_path):
+    """Script run with a mocked grounded relation exits 0 with plan-shaped JSON."""
+    result = _run_validation_script(monkeypatch, tmp_path, "grounded")
+
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["provider"] == "ollama"
+    assert output["grounding_valid"] is True
+    assert len(output["relations"]) >= 1
+    for relation in output["relations"]:
+        assert "source" in relation
+        assert "predicate" in relation
+        assert "target" in relation
+        assert "evidence_start" in relation
+        assert "evidence_end" in relation
+
+
+def test_validate_graph_extraction_exits_1_on_successful_empty_for_relation_fixture(
+    monkeypatch, tmp_path
+):
+    """Fixture that should produce a relation but provider returns empty → exit 1."""
+    result = _run_validation_script(monkeypatch, tmp_path, "empty")
+
+    assert result.returncode == 1, result.stderr
+    output = json.loads(result.stdout)
+    assert output["relations"] == []
+    assert output["grounding_valid"] is True
+
+
+def test_validate_graph_extraction_exits_2_on_provider_failure(monkeypatch, tmp_path):
+    """Provider unavailable/config error → exit 2 with sanitized JSON error to stderr."""
+    result = _run_validation_script(monkeypatch, tmp_path, "unavailable")
+
+    assert result.returncode == 2, result.stderr
+    error = json.loads(result.stderr)
+    assert error["provider"] == "ollama"
+    assert "error" in error
+    assert "detail" in error
+    assert len(error["detail"]) <= 200  # bounded sanitized detail
+
+
+def test_validate_graph_extraction_exits_2_on_configuration_failure(monkeypatch, tmp_path):
+    """Configuration failure (unsupported provider) → exit 2, sanitized stderr, no traceback."""
+    result = _run_validation_script(
+        monkeypatch, tmp_path, mode=None, provider="openai"
+    )
+
+    assert result.returncode == 2, result.stderr
+    error = json.loads(result.stderr)
+    assert error["provider"] == "openai"
+    assert "error" in error
+    assert "detail" in error
+    assert len(error["detail"]) <= 200  # bounded sanitized detail
+    assert "Traceback" not in result.stderr

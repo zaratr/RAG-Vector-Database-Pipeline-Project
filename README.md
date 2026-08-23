@@ -215,6 +215,7 @@ Example output:
 {
   "nonready_vectors_deleted": 0,
   "orphan_vectors_deleted": 0,
+  "pending_extractions_failed": 0,
   "ready_chunks_upserted": 3,
   "staged_documents_failed": 0
 }
@@ -222,29 +223,43 @@ Example output:
 
 Reconciliation treats ready SQL chunks as authoritative. It:
 
-1. Marks interrupted `staged` documents as failed.
+1. Marks interrupted `staged` documents as failed (`reconciled_incomplete`) and terminalizes their still-pending graph extraction runs as failed.
 2. Inventories the configured Chroma collection.
 3. Deletes vectors not represented by ready SQL chunks, including legacy UUID aliases.
 4. Re-embeds and idempotently upserts every ready chunk under `chunk:<chunk_id>`.
 
 > Run reconciliation only against the collection paired with the configured relational database. It intentionally removes collection records that are not authoritative ready SQL chunks.
 
-### 7. Query the persisted graph from the operator CLI
+### 7. Backfill graph extractions
+
+Ready text chunks that predate GraphRAG or lack the current extraction identity can be backfilled idempotently:
+
+```bash
+docker compose exec api python scripts/backfill_graph.py --dry-run
+docker compose exec api python scripts/backfill_graph.py --document-id 3
+docker compose exec api python scripts/backfill_graph.py --retry-failed
+```
+
+`--batch-size` accepts `1–100` (default 20). `--document-id` restricts the scan to one document. `--dry-run` classifies eligibility without calling the extraction provider. `--retry-failed` re-attempts chunks whose current identity owner previously failed or whose lease has expired. Backfill never modifies vector IDs, Chroma records, document readiness, or provenance rows owned by other extraction identities. Each run prints one sorted JSON counter report (`scanned`, `eligible`, `processed`, `succeeded`, `skipped`, `empty`, `failed`, `lease_lost`, `relations`, and `skip_reasons`).
+
+Exit codes: `0` when no chunk failed (including no-op runs), `1` when one or more chunks failed (successful chunks remain committed), and `2` for invalid arguments, configuration failure, or a fatal database error.
+
+### 8. Query the persisted graph from the operator CLI
 
 ```bash
 docker compose exec api python src/graph_rag.py "Aria" --hops 3 --limit 10
 ```
 
-It is mock-triplet NetworkX.
+The CLI traverses the persisted relational graph through the SQL-authoritative `retrieve_graph_paths` traversal and prints complete JSON path objects with per-step provenance. `--hops` accepts `1–3` (default 2), `--direction` accepts `outbound`, `inbound`, or `both` (default `outbound`), and repeatable `--filters KEY=VALUE` applies the scalar document filter matrix (`document_id`, `title`, `source`, `tags`). Unsupported filter keys or malformed `document_id` values exit with an error.
 
-### 8. Run tests
+### 9. Run tests
 
 ```bash
 docker compose exec api python -m pytest -q
 ```
 
 
-### 9. Stop or reset
+### 10. Stop or reset
 
 ```bash
 # Stop services; named-volume data remains
@@ -265,16 +280,27 @@ docker compose down -v
 | `GET` | `/documents` | List documents |
 | `GET` | `/documents/{id}` | Return a document and its chunks |
 | `POST` | `/query` | Generate an answer using vector, graph, or hybrid retrieval |
+| `GET` | `/graph/entities` | List graph entities visible through ready-document evidence |
+| `GET` | `/graph/entities/{id}/relationships` | List an entity's relationships that have ready evidence |
+| `POST` | `/graph/paths` | Run bounded directional path traversal over persisted graph evidence |
 
 Important error behavior:
 
 - `400`: invalid/empty document input or unsupported file
-- `404`: document not found
+- `404`: document or graph entity not found
 - `413`: request envelope, uploaded file, or extracted text exceeds the configured ingestion byte limits (`request_envelope_too_large` / `ingestion_too_large`)
-- `422`: invalid query controls or unsupported graph filters
+- `422`: invalid query controls, unsupported or malformed graph filters (including non-integer `document_id` filter values), or invalid graph-inspection parameters
 - `429`: ingestion rate limit exceeded (`ingestion_rate_limited`)
 - `502`: graph extraction provider returned unusable structured output
-- `503`: graph provider unavailable or traversal safety limit reached; fail-closed security failures (`retrieval_failed`, `context_detector_failed`, `generation_provider_failed`, audit-persistence codes). When every retrieved candidate is blocked, `/query` still returns `200` with the deterministic answer `No safe context was available to answer the query.`
+- `503`: vector index unavailable during ingestion, graph provider unavailable, or traversal safety limit reached; fail-closed security failures (`retrieval_failed`, `context_detector_failed`, `generation_provider_failed`, audit-persistence codes). When every retrieved candidate is blocked, `/query` still returns `200` with the deterministic answer `No safe context was available to answer the query.`
+
+### Graph inspection endpoints
+
+The `/graph/*` routes are read-only over ready-document evidence and never touch the embedding or Chroma layer. Entities, relationships, and paths evidenced only by non-ready documents are invisible.
+
+- `GET /graph/entities` — optional `name` needle with `match` mode (`exact` default, or `prefix`/`contains`; `%`/`_` are matched literally), optional `entity_type` (one of `person`, `organization`, `location`, `product`, `project`, `technology`, `concept`, `event`, `other`), `limit` `1–100` (default 20), and `offset`. Results are ordered by canonical name, entity type, then entity ID, and each item carries ready-document mention and evidence counts. An unsupported `entity_type` returns `422`.
+- `GET /graph/entities/{id}/relationships` — `direction` (`outbound` default, `inbound`, or `both`), `limit` `1–100` (default 20), and `offset`. Items are sorted by source canonical name, predicate, target canonical name, then edge ID; only edges with ready evidence are returned. Unknown entity IDs return `404`.
+- `POST /graph/paths` — JSON body: `query`, `max_hops` (default 3; values outside `1–3` are rejected), `direction` (default `outbound`), `limit` `1–50` (default 20; values outside the range are rejected rather than clamped), and optional scalar `filters` (`document_id`, `title`, `source`, `tags`). Returns complete `GraphPath` objects with per-step provenance. Exceeding a traversal safety cap returns `503`; unsupported or malformed filters return `422`.
 
 ## Architecture
 
@@ -284,7 +310,7 @@ Important error behavior:
 | Embeddings | FastEmbed 0.8.0 + `jinaai/jina-clip-v1` | 768-dimensional text/image embeddings through ONNX |
 | Vector store | ChromaDB 1.5.9 | Persistent HTTP server, deterministic IDs, idempotent upserts |
 | Generation | Ollama + Gemma | Grounded answers through OpenAI-compatible chat completions |
-| Graph extraction | Ollama + Gemma | Strict JSON-schema relationships, grounding, normalization, retries, explicit empty/failure states |
+| Graph extraction | Ollama + Gemma | Strict JSON-schema relationships, grounding, normalization, lease-guarded retries, explicit empty/failure states |
 | Relational store | SQLite + SQLAlchemy 2.0.51 | Documents, chunks, lifecycle state, and normalized graph provenance |
 | Migrations | Alembic 1.18.5 | One-shot Compose migrator, legacy adoption, exact-schema drift validation |
 | Graph retrieval | Relational bounded traversal | Directional, deterministic, cycle-safe, provenance-preserving expansion |
@@ -322,7 +348,11 @@ dee48bc24a7f  frozen documents/chunks baseline
       ↓
 4c9a8d7e6f5b  graph provenance and ingestion lifecycle
       ↓
-a6e2c4f8b1d9  database constraint for document lifecycle states (head)
+a6e2c4f8b1d9  database constraint for document lifecycle states
+      ↓
+b7f3d5a9c2e1  hardened graph extraction lifecycle: idempotent identity owner, attempt counters, pending lease
+      ↓
+c8a4e6b0d3f2  security provenance and audits: document trust fields, retrieval audits/decisions, ingestion rate buckets (head)
 ```
 
 Application import and API startup do not run migrations. The one-shot `migrate` Compose service owns schema adoption and upgrades.
@@ -339,6 +369,7 @@ All application settings use the `RAG_` prefix and load from `.env`.
 | `RAG_GRAPH_EXTRACTION_ENABLED` | `true` | `true` | Enable structured graph extraction for text ingestion |
 | `RAG_GRAPH_EXTRACTION_MODEL` | answer model | `gemma4` | Optional extraction-specific model |
 | `RAG_GRAPH_MAX_HOPS` | `2` | `2` | Configured hop bound; HTTP requests currently use their own validated `graph_max_hops` field (default 2, range 1–3) |
+| `RAG_EXTRACTION_LEASE_SECONDS` | `600` | `600` | Graph extraction lease duration in seconds (range 60–3600); an expired pending lease can be reclaimed by a backfill retry, and reconciliation terminalizes still-pending extractions as failed |
 | `RAG_EMBEDDING_PROVIDER` | `fastembed` | `fastembed` | `local`, `fastembed`, or `openai` |
 | `RAG_EMBEDDING_MODEL` | `jinaai/jina-clip-v1` | same | Embedding model |
 | `RAG_DATABASE_URL` | `sqlite:///./rag.db` | `sqlite:////data/rag.db` | SQLAlchemy database URL |
@@ -354,6 +385,7 @@ All application settings use the `RAG_` prefix and load from `.env`.
 ├── app/
 │   ├── api/
 │   │   ├── routes_documents.py       # ingestion and document inspection
+│   │   ├── routes_graph.py           # read-only graph inspection endpoints
 │   │   └── routes_query.py           # vector/graph/hybrid query API
 │   ├── core/
 │   │   ├── db.py                     # engine, sessions, SQLite FK enforcement
@@ -366,6 +398,7 @@ All application settings use the `RAG_` prefix and load from `.env`.
 │   │   └── repositories.py           # document/chunk operations
 │   ├── services/
 │   │   ├── embeddings.py             # text and image embeddings
+│   │   ├── graph_backfill.py         # idempotent graph extraction backfill
 │   │   ├── graph_extraction.py       # strict Gemma relationship extraction
 │   │   ├── graph_retrieval.py        # bounded persisted traversal
 │   │   ├── ingestion.py              # staged SQL/Chroma ingestion lifecycle
@@ -377,6 +410,7 @@ All application settings use the `RAG_` prefix and load from `.env`.
 │   ├── config.py
 │   └── main.py
 ├── scripts/
+│   ├── backfill_graph.py             # operator graph backfill command
 │   └── reconcile_ingestion.py        # operator reconciliation command
 ├── src/
 │   └── graph_rag.py                  # persisted graph traversal CLI

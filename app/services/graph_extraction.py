@@ -139,6 +139,21 @@ class _ExtractionEnvelope(BaseModel):
     relations: list[_RawRelation] = Field(max_length=100)
 
 
+def _summarize_validation_error(exc: ValidationError) -> str:
+    """Bounded, sanitized summary of a provider-output validation failure.
+
+    Pydantic ``ValidationError`` strings embed the raw input values — the
+    provider payload — so only field locations, error types, and static
+    pydantic messages are surfaced; the input itself is never included.
+    """
+    parts: list[str] = []
+    for error in exc.errors()[:5]:
+        location = ".".join(str(item) for item in error.get("loc", ())) or "root"
+        summary = f"{location}: {error.get('type', 'unknown')} {error.get('msg', '')}"
+        parts.append(summary.rstrip())
+    return ("; ".join(parts) or "schema violation")[:200]
+
+
 class GraphExtractor(Protocol):
     async def extract(self, text: str) -> list[ExtractedRelation]:
         ...
@@ -182,9 +197,14 @@ class OllamaGraphExtractor:
             try:
                 envelope = _ExtractionEnvelope.model_validate_json(content)
                 return self._normalize_relations(envelope, source_text)
-            except (ValidationError, ValueError, TypeError) as exc:
+            except ValidationError as exc:
                 last_output_error = GraphProviderOutputError(
-                    f"Invalid graph extraction output: {exc}"
+                    "Invalid graph extraction output: "
+                    f"{_summarize_validation_error(exc)}"
+                )
+            except (ValueError, TypeError) as exc:
+                last_output_error = GraphProviderOutputError(
+                    f"Invalid graph extraction output: {str(exc)[:200]}"
                 )
         assert last_output_error is not None
         raise last_output_error
@@ -247,7 +267,7 @@ class OllamaGraphExtractor:
                     content = response.json()["choices"][0]["message"]["content"]
                 except (KeyError, IndexError, TypeError, ValueError) as exc:
                     raise GraphProviderOutputError(
-                        f"Invalid graph provider response envelope: {exc}"
+                        f"Invalid graph provider response envelope: {str(exc)[:200]}"
                     ) from exc
                 if not isinstance(content, str):
                     raise GraphProviderOutputError(

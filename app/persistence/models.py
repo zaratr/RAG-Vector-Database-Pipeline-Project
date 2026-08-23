@@ -139,12 +139,29 @@ class GraphExtraction(Base):
             name="ck_graph_extractions_attempt_count",
         ),
         CheckConstraint(
-            "is_identity_owner IN (0, 1)",
+            "is_identity_owner IN (0,1)",
             name="ck_graph_extractions_is_identity_owner",
         ),
         CheckConstraint(
             "length(input_sha256) = 64 AND input_sha256 NOT GLOB '*[^0-9a-f]*'",
             name="ck_graph_extractions_input_sha256_hex",
+        ),
+        CheckConstraint(
+            # Plan-exact per-status lifecycle rules (10A.3 W4); mirrors the
+            # b7f3d5a9c2e1 migration CHECK of the same name.
+            "CASE status "
+            "WHEN 'pending' THEN completed_at IS NULL AND error_code IS NULL "
+            "AND error_detail IS NULL AND attempt_count >= 1 "
+            "WHEN 'succeeded' THEN completed_at IS NOT NULL AND error_code IS NULL "
+            "AND error_detail IS NULL AND attempt_count >= 1 "
+            "WHEN 'empty' THEN completed_at IS NOT NULL AND error_code IS NULL "
+            "AND error_detail IS NULL AND attempt_count >= 1 "
+            "WHEN 'failed' THEN completed_at IS NOT NULL AND error_code IS NOT NULL "
+            "AND attempt_count >= 1 "
+            "WHEN 'skipped' THEN completed_at IS NOT NULL AND error_code IN "
+            "('extraction_disabled', 'unsupported_media_type') AND attempt_count = 0 "
+            "ELSE 0 END",
+            name="ck_graph_extractions_lifecycle",
         ),
         Index(
             "uq_graph_extractions_identity_owner",
