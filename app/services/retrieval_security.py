@@ -38,6 +38,55 @@ class RetrievalSecurityDecision(BaseModel):
     reason_codes: list[str]
 
 
+class RetrievalSecurityRegimeError(ValueError):
+    """Fail-closed refusal: the policy's calibration regime != the runtime's.
+
+    The retrieval-security thresholds (notably ``max_distance``) are
+    calibrated per embedding model. Applying them under a different embedding
+    regime would silently fail-close (or fail-open) retrieval with misleading
+    ``rejected_distance`` decisions. Raised at policy load — mirroring the
+    content-safety fail-closed pattern — naming BOTH regimes.
+    """
+
+
+# Effective model identity of the deterministic local hash embedding. The
+# ``local`` provider (HashEmbeddingProvider) ignores the configured model
+# name entirely, so its regime identity is the hash embedding itself — never
+# the configured model string (R2a: the check is model-identity-based, not a
+# blanket ban on the provider name).
+LOCAL_HASH_EMBEDDING_MODEL = "local-hash-embedding"
+
+
+def effective_runtime_embedding_model(settings) -> str:
+    """The embedding-model identity the configured provider actually realizes.
+
+    ``fastembed``/``openai`` realize the configured model name; ``local`` is
+    the deterministic SHA-256 hash embedding (unnormalized vectors whose l2
+    distances sit far outside any real-model calibration), so its identity is
+    the hash regime.
+    """
+    if settings.embedding_provider == "local":
+        return LOCAL_HASH_EMBEDDING_MODEL
+    return settings.embedding_model
+
+
+def assert_policy_matches_runtime_regime(
+    policy: RetrievalSecurityPolicy, settings
+) -> None:
+    """Refuse (typed, fail-closed) unless the policy's calibration embedding
+    model matches the runtime embedding regime's effective model identity."""
+    runtime_model = effective_runtime_embedding_model(settings)
+    if policy.calibration_embedding_model != runtime_model:
+        raise RetrievalSecurityRegimeError(
+            f"retrieval-security policy calibrated for embedding model "
+            f"{policy.calibration_embedding_model!r} (normalized fastembed "
+            f"regime) but runtime provider is {settings.embedding_provider}/"
+            f"{settings.embedding_model!r} (effective embedding model "
+            f"{runtime_model!r}); refusing to apply calibrated thresholds "
+            f"across embedding regimes"
+        )
+
+
 @dataclass(frozen=True)
 class RetrievalSecurityPolicy:
     version: str

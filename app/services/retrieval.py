@@ -33,11 +33,23 @@ def get_retrieval_security_policy() -> RetrievalSecurityPolicy:
     global _POLICY_CACHE
     if _POLICY_CACHE is None:
         from app.config import get_settings
+        from app.services.retrieval_security import (
+            assert_policy_matches_runtime_regime,
+        )
 
         settings = get_settings()
-        _POLICY_CACHE = load_retrieval_security_policy_strict(
+        policy = load_retrieval_security_policy_strict(
             settings.retrieval_security_policy_path
         )
+        # R2a: the calibrated thresholds are only meaningful under the
+        # embedding regime the policy was calibrated for (e.g. the committed
+        # policy is fastembed/jina-clip-v1 calibrated; the local hash regime
+        # sits far outside it). Refuse at load — typed and fail-closed —
+        # instead of silently fail-closing retrieval with misleading
+        # rejected_distance decisions. A pre-installed _POLICY_CACHE (the
+        # shipped hermetic-test hook) remains a full bypass.
+        assert_policy_matches_runtime_regime(policy, settings)
+        _POLICY_CACHE = policy
     return _POLICY_CACHE
 
 

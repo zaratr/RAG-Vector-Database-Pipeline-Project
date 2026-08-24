@@ -2,14 +2,19 @@
 
 Lane 1 (deterministic topology): injects a fixed schema-valid GraphExtractionResult
 through the production persistence/retrieval services for a unique three-document
-corpus into a disposable migrated SQLite database plus a disposable in-process
-(ephemeral) Chroma collection, and ASSERTS exact entity/evidence counts,
+corpus (one DISTINCT run-scoped source per document, so the merged 10B layer's
+production ``per_source_cap: 2`` is respected while all three stay
+hybrid-retrievable) into a disposable migrated SQLite database plus a disposable
+in-process (ephemeral) Chroma collection, and ASSERTS exact entity/evidence counts,
 directional 1/2/3-hop paths with full citations, genuinely executed hybrid
 retrieval (sources derived from the real fused results), and RRF-60 fusion
 semantics (each fused hybrid_score must equal the sum of 1/(60+rank) over the
 sides that returned the chunk, with ranks derived from real vector-only and
 graph-only ``retrieve_contexts`` calls; a chunk retrievable by both sides must
-outrank every single-side chunk at fused top_k=2).
+outrank every single-side chunk at fused top_k=2). The lane's hash-embedder
+distances are meaningless against the fastembed-calibrated retrieval-security
+``max_distance``, so the lane neutralizes ONLY that control (via the shipped
+``_POLICY_CACHE`` hook) and keeps every cap at its production value.
 
 Lane 2 (live provider): ingests one different unique document through the
 PRODUCTION ingestion path (``app.services.ingestion.ingest_text``) with the
@@ -92,6 +97,21 @@ EXPECTED_HOPS = [1, 2, 3]
 # call (lexical seeds plus vector-derived seeds collapse to the same set).
 HYBRID_QUERY = "User purchases Subscription grants PremiumAccess unlocks Dashboard"
 HYBRID_MAX_HOPS = 2
+
+
+def _doc_sources(run_id: str) -> list[str]:
+    """Run-scoped DISTINCT per-document sources for the deterministic lane.
+
+    The merged 10B layer applies ``per_source_cap: 2`` (its production value)
+    inside this lane, so all three seeded documents must carry distinct
+    sources to stay hybrid-retrievable together; the pre-merge fixture seeded
+    one shared source and silently lost the third document to
+    ``rejected_source_cap`` (hybrid count 2 instead of the pinned 3).
+    """
+    return [
+        f"validate-phase10a-{run_id}-{index}"
+        for index in range(EXPECTED_DOCUMENTS)
+    ]
 
 # The seeded chain yields exactly 5 outbound paths within 2 hops; every hybrid
 # internal graph limit used below (top_k=2 -> 6, top_k=10 -> 30) exceeds this,
@@ -232,17 +252,49 @@ async def _run_deterministic(db_url: str, run_id: str) -> tuple[dict, bool]:
         ("Subscription", "grants", "PremiumAccess", "Subscription grants PremiumAccess."),
         ("PremiumAccess", "unlocks", "Dashboard", "PremiumAccess unlocks Dashboard."),
     ]
+    doc_sources = _doc_sources(run_id)
+    _check(lane, "seeded_sources_distinct",
+           len(set(doc_sources)) == EXPECTED_DOCUMENTS,
+           actual=sorted(set(doc_sources)))
     doc_ids: list[int] = []
     chunk_ids: list[int] = []
     chunk_texts: dict[int, str] = {}
     chunk_models: dict[int, models.Chunk] = {}
     vector_ids: list[str] = []
     restored = False
+
+    # Merged-tree adaptation (mirrors the repo tests' own ``_POLICY_CACHE``
+    # shim): this lane pins 10A topology/fusion semantics with the
+    # deterministic hash embedder, whose l2 distances (~1e1) are meaningless
+    # against the fastembed-calibrated ``max_distance`` — without this, the
+    # per-side vector derivation calls would be emptied by
+    # ``rejected_distance``. Neutralize ONLY the distance control for the
+    # lane's scope; every cap keeps its PRODUCTION value so the 10B layer's
+    # per-source/per-document caps genuinely apply and the distinct seeded
+    # sources above stay load-bearing for the pinned hybrid count of 3.
+    from app.services import retrieval as retrieval_module
+    from app.services.retrieval_security import RetrievalSecurityPolicy
+
+    prior_policy = retrieval_module._POLICY_CACHE
+    retrieval_module._POLICY_CACHE = RetrievalSecurityPolicy(
+        version="retrieval-security-v1",
+        metric="l2",
+        max_distance=float("inf"),
+        per_source_cap=2,
+        per_document_cap=2,
+        max_candidates=50,
+        near_duplicate_jaccard=0.9,
+        calibration_fixture_sha256="phase10a-deterministic-lane",
+        calibration_clean_recall=1.0,
+        calibration_poison_share=0.0,
+        calibration_tool_version="calibrate-v1",
+        calibration_embedding_model="phase10a-deterministic-lane",
+    )
     try:
         for index, (source, predicate, target, text) in enumerate(triples):
             document = models.Document(
                 title=f"validate-phase10a:{run_id}:{index}",
-                source="validate-phase10a",
+                source=doc_sources[index],
                 ingestion_status="ready",
             )
             session.add(document)
@@ -442,6 +494,7 @@ async def _run_deterministic(db_url: str, run_id: str) -> tuple[dict, bool]:
         _delete_lane_rows(session, doc_ids)
         session.close()
         engine.dispose()
+        retrieval_module._POLICY_CACHE = prior_policy
         try:
             fresh = create_engine(db_url)
             restored = _db_fingerprint(fresh) == baseline

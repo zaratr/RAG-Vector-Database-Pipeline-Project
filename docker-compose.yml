@@ -43,6 +43,12 @@ services:
       RAG_SAFETY_LLM_MODE: ${RAG_SAFETY_LLM_MODE:-disabled}
     volumes:
       - relational_data:/data
+      # Named volume for the fastembed model cache (fastembed 0.8 caches the
+      # ~500MB jina-clip-v1 model at /tmp/fastembed_cache in-container) so
+      # `docker compose up --force-recreate` reuses the downloaded model
+      # instead of re-downloading it on every recreate. First populate is a
+      # one-time download into the volume.
+      - fastembed_cache:/tmp/fastembed_cache
       # Read-only mount of the external Phase 10 plan archive; the plan is
       # normative and read-only, never copied into the image.
       - ${RAG_PLAN_ARCHIVE:-../random_archive/.hermes/plans}:/plan-archive:ro
@@ -68,3 +74,4 @@ services:
 volumes:
   chroma_data:
   relational_data:
+  fastembed_cache:

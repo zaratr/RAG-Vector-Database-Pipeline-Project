@@ -355,6 +355,35 @@ async def test_deterministic_lane_fails_on_broken_topology(
 
 
 @pytest.mark.asyncio
+async def test_deterministic_lane_requires_distinct_seed_sources(
+    monkeypatch, tmp_path
+):
+    """Regression proof for the post-10B seeding fix: all three documents
+    under ONE shared source must FAIL the lane — the merged 10B layer's
+    ``per_source_cap: 2`` is applied at its production value inside the lane,
+    so a shared-source fixture silently loses the third document again."""
+    from scripts import validate_phase10a as validator
+
+    monkeypatch.setattr(
+        validator,
+        "_doc_sources",
+        lambda run_id: ["validate-phase10a-regression"]
+        * validator.EXPECTED_DOCUMENTS,
+    )
+
+    with pytest.raises(validator.ValidatorFailure) as excinfo:
+        await validator._run_deterministic(
+            _db_url(tmp_path, "det-single-source.db"), "0f0f0f0f0f0f0f0f"
+        )
+    assert excinfo.value.lane == "deterministic"
+    assert excinfo.value.detail["check"] in {
+        "seeded_sources_distinct",
+        "hybrid_executed",
+    }
+    _assert_disposable_db_empty(_db_url(tmp_path, "det-single-source.db"))
+
+
+@pytest.mark.asyncio
 async def test_live_lane_persists_through_production_ingest_path(
     monkeypatch, tmp_path
 ):

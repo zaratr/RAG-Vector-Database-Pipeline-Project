@@ -117,12 +117,20 @@ async def lifespan(app: FastAPI):
     # service loader; the immutable object is shared with app.services.retrieval.
     try:
         from app.services.retrieval import reset_retrieval_security_policy_cache
-        from app.services.retrieval_security import load_retrieval_security_policy_strict
+        from app.services.retrieval_security import (
+            assert_policy_matches_runtime_regime,
+            load_retrieval_security_policy_strict,
+        )
 
         reset_retrieval_security_policy_cache()
         policy = load_retrieval_security_policy_strict(
             settings.retrieval_security_policy_path
         )
+        # R2a: refuse startup when the policy's calibration embedding regime
+        # does not match the runtime provider/model (e.g. a local-hash runtime
+        # under the fastembed-calibrated committed policy would silently
+        # fail-close retrieval with misleading rejected_distance decisions).
+        assert_policy_matches_runtime_regime(policy, boot_settings)
         app.state.retrieval_security_policy = policy
         logger.info("Retrieval security policy loaded: version=%s, max_distance=%s",
                      policy.version, policy.max_distance)

@@ -34,6 +34,41 @@ def _fail(message: str) -> None:
     raise SystemExit(2)
 
 
+def _assert_embedding_regime(settings) -> None:
+    """R2b precondition: this validator judges calibrated distances.
+
+    Its corpus fixtures are near-verbatim variants of the calibration-corpus
+    answer so the LIVE embedding model keeps every candidate inside the
+    calibrated ``max_distance`` (verified distances 0.49-0.61 vs threshold
+    0.643872). Those verdicts are meaningless under any other embedding
+    regime (e.g. the deterministic local hash provider, whose l2 distances
+    sit around 1e1), so fail FAST (exit 2) with a machine-readable
+    ``provider_mismatch`` naming both regimes before any distance is judged.
+    """
+    from app.services.retrieval_security import load_retrieval_security_policy_strict
+
+    try:
+        policy = load_retrieval_security_policy_strict(
+            settings.retrieval_security_policy_path
+        )
+    except Exception as exc:
+        _fail(
+            f"provider_mismatch precondition cannot load policy "
+            f"{settings.retrieval_security_policy_path}: {exc}"
+        )
+    if (
+        settings.embedding_provider != "fastembed"
+        or settings.embedding_model != policy.calibration_embedding_model
+    ):
+        _fail(
+            f"provider_mismatch: retrieval-security policy calibrated for "
+            f"fastembed/{policy.calibration_embedding_model} but runtime "
+            f"embedding regime is {settings.embedding_provider}/"
+            f"{settings.embedding_model}; calibrated-distance verdicts are "
+            f"meaningless under this regime"
+        )
+
+
 def _fingerprint_sqlite(path: Path) -> str:
     uri = f"file:{path.resolve().as_posix()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
@@ -90,6 +125,7 @@ def main() -> int:
     from app.core.db import create_database_engine
 
     settings = get_settings()
+    _assert_embedding_regime(settings)
     run_tag = f"phase10b-gate-{uuid.uuid4().hex[:12]}"
     operator_token = (
         settings.operator_token.get_secret_value() if settings.operator_token else None

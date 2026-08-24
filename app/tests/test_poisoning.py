@@ -824,6 +824,123 @@ def test_retrieval_policy_is_loaded_once_and_fails_closed(tmp_path, monkeypatch)
         get_settings.cache_clear()
 
 
+# ---------------------------------------------------------------------------
+# Embedding-regime precondition (R2a): the policy load path must refuse a
+# runtime whose embedding regime differs from the policy's calibration regime
+# (typed, fail-closed at load — never silent rejected_distance filtering).
+# ---------------------------------------------------------------------------
+
+
+def _regime_env(monkeypatch, provider, model=None):
+    """Resolve settings against the committed policy under a chosen regime."""
+    monkeypatch.setenv(
+        "RAG_RETRIEVAL_SECURITY_POLICY_PATH",
+        str(PROJECT_ROOT / "config" / "retrieval-security-policy.json"),
+    )
+    monkeypatch.setenv("RAG_EMBEDDING_PROVIDER", provider)
+    if model is not None:
+        monkeypatch.setenv("RAG_EMBEDDING_MODEL", model)
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    return get_settings()
+
+
+def test_policy_load_refuses_local_provider_under_fastembed_calibration(
+    monkeypatch,
+):
+    """local (hash) regime + committed fastembed-calibrated policy -> typed
+    refusal at load naming BOTH regimes, not filter-time rejections."""
+    from app.config import get_settings
+    from app.services import retrieval as retrieval_module
+    from app.services.retrieval_security import RetrievalSecurityRegimeError
+
+    _regime_env(monkeypatch, "local")
+    retrieval_module.reset_retrieval_security_policy_cache()
+    try:
+        with pytest.raises(RetrievalSecurityRegimeError) as excinfo:
+            retrieval_module.get_retrieval_security_policy()
+        message = str(excinfo.value)
+        # Both regimes are named: the calibrated model and the runtime provider.
+        assert "jinaai/jina-clip-v1" in message
+        assert "local" in message
+    finally:
+        retrieval_module.reset_retrieval_security_policy_cache()
+        get_settings.cache_clear()
+
+
+def test_policy_load_accepts_matching_fastembed_regime(monkeypatch):
+    """fastembed regime + committed policy (the dev-stack configuration)
+    loads unchanged."""
+    from app.config import get_settings
+    from app.services import retrieval as retrieval_module
+
+    _regime_env(monkeypatch, "fastembed", "jinaai/jina-clip-v1")
+    retrieval_module.reset_retrieval_security_policy_cache()
+    try:
+        policy = retrieval_module.get_retrieval_security_policy()
+        assert policy.calibration_embedding_model == "jinaai/jina-clip-v1"
+        assert policy.max_distance == pytest.approx(0.643872)
+    finally:
+        retrieval_module.reset_retrieval_security_policy_cache()
+        get_settings.cache_clear()
+
+
+def test_preinstalled_policy_cache_is_a_full_regime_bypass(monkeypatch):
+    """The shipped _POLICY_CACHE test hook stays a full bypass: hermetic tests
+    installing their own policy must never hit the provider-regime assertion
+    (even under a local runtime regime with a non-fastembed calibration)."""
+    from app.config import get_settings
+    from app.services import retrieval as retrieval_module
+
+    _regime_env(monkeypatch, "local")
+    installed = _policy(
+        max_distance=1e9,
+        per_source_cap=1000,
+        per_document_cap=1000,
+        max_candidates=1000,
+        near_duplicate_jaccard=1.0,
+        calibration_fixture_sha256="hermetic-test",
+        calibration_embedding_model="hash-test",
+    )
+    retrieval_module._POLICY_CACHE = installed
+    try:
+        assert retrieval_module.get_retrieval_security_policy() is installed
+    finally:
+        retrieval_module.reset_retrieval_security_policy_cache()
+        get_settings.cache_clear()
+
+
+def test_regime_assertion_is_model_identity_not_provider_name():
+    """A local-calibrated policy under a local runtime regime is fine: the
+    refusal compares effective embedding-model identity, it is not a blanket
+    ban on the local provider name."""
+    from app.services.retrieval_security import (
+        LOCAL_HASH_EMBEDDING_MODEL,
+        RetrievalSecurityRegimeError,
+        assert_policy_matches_runtime_regime,
+        effective_runtime_embedding_model,
+    )
+
+    class _Regime:
+        embedding_provider = "local"
+        embedding_model = "jinaai/jina-clip-v1"  # ignored by the local provider
+
+    assert effective_runtime_embedding_model(_Regime()) == LOCAL_HASH_EMBEDDING_MODEL
+
+    local_calibrated = _policy(
+        calibration_embedding_model=LOCAL_HASH_EMBEDDING_MODEL,
+        max_distance=12.0,
+    )
+    assert assert_policy_matches_runtime_regime(local_calibrated, _Regime()) is None
+
+    fastembed_calibrated = _policy(
+        calibration_embedding_model="jinaai/jina-clip-v1"
+    )
+    with pytest.raises(RetrievalSecurityRegimeError):
+        assert_policy_matches_runtime_regime(fastembed_calibrated, _Regime())
+
+
 def test_production_graph_contexts_pre_rank_by_min_hop_on_equal_graph_score():
     """D-23: production graph metadata carries the hop under ``min_hop``; with
     equal graph_score the lower-hop chunk must rank (and be selected) first."""

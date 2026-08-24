@@ -98,7 +98,7 @@ Endpoints:
 - Swagger UI: <http://localhost:8000/docs>
 - Host-only Chroma endpoint: <http://127.0.0.1:8001>
 
-The first embedding request can be slow because FastEmbed downloads and initializes the ONNX model. Relational data and Chroma data persist in separate named Docker volumes.
+The first embedding request can be slow because FastEmbed downloads and initializes the ONNX model. Relational data, Chroma data, and the FastEmbed model cache (`/tmp/fastembed_cache` in-container, ~500MB for `jinaai/jina-clip-v1`) persist in separate named Docker volumes, so `docker compose up --force-recreate` reuses the downloaded model instead of re-downloading it.
 
 ### 3. Ingest documents
 
@@ -370,13 +370,26 @@ All application settings use the `RAG_` prefix and load from `.env`.
 | `RAG_GRAPH_EXTRACTION_MODEL` | answer model | `gemma4` | Optional extraction-specific model |
 | `RAG_GRAPH_MAX_HOPS` | `2` | `2` | Configured hop bound; HTTP requests currently use their own validated `graph_max_hops` field (default 2, range 1–3) |
 | `RAG_EXTRACTION_LEASE_SECONDS` | `600` | `600` | Graph extraction lease duration in seconds (range 60–3600); an expired pending lease can be reclaimed by a backfill retry, and reconciliation terminalizes still-pending extractions as failed |
-| `RAG_EMBEDDING_PROVIDER` | `fastembed` | `fastembed` | `local`, `fastembed`, or `openai` |
-| `RAG_EMBEDDING_MODEL` | `jinaai/jina-clip-v1` | same | Embedding model |
+| `RAG_EMBEDDING_PROVIDER` | `fastembed` | `fastembed` | `local`, `fastembed`, or `openai`; selects the embedding regime (see below) |
+| `RAG_EMBEDDING_MODEL` | `jinaai/jina-clip-v1` | same | Embedding model (realized by the `fastembed`/`openai` providers; ignored by `local`) |
 | `RAG_DATABASE_URL` | `sqlite:///./rag.db` | `sqlite:////data/rag.db` | SQLAlchemy database URL |
 | `RAG_CHROMA_HOST` | empty | `vectordb` | Chroma host; empty selects standalone modes |
 | `RAG_CHROMA_PORT` | `8000` | `8000` | Chroma server port |
 | `RAG_CHROMA_PERSIST_DIRECTORY` | empty | empty | Standalone persistent-client path when host is empty |
 | `RAG_OPENAI_API_KEY` | empty | placeholder | Used only by OpenAI-oriented provider paths |
+
+### Embedding regimes and the retrieval-security policy
+
+The pipeline has two embedding regimes, selected with `RAG_EMBEDDING_PROVIDER`:
+
+- **fastembed (normalized, the calibrated/production regime)** — `RAG_EMBEDDING_PROVIDER=fastembed` with `RAG_EMBEDDING_MODEL=jinaai/jina-clip-v1` produces normalized real-model vectors. The retrieval-security policy (`config/retrieval-security-policy.json`, `max_distance` 0.643872, l2) was calibrated under exactly this regime, and the API refuses to start (and any process refuses to load the policy) with a typed, fail-closed error naming both regimes when the runtime regime does not match the policy's calibration — e.g. `RAG_EMBEDDING_PROVIDER=local` under the committed policy. Hermetic tests that install their own policy through the `_POLICY_CACHE` hook are a full bypass of that check.
+- **local hash (hermetic/deterministic)** — `RAG_EMBEDDING_PROVIDER=local` is a deterministic SHA-256 hash embedding used by hermetic and deterministic tests. Its vectors are unnormalized (l2 distances around 1e1), so every calibrated distance threshold is meaningless under it; retrieval under this regime requires a policy calibrated (or scoped) for it.
+
+Validator requirements:
+
+- `scripts/validate_phase10b.py` judges exact distance-calibrated retrieval outcomes and fails fast with a machine-readable `provider_mismatch` (exit 2) unless the live settings resolve `fastembed` plus the policy's calibrated model.
+- `scripts/validate_phase10a.py` is regime-independent: its deterministic lane pins topology/RRF-fusion semantics with the hash embedder under a lane-scoped policy (production caps, neutralized distance control), and its live lane asserts ingestion/provider behavior only.
+- `scripts/validate_phase10c.py` judges content-safety enforcement (no distance-calibrated verdicts) and imposes no embedding-regime precondition.
 
 ## Project Structure
 
