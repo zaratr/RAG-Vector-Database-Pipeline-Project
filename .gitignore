@@ -25,6 +25,3 @@ query*.json
 # Editor junk
 *~
 *.un~
-
-# Phase 10 gate artifacts (plan §10B)
-.hermes/reports/
