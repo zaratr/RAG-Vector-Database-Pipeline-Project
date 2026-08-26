@@ -12,7 +12,10 @@ class Settings(BaseSettings):
     app_name: str = Field(default="RAG Pipeline API")
     debug: bool = Field(default=True)
     database_url: str = Field(default="sqlite:///./rag.db")
-    embedding_provider: Literal["local", "fastembed", "openai"] = Field(default="fastembed")
+    # "local" (deterministic hash embeddings, no model downloads) matches the
+    # Dockerfile ENV default and keeps a bare environment runnable; production
+    # deployments opt into "fastembed" via environment or .env.
+    embedding_provider: Literal["local", "fastembed", "openai"] = Field(default="local")
     embedding_model: str = Field(default="jinaai/jina-clip-v1")
     vector_store: Literal["chroma"] = Field(default="chroma")
     llm_provider: Literal["dummy", "ollama", "openai"] = Field(default="ollama")
