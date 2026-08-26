@@ -34,7 +34,7 @@ def test_review_input_schema_rejects_actionable_warn_with_approved():
 
 def test_write_gate_report_refuses_existing_approved_pair(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    approvals_dir = tmp_path / ".hermes" / "reports" / "approvals"
+    approvals_dir = tmp_path / "reports" / "approvals"
     approvals_dir.mkdir(parents=True)
     (approvals_dir / "phase10a.json").write_text(
         json.dumps({"terminal_verdict": "APPROVED"}), encoding="utf-8"
@@ -49,7 +49,7 @@ def test_write_gate_report_refuses_existing_approved_pair(tmp_path, monkeypatch)
 
 def test_write_gate_report_archives_existing_not_approved_pair_before_retry(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    approvals_dir = tmp_path / ".hermes" / "reports" / "approvals"
+    approvals_dir = tmp_path / "reports" / "approvals"
     approvals_dir.mkdir(parents=True)
     (approvals_dir / "phase10a.json").write_text(
         json.dumps({"terminal_verdict": "NOT APPROVED"}), encoding="utf-8"
@@ -60,7 +60,7 @@ def test_write_gate_report_archives_existing_not_approved_pair_before_retry(tmp_
 
     write_report(gate="phase10a", plan="plan.md")
 
-    archive_dir = tmp_path / ".hermes" / "reports" / "approval-attempts" / "phase10a"
+    archive_dir = tmp_path / "reports" / "approval-attempts" / "phase10a"
     assert archive_dir.exists()
     archived_files = list(archive_dir.iterdir())
     assert len(archived_files) >= 3  # report.json, report.md, source-manifest.json
@@ -69,7 +69,7 @@ def test_write_gate_report_archives_existing_not_approved_pair_before_retry(tmp_
 def test_write_gate_report_validates_command_ledger_completeness(tmp_path, monkeypatch):
     """A command ledger with missing steps must fail writer validation."""
     monkeypatch.chdir(tmp_path)
-    (tmp_path / ".hermes" / "reports").mkdir(parents=True)
+    (tmp_path / "reports").mkdir(parents=True)
 
     from scripts.write_phase10_gate_report import validate_command_ledger_for_gate
 
@@ -80,7 +80,7 @@ def test_write_gate_report_validates_command_ledger_completeness(tmp_path, monke
 
 def test_write_gate_report_validates_source_manifest_hash_matches_build_manifest(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    reports_dir = tmp_path / ".hermes" / "reports"
+    reports_dir = tmp_path / "reports"
     reports_dir.mkdir(parents=True)
 
     build_manifest = reports_dir / "phase10a-source-manifest.json"
@@ -99,7 +99,7 @@ def test_write_gate_report_validates_source_manifest_hash_matches_build_manifest
 def test_verify_phase10_approvals_validates_exact_required_gate_set(tmp_path, monkeypatch):
     """Missing any required gate must fail verification."""
     monkeypatch.chdir(tmp_path)
-    approvals_dir = tmp_path / ".hermes" / "reports" / "approvals"
+    approvals_dir = tmp_path / "reports" / "approvals"
     approvals_dir.mkdir(parents=True)
     # Only create one gate, missing the rest
     (approvals_dir / "phase10a.json").write_text(
@@ -117,7 +117,7 @@ def test_verify_phase10_approvals_validates_exact_required_gate_set(tmp_path, mo
 
 def test_verify_phase10_approvals_rejects_any_fail_finding(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    approvals_dir = tmp_path / ".hermes" / "reports" / "approvals"
+    approvals_dir = tmp_path / "reports" / "approvals"
     approvals_dir.mkdir(parents=True)
     for gate in ["phase10a", "phase10b", "phase10c", "phase10d", "documentation", "final"]:
         verdict = "NOT APPROVED" if gate == "phase10a" else "APPROVED"
@@ -137,7 +137,7 @@ def test_verify_phase10_approvals_rejects_any_fail_finding(tmp_path, monkeypatch
 
 def test_verify_phase10_approvals_excludes_raw_compose_env_or_secret_bytes(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    approvals_dir = tmp_path / ".hermes" / "reports" / "approvals"
+    approvals_dir = tmp_path / "reports" / "approvals"
     approvals_dir.mkdir(parents=True)
     for gate in ["phase10a", "phase10b", "phase10c", "phase10d", "documentation", "final"]:
         content = json.dumps({

@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -22,8 +23,8 @@ def test_prepare_writes_source_manifest_and_binding_files(monkeypatch, tmp_path)
 
     prepare_task(task="10A.1", expected_head="a6e2c4f8b1d9")
 
-    assert (tmp_path / ".hermes" / "reports" / "task-10a-1-source-manifest.json").exists()
-    assert (tmp_path / ".hermes" / "reports" / "task-10a-1-source-binding.json").exists()
+    assert (tmp_path / "reports" / "task-10a-1-source-manifest.json").exists()
+    assert (tmp_path / "reports" / "task-10a-1-source-binding.json").exists()
 
 
 def test_prepare_invokes_docker_compose_build_with_argv_array_not_shell(monkeypatch, tmp_path):
@@ -123,3 +124,39 @@ def test_prepare_never_passes_credentials_in_argv(monkeypatch, tmp_path):
         assert "token" not in joined.lower()
         assert "password" not in joined.lower()
         assert "secret" not in joined.lower()
+
+
+def test_prepare_re_runs_keep_delivery_tree_hash_stable(monkeypatch, tmp_path):
+    """Re-running preparation into a non-ignored reports dir must not change
+    ``delivery_tree_sha256``: the manifest/binding outputs are excluded from
+    the fingerprint via the reports dir (regression: without passing
+    ``reports_dir`` the second run's fingerprint absorbed the first run's
+    output files and drifted)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+    subprocess.run(["git", "init", "-q"], check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "config", "user.email", "t@e.com"], check=True)
+    (repo / "README.md").write_text("# Project\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], check=True)
+    monkeypatch.setattr(
+        "scripts.prepare_phase10_task.subprocess.run", mock.Mock(returncode=0)
+    )
+
+    from scripts.prepare_phase10_task import prepare_task
+
+    def delivery_hash() -> str:
+        manifest = json.loads(
+            (repo / "reports" / "task-10a-1-source-manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        return manifest["delivery_tree_sha256"]
+
+    prepare_task(task="10A.1", expected_head="a6e2c4f8b1d9")
+    first = delivery_hash()
+    prepare_task(task="10A.1", expected_head="a6e2c4f8b1d9")
+
+    assert delivery_hash() == first

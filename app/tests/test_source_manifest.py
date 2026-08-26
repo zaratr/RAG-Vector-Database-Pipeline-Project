@@ -103,14 +103,44 @@ def test_source_manifest_field_reader_rejects_unknown_field_name(isolated_repo, 
 
 
 def test_source_manifest_excludes_reports_directory(isolated_repo, tmp_path):
-    reports = isolated_repo / ".hermes" / "reports"
+    reports = isolated_repo / "reports"
     reports.mkdir(parents=True)
     (reports / "sensitive-output.json").write_text('{"token":"abc"}', encoding="utf-8")
 
     output = tmp_path / "manifest.json"
-    manifest = build_manifest(output_path=str(output))
+    manifest = build_manifest(output_path=str(output), reports_dir="reports")
 
     assert "sensitive-output" not in json.dumps(manifest)
+
+
+def test_source_manifest_normalizes_plan_path_without_absolute_entries(isolated_repo, tmp_path):
+    """The operator-supplied plan path must never embed machine-specific
+    absolute paths, and an in-repo plan must not be double-counted."""
+    # In-tree plan: tracked, so the tree walk already lists it exactly once.
+    (isolated_repo / "docs").mkdir()
+    (isolated_repo / "docs" / "plan.md").write_text("# Plan\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "plan"], check=True)
+
+    in_tree = build_manifest(
+        output_path=str(tmp_path / "m-in.json"),
+        plan_path="docs/plan.md",
+    )
+    in_tree_paths = [f["path"] for f in in_tree["files"]]
+    assert in_tree_paths.count("docs/plan.md") == 1
+    assert str(isolated_repo) not in json.dumps(in_tree)
+
+    # Out-of-tree plan: exactly one stable basename-label entry, no absolute
+    # path string anywhere in the manifest, and stable across runs.
+    external = tmp_path / "external-plan.md"
+    external.write_text("# External\n", encoding="utf-8")
+    out1 = build_manifest(output_path=str(tmp_path / "m-out1.json"), plan_path=str(external))
+    out2 = build_manifest(output_path=str(tmp_path / "m-out2.json"), plan_path=str(external))
+
+    out_paths = [f["path"] for f in out1["files"]]
+    assert out_paths.count("external-plan.md") == 1
+    assert str(tmp_path) not in json.dumps(out1)
+    assert out1["delivery_tree_sha256"] == out2["delivery_tree_sha256"]
 
 
 def test_source_manifest_normalizes_paths_to_posix(isolated_repo, tmp_path):

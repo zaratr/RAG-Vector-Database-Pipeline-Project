@@ -1,66 +1,20 @@
+"""Self-contained tests for ``scripts/validate_phase10_plan_payloads``.
+
+Every test builds a synthetic plan document under ``tmp_path``; the suite must
+pass from a clean checkout with no external plan document present. The CLI
+validator remains available to operators via an explicit ``--plan`` path.
+
+Earlier revisions pinned some of these tests to a plan document stored outside
+the repository. Per the self-containment directive those document-pinned
+assertions were removed; what remains (and what the converted tests cover) is
+the validator machinery: marker and prose declaration parsing, inline-text
+extraction, byte-count/SHA-256 verification on both the success and failure
+paths, and the no-payload-leak guarantee.
+"""
+
 import json
-from pathlib import Path
 
 import pytest
-
-PLAN_PATH = Path(__file__).resolve().parents[2] / ".hermes" / "plans" / (
-    "2026-08-01_094008-phase-10-contract-reassessment-and-implementation.md"
-)
-
-
-def test_validate_plan_payloads_locates_all_json_fence_payloads():
-    from scripts.validate_phase10_plan_payloads import locate_payloads
-
-    payloads = locate_payloads(str(PLAN_PATH))
-
-    labels = {p["label"] for p in payloads}
-    assert "content-safety-policy" in labels
-    assert "content-safety-fixture" in labels
-    assert "context-security-policy" in labels
-    assert "attack-corpus" in labels
-
-
-def test_validate_plan_payloads_asserts_declared_byte_count_for_content_safety_policy():
-    from scripts.validate_phase10_plan_payloads import locate_payloads, reserialize_payload
-
-    payloads = locate_payloads(str(PLAN_PATH))
-    policy = next(p for p in payloads if p["label"] == "content-safety-policy")
-    serialized = reserialize_payload(policy)
-
-    assert len(serialized) == 1785
-
-
-def test_validate_plan_payloads_asserts_declared_sha256_for_content_safety_policy():
-    import hashlib
-
-    from scripts.validate_phase10_plan_payloads import locate_payloads, reserialize_payload
-
-    payloads = locate_payloads(str(PLAN_PATH))
-    policy = next(p for p in payloads if p["label"] == "content-safety-policy")
-    serialized = reserialize_payload(policy)
-
-    assert hashlib.sha256(serialized).hexdigest() == "2a9c9c5d4d44cce8ecb02bbf2b8586f6dd86dc410e474b93552e22180637d4f1"
-
-
-def test_validate_plan_payloads_asserts_declared_byte_count_for_context_security_policy():
-    from scripts.validate_phase10_plan_payloads import locate_payloads, reserialize_payload
-
-    payloads = locate_payloads(str(PLAN_PATH))
-    policy = next(p for p in payloads if p["label"] == "context-security-policy")
-    serialized = reserialize_payload(policy)
-
-    assert len(serialized) == 2207
-
-
-def test_validate_plan_payloads_locates_inline_text_source_trust_policy():
-    from scripts.validate_phase10_plan_payloads import locate_payloads
-
-    payloads = locate_payloads(str(PLAN_PATH))
-    trust = next((p for p in payloads if p["label"] == "source-trust-policy"), None)
-
-    assert trust is not None
-    assert trust["payload_type"] == "inline-text"
-    assert len(trust["serialized"]) == 288
 
 
 def test_validate_plan_payloads_exits_2_on_missing_payload(tmp_path):
@@ -110,58 +64,82 @@ def test_validate_plan_payloads_does_not_print_payload_bytes(tmp_path, capsys):
     assert "secret" not in captured.err
 
 
-def test_validate_plan_payloads_locates_prose_declared_attack_corpus():
-    """The 17,757-byte corpus fence is prose-declared; the full-text fence scan
-    must parse it (a payload larger than the marker fence window)."""
-    import hashlib
+def test_validate_plan_payloads_locates_inline_text_payload_via_type_inline_marker(tmp_path):
+    """A ``type=inline`` marker binds the backtick-wrapped JSON that follows it.
 
-    from scripts.validate_phase10_plan_payloads import locate_payloads, reserialize_payload
+    Converted from a document-pinned test: the machinery under assertion is the
+    inline-text extraction path (payload_type, canonical serialization), not any
+    particular plan document's content.
+    """
+    from scripts.validate_phase10_plan_payloads import locate_payloads
 
-    payloads = locate_payloads(str(PLAN_PATH))
-    corpus = next(p for p in payloads if p["label"] == "attack-corpus")
-
-    assert corpus["payload_type"] == "json-fence"
-    serialized = reserialize_payload(corpus)
-    assert len(serialized) == 17757
-    assert (
-        hashlib.sha256(serialized).hexdigest()
-        == "bca0c8eed73c02a346b92658b9545620aa4565e5decb8befc6a74f541f8d03ce"
+    obj = {"source": "operator-supplied", "trust": "high"}
+    serialized = (
+        json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        + b"\n"
+    )
+    plan = tmp_path / "inline.md"
+    plan.write_text(
+        "# Plan\n\n<!-- payload: source-trust-policy bytes="
+        + str(len(serialized))
+        + " type=inline -->\n`"
+        + serialized.decode("utf-8")
+        + "`\n",
+        encoding="utf-8",
     )
 
+    payloads = locate_payloads(str(plan))
+    trust = next(p for p in payloads if p["label"] == "source-trust-policy")
 
-def test_validate_plan_payloads_locates_text_fence_owasp_excerpt():
-    """The OWASP excerpt is a raw-text payload bound by a leading prose
-    declaration; it serializes as raw UTF-8 bytes plus a final LF."""
+    assert trust["payload_type"] == "inline-text"
+    assert trust["serialized"] == serialized
+
+
+def test_validate_plan_passes_when_every_declared_payload_matches(tmp_path):
+    """validate_plan must fully pass when all required payloads are present and
+    their declared byte counts and SHA-256 digests match (any defect raises
+    SystemExit(2)).
+
+    Converted from a document-pinned test: the assertion logic (full success
+    path of the validator, including SHA-256 verification and the inline-text
+    required payload) is preserved against a synthetic plan document.
+    """
     import hashlib
 
-    from scripts.validate_phase10_plan_payloads import locate_payloads, reserialize_payload
-
-    payloads = locate_payloads(str(PLAN_PATH))
-    excerpt = next(p for p in payloads if p["label"] == "owasp-excerpt")
-
-    assert excerpt["payload_type"] == "text-fence"
-    serialized = reserialize_payload(excerpt)
-    assert len(serialized) == 436
-    assert (
-        hashlib.sha256(serialized).hexdigest()
-        == "e024da7f5a562882e3ba8c8eae62d74db29d9aa86ec20b5512ad6be58c0c6200"
-    )
-
-
-def test_validate_plan_payloads_locates_every_manifest_label():
-    """All seven B-16 manifest labels must resolve to exactly one payload each."""
-    from scripts.validate_phase10_plan_payloads import KNOWN_LABELS, locate_payloads
-
-    payloads = locate_payloads(str(PLAN_PATH))
-
-    assert {p["label"] for p in payloads} == KNOWN_LABELS
-
-
-def test_validate_plan_passes_on_the_committed_plan():
-    """validate_plan must fully pass (any defect raises SystemExit(2))."""
     from scripts.validate_phase10_plan_payloads import validate_plan
 
-    validate_plan(str(PLAN_PATH))
+    def fence(label: str, obj: dict) -> str:
+        body = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        raw = body.encode("utf-8") + b"\n"
+        return (
+            f"<!-- payload: {label} bytes={len(raw)} "
+            f"sha256={hashlib.sha256(raw).hexdigest()} -->\n```json\n{body}\n```\n"
+        )
+
+    inline_obj = {"source": "operator-supplied"}
+    inline_raw = (
+        json.dumps(inline_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        + b"\n"
+    )
+    plan = tmp_path / "complete.md"
+    plan.write_text(
+        "# Plan\n\n"
+        + fence("content-safety-policy", {"policy": "block"})
+        + "\n"
+        + fence("content-safety-fixture", {"fixture": True})
+        + "\n"
+        + fence("context-security-policy", {"context": "strict"})
+        + "\n"
+        + fence("attack-corpus", {"attacks": []})
+        + "\n"
+        + f"<!-- payload: source-trust-policy bytes={len(inline_raw)} type=inline -->\n"
+        + "`"
+        + inline_raw.decode("utf-8")
+        + "`\n",
+        encoding="utf-8",
+    )
+
+    validate_plan(str(plan))
 
 
 def test_prose_trailing_declaration_locates_preceding_fence(tmp_path):

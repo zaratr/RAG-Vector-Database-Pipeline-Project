@@ -4,15 +4,16 @@ Produces two content-addressed domains that are intentionally different and neve
 compared:
 
 * ``delivery_tree_sha256`` — over tracked files plus non-ignored untracked
-  *delivery* files (including this Phase 10 plan under ``.hermes/plans/``).
+  *delivery* files (and, when the operator supplies ``plan_path``, that plan
+  document wherever it lives).
 * ``image_context_sha256`` — over exactly the non-ignored Docker build-context
   files after applying ``.dockerignore``.
 
 Both domains are built from sorted POSIX ``path/status/sha256`` tuples so that
 the manifest is deterministic for a given tree. Git status porcelain entries
 (deletions, modifications, untracked) are included so that a dirty tree is
-distinguished from a clean one. Ignored files and the Phase 10 reports
-directory are excluded from both domains.
+distinguished from a clean one. Ignored files and (when supplied) the
+operator-designated reports directory are excluded from both domains.
 
 The manifest JSON is written canonically (sorted keys, ``",:"`` separators,
 ASCII) followed by a trailing LF, and is never printed to stdout by the CLI.
@@ -41,14 +42,13 @@ FIELDS = {
     "image_context_sha256": r"^[0-9a-f]{64}$",
 }
 
-# The Phase 10 plan is delivery evidence even though it lives beneath .hermes
-# (which .dockerignore excludes from the image context). It must be part of the
-# delivery tree fingerprint.
-PLAN_PATH = Path(".hermes/plans/2026-08-01_094008-phase-10-contract-reassessment-and-implementation.md")
-
+# A plan document is delivery evidence even when it lives outside the tracked
+# tree (e.g. outside the Docker image context). The operator supplies its path
+# explicitly via ``plan_path``; no location is assumed by default.
+#
 # Reports produced by gates are never delivery evidence and never enter the
-# image; they are excluded from both domains.
-REPORTS_DIR = Path(".hermes/reports")
+# image; the operator designates the reports directory via ``reports_dir`` and
+# it is then excluded from both domains.
 
 REPO_ROOT_HINT_FILES = (".git", "Dockerfile", "requirements.txt", "app")
 
@@ -89,13 +89,24 @@ def _porcelain_signature(porcelain_lines: list[str]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _is_ignored(path_str: str, cwd: Path, *, respect_dockerignore: bool) -> bool:
+def _reports_prefix(reports_dir: str | Path | None) -> str | None:
+    """Normalize an operator-supplied reports directory to a POSIX prefix."""
+    if reports_dir is None:
+        return None
+    return Path(reports_dir).as_posix().rstrip("/")
+
+
+def _is_ignored(
+    path_str: str,
+    cwd: Path,
+    *,
+    respect_dockerignore: bool,
+    reports_prefix: str | None = None,
+) -> bool:
     """Return True if ``path_str`` is git-ignored (and, optionally, docker-ignored)."""
-    parts = Path(path_str).parts
-    if str(REPORTS_DIR) in parts:
-        return True
-    if respect_dockerignore and path_str.startswith(".hermes/"):
-        # The image context excludes the entire .hermes tree per .dockerignore.
+    if reports_prefix is not None and (
+        path_str == reports_prefix or path_str.startswith(reports_prefix + "/")
+    ):
         return True
     if respect_dockerignore and _docker_ignores(cwd, path_str):
         return True
@@ -191,12 +202,36 @@ def _is_deletion(status: str) -> bool:
     return status.startswith("D") or status[1:2] == "D"
 
 
-def _delivery_files(cwd: Path) -> list[str]:
-    """Tracked files + non-ignored untracked delivery files, including the plan.
+def _plan_label(plan_path: str | Path, cwd: Path) -> str | None:
+    """Normalize an operator-supplied plan path to a stable manifest label.
+
+    A plan that resolves inside the repository is already covered by the tree
+    walk (tracked file or porcelain entry), so no extra entry is added — this
+    avoids double-counting and machine-specific absolute paths. A plan outside
+    the repository gets a single stable basename label.
+    """
+    resolved = Path(plan_path).resolve()
+    if not resolved.is_file():
+        return None
+    try:
+        resolved.relative_to(cwd)
+    except ValueError:
+        return resolved.name
+    return None
+
+
+def _delivery_files(
+    cwd: Path,
+    plan_path: str | Path | None = None,
+    reports_dir: str | Path | None = None,
+) -> list[str]:
+    """Tracked files + non-ignored untracked delivery files, plus the plan.
 
     Deletions are recorded so the manifest reflects the working-tree delta; a
-    deleted delivery file remains part of the delivery fingerprint.
+    deleted delivery file remains part of the delivery fingerprint. The plan,
+    when supplied, is normalized per ``_plan_label`` (never an absolute path).
     """
+    reports_prefix = _reports_prefix(reports_dir)
     porcelain_lines = _git_porcelain(cwd)
     tracked = set(_git_tracked_files(cwd))
     extra: set[str] = set()
@@ -206,15 +241,21 @@ def _delivery_files(cwd: Path) -> list[str]:
         if _is_deletion(status):
             extra.add(path)  # deletion recorded as a delivery delta
             continue
-        if not _is_ignored(path, cwd, respect_dockerignore=False):
+        if not _is_ignored(
+            path, cwd, respect_dockerignore=False, reports_prefix=reports_prefix
+        ):
             extra.add(path)
     files = tracked | extra
-    if PLAN_PATH.is_file():
-        files.add(str(PLAN_PATH).replace("\\", "/"))
+    plan_label = _plan_label(plan_path, cwd) if plan_path is not None else None
+    if plan_label is not None:
+        files.add(plan_label)
     return sorted(p.replace("\\", "/") for p in files)
 
 
-def _image_context_files(cwd: Path) -> list[str]:
+def _image_context_files(
+    cwd: Path,
+    reports_dir: str | Path | None = None,
+) -> list[str]:
     """Committed Docker build-context files (tracked, non-dockerignored).
 
     The image provenance is the content-addressed committed context; untracked
@@ -222,10 +263,13 @@ def _image_context_files(cwd: Path) -> list[str]:
     resolve to the same image context (and so the delivery and image domains
     differ whenever the tree is dirty). Deletions are recorded as deltas.
     """
+    reports_prefix = _reports_prefix(reports_dir)
     porcelain_lines = _git_porcelain(cwd)
     tracked = {
         p for p in _git_tracked_files(cwd)
-        if not _is_ignored(p, cwd, respect_dockerignore=True)
+        if not _is_ignored(
+            p, cwd, respect_dockerignore=True, reports_prefix=reports_prefix
+        )
     }
     deltas: set[str] = set()
     for status, path in _porcelain_entries(porcelain_lines):
@@ -285,20 +329,32 @@ def _is_dirty(porcelain_lines: list[str]) -> bool:
     return any(line.strip() for line in porcelain_lines)
 
 
-def build_manifest(output_path: str | None = None) -> dict:
+def build_manifest(
+    output_path: str | None = None,
+    *,
+    plan_path: str | Path | None = None,
+    reports_dir: str | Path | None = None,
+) -> dict:
     """Build (and optionally write) the canonical source manifest.
 
     Args:
         output_path: If provided, write canonical JSON + LF to this path and
             create parent directories. The file is overwritten atomically.
+        plan_path: Optional operator-supplied plan document to include in the
+            delivery fingerprint (no default location is assumed). A plan that
+            resolves inside the repository adds no extra entry (the tree walk
+            already covers it); an out-of-repo plan adds one stable basename
+            label — never a machine-specific absolute path.
+        reports_dir: Optional operator-designated reports directory excluded
+            from both fingerprint domains.
 
     Returns:
         The manifest as a Python dict.
     """
     cwd = _find_repo_root()
     porcelain_lines = _git_porcelain(cwd)
-    delivery = _delivery_files(cwd)
-    image_context = _image_context_files(cwd)
+    delivery = _delivery_files(cwd, plan_path=plan_path, reports_dir=reports_dir)
+    image_context = _image_context_files(cwd, reports_dir=reports_dir)
     delivery_hash = _fingerprint(cwd, delivery, porcelain_lines=porcelain_lines)
     image_hash = _fingerprint(cwd, image_context, porcelain_lines=porcelain_lines)
     porcelain_hash = _porcelain_signature(porcelain_lines)
@@ -365,6 +421,16 @@ def _main(argv: list[str] | None = None) -> int:
         "--field",
         help="Print a single validated scalar (commit_sha|dirty|image_context_sha256).",
     )
+    parser.add_argument(
+        "--plan",
+        help="Optional plan document for the delivery fingerprint "
+        "(no default location is assumed; in-repo plans add no extra entry, "
+        "out-of-repo plans add a stable basename label).",
+    )
+    parser.add_argument(
+        "--reports-dir",
+        help="Optional reports directory excluded from both fingerprint domains.",
+    )
     args = parser.parse_args(argv)
 
     if args.input:
@@ -375,7 +441,11 @@ def _main(argv: list[str] | None = None) -> int:
 
     if not args.output:
         parser.error("--output is required when not reading a field")
-    build_manifest(output_path=args.output)
+    build_manifest(
+        output_path=args.output,
+        plan_path=args.plan,
+        reports_dir=args.reports_dir,
+    )
     return 0
 
 

@@ -28,7 +28,7 @@ def test_gate_steps_are_typed_argv_arrays_not_shell_strings():
 
 def test_run_recorded_gate_stops_at_first_primary_failure(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    reports_dir = tmp_path / ".hermes" / "reports"
+    reports_dir = tmp_path / "reports"
     reports_dir.mkdir(parents=True)
 
     call_log = []
@@ -56,7 +56,7 @@ def test_run_recorded_gate_stops_at_first_primary_failure(monkeypatch, tmp_path)
 
 def test_run_recorded_gate_always_executes_restoration_in_finally(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    reports_dir = tmp_path / ".hermes" / "reports"
+    reports_dir = tmp_path / "reports"
     reports_dir.mkdir(parents=True)
 
     restoration_called = []
@@ -79,7 +79,7 @@ def test_run_recorded_gate_always_executes_restoration_in_finally(monkeypatch, t
 
 def test_run_recorded_gate_restoration_failure_exits_2(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    reports_dir = tmp_path / ".hermes" / "reports"
+    reports_dir = tmp_path / "reports"
     reports_dir.mkdir(parents=True)
 
     def fake_run(argv, **kwargs):
@@ -97,7 +97,7 @@ def test_run_recorded_gate_restoration_failure_exits_2(monkeypatch, tmp_path):
 
 def test_command_ledger_has_deterministic_order_after_timestamp_normalization(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    reports_dir = tmp_path / ".hermes" / "reports"
+    reports_dir = tmp_path / "reports"
     reports_dir.mkdir(parents=True)
 
     monkeypatch.setattr(
@@ -120,7 +120,7 @@ def test_command_ledger_has_deterministic_order_after_timestamp_normalization(mo
 
 def test_command_ledger_has_secret_scan_passed_on_every_row(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    reports_dir = tmp_path / ".hermes" / "reports"
+    reports_dir = tmp_path / "reports"
     reports_dir.mkdir(parents=True)
 
     monkeypatch.setattr(

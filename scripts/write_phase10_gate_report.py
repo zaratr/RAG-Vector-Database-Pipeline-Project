@@ -10,7 +10,9 @@ Finalization is atomic and ordered:
 
 An existing APPROVED pair is immutable/refused. Before a retry, an existing
 complete NOT APPROVED pair and sidecar are atomically archived together to
-``.hermes/reports/approval-attempts/<gate>/`` before the new pair is written.
+``<reports>/approval-attempts/<gate>/`` before the new pair is written. The
+reports location defaults to ``reports/`` under the working directory and can
+be overridden with the ``reports_dir`` argument / ``--reports-dir`` flag.
 """
 
 from __future__ import annotations
@@ -28,8 +30,12 @@ from jsonschema import Draft202012Validator
 GATE_IDS = ("phase10a", "phase10b", "phase10c", "phase10d", "documentation", "final")
 
 _FIXTURES = Path("app/tests/fixtures")
-_REPORTS = Path(".hermes/reports")
-_APPROVALS = _REPORTS / "approvals"
+_DEFAULT_REPORTS = Path("reports")
+
+
+def _reports_root(reports_dir: str | None = None) -> Path:
+    """Resolve the reports root (operator-supplied or the neutral default)."""
+    return Path(reports_dir) if reports_dir else _DEFAULT_REPORTS
 
 
 def _load_schema(name: str) -> dict[str, Any]:
@@ -47,12 +53,13 @@ def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _existing_pair(gate: str) -> tuple[Path, Path]:
-    return _APPROVALS / f"{gate}.json", _APPROVALS / f"{gate}.md"
+def _existing_pair(gate: str, root: Path) -> tuple[Path, Path]:
+    approvals = root / "approvals"
+    return approvals / f"{gate}.json", approvals / f"{gate}.md"
 
 
-def _verdict(gate: str) -> str | None:
-    json_path, _ = _existing_pair(gate)
+def _verdict(gate: str, root: Path) -> str | None:
+    json_path, _ = _existing_pair(gate, root)
     if not json_path.is_file():
         return None
     try:
@@ -61,23 +68,24 @@ def _verdict(gate: str) -> str | None:
         return None
 
 
-def write_report(gate: str, plan: str) -> None:
+def write_report(gate: str, plan: str, reports_dir: str | None = None) -> None:
     """Write the approval pair for ``gate``, honoring immutability and archiving."""
     if gate not in GATE_IDS:
         raise ValueError(f"unknown gate: {gate!r}")
-    json_path, md_path = _existing_pair(gate)
-    verdict = _verdict(gate)
+    root = _reports_root(reports_dir)
+    json_path, md_path = _existing_pair(gate, root)
+    verdict = _verdict(gate, root)
     if verdict == "APPROVED":
         raise RuntimeError(f"{gate} approval pair is immutable: refusing to overwrite APPROVED")
 
     # Archive an existing NOT APPROVED pair before retry.
     if json_path.is_file() or md_path.is_file():
-        _archive_existing(gate)
+        _archive_existing(gate, root)
 
-    _APPROVALS.mkdir(parents=True, exist_ok=True)
-    review_input = _load_review_input(gate)
-    ledger_path = _REPORTS / f"{gate}-command-ledger.json"
-    command_ledger = _load_command_ledger(gate)
+    (root / "approvals").mkdir(parents=True, exist_ok=True)
+    review_input = _load_review_input(gate, root)
+    ledger_path = root / f"{gate}-command-ledger.json"
+    command_ledger = _load_command_ledger(gate, root)
     # Only enforce full ledger completeness when a ledger was actually recorded
     # for this gate; an absent ledger (e.g. an isolated writer unit test) is
     # written through with an empty step list rather than blocking finalization.
@@ -113,9 +121,9 @@ def _atomic_replace(tmp: Path, final: Path) -> None:
     os.replace(tmp, final)
 
 
-def _archive_existing(gate: str) -> None:
-    json_path, md_path = _existing_pair(gate)
-    archive_dir = _REPORTS / "approval-attempts" / gate
+def _archive_existing(gate: str, root: Path) -> None:
+    json_path, md_path = _existing_pair(gate, root)
+    archive_dir = root / "approval-attempts" / gate
     archive_dir.mkdir(parents=True, exist_ok=True)
     utc = _utc_now().replace(":", "").replace("-", "")
     archived_hashes: dict[str, str] = {}
@@ -125,7 +133,7 @@ def _archive_existing(gate: str) -> None:
     if md_path.is_file():
         shutil.copy2(md_path, archive_dir / f"{utc}-report.md")
         archived_hashes["report_md"] = _sha256_file(md_path)
-    manifest = _REPORTS / f"{gate}-source-manifest.json"
+    manifest = root / f"{gate}-source-manifest.json"
     if manifest.is_file():
         shutil.copy2(manifest, archive_dir / f"{utc}-source-manifest.json")
         archived_hashes["source_manifest"] = _sha256_file(manifest)
@@ -141,15 +149,15 @@ def _archive_existing(gate: str) -> None:
     md_path.unlink(missing_ok=True)
 
 
-def _load_review_input(gate: str) -> dict[str, Any]:
-    path = _REPORTS / f"{gate}-review-input.json"
+def _load_review_input(gate: str, root: Path) -> dict[str, Any]:
+    path = root / f"{gate}-review-input.json"
     if path.is_file():
         return _read_json(path)
     return {}
 
 
-def _load_command_ledger(gate: str) -> dict[str, Any]:
-    path = _REPORTS / f"{gate}-command-ledger.json"
+def _load_command_ledger(gate: str, root: Path) -> dict[str, Any]:
+    path = root / f"{gate}-command-ledger.json"
     if path.is_file():
         return _read_json(path)
     return {"schema": "phase10-command-ledger-v1", "gate_id": gate, "steps": []}
@@ -222,8 +230,13 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--markdown-input")
     parser.add_argument("--markdown-output")
     parser.add_argument("--json-output")
+    parser.add_argument(
+        "--reports-dir",
+        help="Reports directory for approvals, ledgers, and archives "
+        f"(default: {_DEFAULT_REPORTS.as_posix()} under the working directory).",
+    )
     args = parser.parse_args(argv)
-    write_report(args.gate, args.plan)
+    write_report(args.gate, args.plan, reports_dir=args.reports_dir)
     return 0
 
 

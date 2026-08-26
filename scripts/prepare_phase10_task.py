@@ -3,8 +3,10 @@
 ``prepare_phase10_task.py --task TASK_ID --expected-head REVISION [--migration-owner]``:
 
 1. Normalizes the task id (``10A.1`` -> ``10a-1``, ``10D.2`` -> ``10d-2``).
-2. Writes ``.hermes/reports/task-<id>-source-manifest.json`` and a matching
-   source binding so the task's evidence is content-addressed before any build.
+2. Writes ``<reports>/task-<id>-source-manifest.json`` and a matching
+   source binding (default ``reports/`` under the working directory, or the
+   operator-supplied ``--reports-dir``) so the task's evidence is
+   content-addressed before any build.
 3. Builds the ``api`` and ``migrate`` images with ``--no-cache`` using the three
    validated source-manifest scalars as build arguments.
 4. When ``--migration-owner`` is present, runs ``docker compose run --rm migrate``
@@ -37,7 +39,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from scripts.source_manifest import build_manifest
 
-REPORTS_DIR = Path(".hermes/reports")
+DEFAULT_REPORTS_DIR = Path("reports")
 
 
 def normalize_task_id(task_id: str) -> str:
@@ -62,9 +64,9 @@ def _rc(result) -> int:
     return rc if isinstance(rc, int) and not isinstance(rc, bool) else 0
 
 
-def _manifest_paths(normalized: str) -> tuple[Path, Path]:
+def _manifest_paths(normalized: str, reports_dir: Path) -> tuple[Path, Path]:
     stem = f"task-{normalized}"
-    return REPORTS_DIR / f"{stem}-source-manifest.json", REPORTS_DIR / f"{stem}-source-binding.json"
+    return reports_dir / f"{stem}-source-manifest.json", reports_dir / f"{stem}-source-binding.json"
 
 
 def _build_env(manifest_path: Path) -> dict[str, str]:
@@ -205,13 +207,19 @@ def _fail(message: str) -> None:
     raise SystemExit(2)
 
 
-def prepare_task(task: str, expected_head: str, migration_owner: bool = False) -> None:
+def prepare_task(
+    task: str,
+    expected_head: str,
+    migration_owner: bool = False,
+    reports_dir: str | None = None,
+) -> None:
     """Run the full preparation sequence for a Phase 10 task."""
     normalized = normalize_task_id(task)
-    manifest_path, binding_path = _manifest_paths(normalized)
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    resolved_reports = Path(reports_dir) if reports_dir else DEFAULT_REPORTS_DIR
+    manifest_path, binding_path = _manifest_paths(normalized, resolved_reports)
+    resolved_reports.mkdir(parents=True, exist_ok=True)
 
-    build_manifest(output_path=str(manifest_path))
+    build_manifest(output_path=str(manifest_path), reports_dir=str(resolved_reports))
     _build_images(manifest_path)
     _write_binding(binding_path, manifest_path, services=["api", "migrate"])
     if migration_owner:
@@ -225,11 +233,17 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task", required=True)
     parser.add_argument("--expected-head", required=True)
     parser.add_argument("--migration-owner", action="store_true")
+    parser.add_argument(
+        "--reports-dir",
+        help="Directory for the task manifest/binding files "
+        f"(default: {DEFAULT_REPORTS_DIR.as_posix()} under the working directory).",
+    )
     args = parser.parse_args(argv)
     prepare_task(
         task=args.task,
         expected_head=args.expected_head,
         migration_owner=args.migration_owner,
+        reports_dir=args.reports_dir,
     )
     return 0
 
