@@ -298,6 +298,13 @@ def apply_document_filters(query, filters: dict | None, session: Session):
 
 
 def _ready_evidence_rows(session: Session, filters: dict):
+    """Ready-document evidence rows for path traversal.
+
+    The query is bounded at ``MAX_EVIDENCE_ROWS + 1`` rows (the same pattern
+    as ``retrieve_graph_contexts``) so the caller's cap check never needs to
+    materialize an unbounded result set first; the extra row is the
+    over-cap signal.
+    """
     query = (
         session.query(models.GraphEdgeEvidence)
         .join(models.GraphEdgeEvidence.extraction)
@@ -313,7 +320,7 @@ def _ready_evidence_rows(session: Session, filters: dict):
         .filter(models.Document.ingestion_status == "ready")
     )
     query = apply_document_filters(query, filters, session)
-    return query.all()
+    return query.limit(MAX_EVIDENCE_ROWS + 1).all()
 
 
 def resolve_graph_seeds(
