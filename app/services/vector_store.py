@@ -59,25 +59,6 @@ def _create_client() -> chromadb.api.ClientAPI:
     return chromadb.EphemeralClient()
 
 
-def _create_client() -> chromadb.api.ClientAPI:
-    """Create the correct Chroma client based on configuration.
-
-    Precedence:
-      1. chroma_host set       → HttpClient (Docker/production)
-      2. persist_directory set → PersistentClient (standalone)
-      3. otherwise             → EphemeralClient (tests/dev)
-    """
-    settings = get_settings()
-    if settings.chroma_host:
-        logger.info("Creating Chroma HttpClient(host=%s, port=%s)", settings.chroma_host, settings.chroma_port)
-        return chromadb.HttpClient(host=settings.chroma_host, port=settings.chroma_port)
-    if settings.chroma_persist_directory:
-        logger.info("Creating Chroma PersistentClient(path=%s)", settings.chroma_persist_directory)
-        return chromadb.PersistentClient(path=settings.chroma_persist_directory)
-    logger.info("Creating Chroma EphemeralClient")
-    return chromadb.EphemeralClient()
-
-
 class ChromaVectorStore:
     """Wrapper around Chroma DB with configurable client mode."""
 
