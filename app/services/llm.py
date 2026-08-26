@@ -31,9 +31,15 @@ class OpenAILLMClient:
         context_preview = " ".join(context)[:2000]
         return f"[OpenAI simulated] {query} | context: {context_preview}"
 
+class LLMProviderOutputError(Exception):
+    """The answer provider answered but its response envelope was unusable
+    (non-JSON body, missing/empty ``choices``, or missing/non-text
+    ``message.content``); maps to HTTP 502."""
+
+
 class OllamaLLMClient:
     """LLM client using Ollama's OpenAI-compatible API."""
-    
+
     def __init__(
         self,
         base_url: str,
@@ -70,7 +76,17 @@ class OllamaLLMClient:
         async with httpx.AsyncClient(timeout=120.0, transport=self.transport) as client:
             resp = await client.post(f"{self.base_url}/chat/completions", json=payload)
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+            try:
+                content = resp.json()["choices"][0]["message"]["content"]
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                raise LLMProviderOutputError(
+                    "LLM provider returned a malformed chat completion envelope"
+                ) from exc
+            if not isinstance(content, str):
+                raise LLMProviderOutputError(
+                    "LLM provider returned a chat completion without text content"
+                )
+            return content
 
 def get_llm_client(api_key: str | None = None, provider: str = "dummy",
                    base_url: str | None = None, model: str | None = None) -> LLMClient:

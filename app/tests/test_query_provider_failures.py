@@ -1,11 +1,13 @@
 """LLM provider failure contract for POST /query.
 
-The answer LLM is an external provider invoked during /query. Its transport
+The answer LLM is an external provider invoked during /query. Transport
 failures — connection refused, timeout, and 5xx responses — must surface as a
 stable, typed HTTP 503 with detail ``LLM provider unavailable`` (mirroring the
-graph-extractor and vector-store provider-failure conventions), never as an
-unhandled 500 with a traceback. All failure lanes are hermetic: the transport
-is either a raising stub or httpx.MockTransport, so no Ollama is needed.
+graph-extractor and vector-store provider-failure conventions), and a provider
+that answers unusable output (a non-JSON envelope) must surface as a typed 502
+with detail ``LLM provider failed`` — never an unhandled 500 with a traceback.
+All failure lanes are hermetic: the transport is either a raising stub or
+httpx.MockTransport, so no Ollama is needed.
 """
 from __future__ import annotations
 
@@ -66,6 +68,15 @@ def _llm_500_transport() -> httpx.MockTransport:
     """MockTransport whose /chat/completions answers HTTP 500."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="upstream exploded")
+
+    return httpx.MockTransport(handler)
+
+
+def _llm_malformed_envelope_transport() -> httpx.MockTransport:
+    """MockTransport whose /chat/completions answers 200 with a non-JSON
+    body — a provider that answers garbage instead of failing to answer."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html><body>proxy error page</body></html>")
 
     return httpx.MockTransport(handler)
 
@@ -155,6 +166,28 @@ def test_query_llm_http_500_returns_stable_503(monkeypatch):
 
     assert response.status_code == 503
     assert response.json()["detail"] == "LLM provider unavailable"
+    assert "Traceback" not in response.text
+
+
+def test_query_llm_malformed_envelope_returns_stable_502(monkeypatch):
+    """A production OllamaLLMClient whose endpoint answers 200 with a
+    non-JSON body raises LLMProviderOutputError; the route maps it to a
+    typed 502 (provider answered unusable output — distinct from the 503
+    transport-unavailable lane), never an unhandled 500 with a traceback."""
+    _ingest_one_document()
+    _use_llm_client(
+        monkeypatch,
+        OllamaLLMClient(
+            base_url="http://llm-invalid.test/v1",
+            model="gemma4:latest",
+            transport=_llm_malformed_envelope_transport(),
+        ),
+    )
+
+    response = client.post("/query", json={"query": "evidence", "top_k": 3})
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "LLM provider failed"
     assert "Traceback" not in response.text
 
 

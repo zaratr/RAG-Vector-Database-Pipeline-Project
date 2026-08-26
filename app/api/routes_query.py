@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.core.db import get_db
 from app.core.models import QueryRequest, QueryResponse
 from app.services.embeddings import get_embedding_provider
-from app.services.llm import get_llm_client
+from app.services.llm import LLMProviderOutputError, get_llm_client
 from app.services.rag import answer_query
 from app.services.graph_retrieval import GraphTraversalLimitError, UnsupportedGraphFilter
 from app.services.vector_store import get_vector_store
@@ -44,6 +44,10 @@ async def query(payload: QueryRequest, session: Session = Depends(get_db)):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except GraphTraversalLimitError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except LLMProviderOutputError as exc:
+        # The answer provider answered but its envelope was unusable: a typed
+        # 502, mirroring the graph-extraction provider-output convention.
+        raise HTTPException(status_code=502, detail="LLM provider failed") from exc
     except httpx.HTTPError as exc:
         # The answer LLM is an external provider: transport failures
         # (connection refused, timeout, 5xx via raise_for_status) surface as
