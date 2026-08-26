@@ -15,7 +15,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends vim git && rm -
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
+
+# Copy only what the image uses: the application package (including its
+# tests), the Alembic configuration plus in-package migration scripts used
+# by the one-shot migrator, the operator scripts, the graph traversal CLI,
+# and the pytest configuration for the documented in-container test run.
+# Local working-tree files (env files, databases, query payloads, diagrams)
+# are never baked into the image.
+COPY alembic.ini pytest.ini ./
+COPY app/ app/
+COPY scripts/ scripts/
+COPY src/ src/
 
 ENV RAG_EMBEDDING_PROVIDER=local \
     RAG_VECTOR_STORE=chroma
