@@ -1,8 +1,8 @@
 """Tests for the hardened Phase 10A.7 acceptance validator (F9 remediation).
 
-``scripts/validate_phase10a.py`` is load-bearing inside the recorded phase10a
-gate: its exit code is parsed by ``run_recorded_gate.py``. These tests prove
-the remediation contract:
+``scripts/validate_phase10a.py`` is the acceptance validator whose exit code
+separates success from validation failure and provider unavailability. These
+tests prove the validator contract:
 
 * the deterministic lane ASSERTS exact document/entity/evidence counts,
   directional 1/2/3-hop paths with citations, genuinely executed hybrid

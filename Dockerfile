@@ -1,8 +1,7 @@
 FROM python:3.11-slim
 
-# Phase 10 source provenance build arguments (Task 10.0).
-# Parse-only defaults that every approval rejects; real builds supply validated
-# scalars from scripts/source_manifest.py.
+# Source provenance build arguments. Defaults are placeholders; real builds
+# may supply validated revision scalars to stamp into the labels below.
 ARG SOURCE_REVISION=unknown
 ARG SOURCE_CONTEXT_SHA256=unknown
 ARG SOURCE_DIRTY=unknown
