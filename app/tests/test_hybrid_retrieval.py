@@ -681,3 +681,121 @@ async def test_answer_query_with_no_evidence_invokes_llm_with_empty_context():
         assert llm.calls == [("zzz nothing matches this", [])]
     finally:
         session.close(); engine.dispose()
+
+
+# ── Vector-store inconsistency hardening at retrieval time ─────────────
+
+
+async def test_hybrid_duplicate_ids_in_one_store_response_yield_chunk_once():
+    """A single Chroma response returning the SAME chunk id twice (same
+    deterministic vector id, two score entries) must hydrate to exactly one
+    context entry. Without hydration-time dedup the duplicate would be fused
+    twice and inflate the RRF score to 1/61 + 1/62 from the vector side
+    alone; the pinned value proves the second occurrence never reaches the
+    fusion ranking."""
+    session, engine, document, graph_chunk, vector_chunk = _graph_session()
+    try:
+        vector = FixedVectorStore([
+            RetrievedChunk(text="first copy", score=0.1,
+                           vector_id=vector_chunk.vector_id,
+                           metadata={"document_id": document.id,
+                                     "chunk_id": vector_chunk.id}),
+            RetrievedChunk(text="second copy", score=0.3,
+                           vector_id=vector_chunk.vector_id,
+                           metadata={"document_id": document.id,
+                                     "chunk_id": vector_chunk.id}),
+        ])
+        contexts = await retrieve_contexts(
+            query="zzz nothing matches this",
+            embedding_provider=FixedEmbeddingProvider(),
+            vector_store=vector, session=session, mode="hybrid",
+            top_k=5, graph_max_hops=1)
+
+        assert len(contexts) == 1
+        assert contexts[0]["text"] == vector_chunk.text
+        assert contexts[0]["score"] == 0.1  # first occurrence wins
+        assert contexts[0]["metadata"]["chunk_id"] == vector_chunk.id
+        assert contexts[0]["metadata"]["hybrid_score"] == 1 / 61
+    finally:
+        session.close(); engine.dispose()
+
+
+def _cross_document_session():
+    """Two ready documents; ``chunk_a`` belongs to doc A but the store hit
+    for it claims doc B's identity (document_id, title, and text)."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    doc_a = models.Document(title="Doc A title", source="unit")
+    doc_b = models.Document(title="Doc B title", source="unit")
+    session.add_all([doc_a, doc_b])
+    session.flush()
+    chunk_a = models.Chunk(document_id=doc_a.id, index=0,
+                           text="Authoritative SQL text for doc A.",
+                           start_offset=0, end_offset=33,
+                           vector_id="chunk:docA:0")
+    chunk_b = models.Chunk(document_id=doc_b.id, index=0,
+                           text="Doc B chunk text.",
+                           start_offset=0, end_offset=16,
+                           vector_id="chunk:docB:0")
+    session.add_all([chunk_a, chunk_b])
+    session.commit()
+    lying_hit = RetrievedChunk(
+        text="stolen doc B text riding a doc A vector",
+        score=0.2,
+        vector_id=chunk_a.vector_id,
+        metadata={"document_id": doc_b.id, "chunk_id": chunk_a.id,
+                  "title": "Doc B title", "index": 9},
+    )
+    return session, engine, doc_a, doc_b, chunk_a, chunk_b, lying_hit
+
+
+async def test_vector_hit_claiming_foreign_document_yields_sql_identity():
+    """Cross-document metadata lie: the hit's chunk_id resolves to a chunk of
+    a DIFFERENT document than the hit's own metadata claims, while the vector
+    record id matches the chunk's deterministic id. SQL identity must win:
+    the hydrated entry carries doc A's document_id/title/index/text, never
+    the claimed doc B identity as one blended context entry."""
+    session, engine, doc_a, doc_b, chunk_a, chunk_b, lying_hit = (
+        _cross_document_session()
+    )
+    try:
+        contexts = await retrieve_contexts(
+            query="anything",
+            embedding_provider=FixedEmbeddingProvider(),
+            vector_store=FixedVectorStore([lying_hit]),
+            session=session, mode="vector", top_k=5)
+
+        assert len(contexts) == 1
+        entry = contexts[0]
+        assert entry["text"] == chunk_a.text
+        assert entry["metadata"]["document_id"] == doc_a.id
+        assert entry["metadata"]["chunk_id"] == chunk_a.id
+        assert entry["metadata"]["title"] == doc_a.title
+        assert entry["metadata"]["index"] == chunk_a.index
+        assert entry["metadata"]["document_id"] != doc_b.id
+    finally:
+        session.close(); engine.dispose()
+
+
+async def test_document_id_filter_uses_sql_identity_not_store_metadata():
+    """The scalar document_id filter is re-applied against SQL during
+    hydration, so filtering for the LIED-about document excludes the hit and
+    filtering for the SQL-true document keeps it — Chroma metadata can never
+    smuggle a foreign-document chunk into a filtered result set."""
+    session, engine, doc_a, doc_b, chunk_a, chunk_b, lying_hit = (
+        _cross_document_session()
+    )
+    try:
+        for filters, expected in (
+            ({"document_id": doc_b.id}, []),   # the lie matches nothing in SQL
+            ({"document_id": doc_a.id}, [chunk_a.id]),  # SQL truth admits it
+        ):
+            contexts = await retrieve_contexts(
+                query="anything",
+                embedding_provider=FixedEmbeddingProvider(),
+                vector_store=FixedVectorStore([lying_hit]),
+                session=session, mode="vector", top_k=5, filters=filters)
+            assert [c["metadata"]["chunk_id"] for c in contexts] == expected
+    finally:
+        session.close(); engine.dispose()
