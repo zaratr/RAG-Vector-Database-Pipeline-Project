@@ -29,15 +29,10 @@ from app.services.graph_extraction import (
 
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Idempotent graph backfill.")
-    parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--document-id", type=int, default=None)
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-
-    if args.batch_size < 1 or args.batch_size > 100:
-        sys.stderr.write("backfill_graph: --batch-size must be between 1 and 100\n")
-        return 2
 
     settings = get_settings()
     provider = "ollama"
@@ -59,7 +54,6 @@ def _main(argv: list[str] | None = None) -> int:
                     provider=provider,
                     model=model,
                     document_id=args.document_id,
-                    batch_size=args.batch_size,
                     retry_failed=args.retry_failed,
                     dry_run=args.dry_run,
                 )

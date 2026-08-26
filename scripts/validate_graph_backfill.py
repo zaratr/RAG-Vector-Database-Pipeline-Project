@@ -733,7 +733,7 @@ async def _run(db_path: Path | None = None, run_id: str | None = None) -> dict:
         for probe, document_id, expected in dry_specs:
             payload = _run_cli(
                 "cli", db_url, provider_base_url,
-                ["--document-id", str(document_id), "--dry-run", "--batch-size", "20"],
+                ["--document-id", str(document_id), "--dry-run"],
             )
             _check_dry_run_shape("cli", probe, payload, expected)
             dry_runs.append({"probe": probe, "payload": payload})
@@ -747,7 +747,7 @@ async def _run(db_path: Path | None = None, run_id: str | None = None) -> dict:
         # --- First real run (CLI, document-scoped, plan-pinned counters). ---
         first_payload = _run_cli(
             "cli", db_url, provider_base_url,
-            ["--document-id", str(fixture_document_id), "--batch-size", "20"],
+            ["--document-id", str(fixture_document_id)],
         )
         _check("cli", "first_run_counters",
                {key: first_payload.get(key) for key in PINNED_FIRST} == PINNED_FIRST
@@ -793,7 +793,7 @@ async def _run(db_path: Path | None = None, run_id: str | None = None) -> dict:
         # --- Second real run (CLI): idempotent current_terminal no-op. ---
         second_payload = _run_cli(
             "cli", db_url, provider_base_url,
-            ["--document-id", str(fixture_document_id), "--batch-size", "20"],
+            ["--document-id", str(fixture_document_id)],
         )
         _check("cli", "second_run_counters",
                {key: second_payload.get(key) for key in PINNED_SECOND} == PINNED_SECOND,
@@ -824,7 +824,6 @@ async def _run(db_path: Path | None = None, run_id: str | None = None) -> dict:
                 provider=_PROVIDER,
                 model=_MODEL,
                 document_id=conc_document_id,
-                batch_size=20,
                 retry_failed=False,
                 dry_run=False,
             )
@@ -855,7 +854,6 @@ async def _run(db_path: Path | None = None, run_id: str | None = None) -> dict:
                 provider=_PROVIDER,
                 model=_MODEL,
                 document_id=conc_document_id,
-                batch_size=20,
                 retry_failed=False,
                 dry_run=False,
             )

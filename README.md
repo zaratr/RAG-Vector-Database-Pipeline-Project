@@ -240,7 +240,7 @@ docker compose exec api python scripts/backfill_graph.py --document-id 3
 docker compose exec api python scripts/backfill_graph.py --retry-failed
 ```
 
-`--batch-size` accepts `1–100` (default 20). `--document-id` restricts the scan to one document. `--dry-run` classifies eligibility without calling the extraction provider. `--retry-failed` re-attempts chunks whose current identity owner previously failed or whose lease has expired. Backfill never modifies vector IDs, Chroma records, document readiness, or provenance rows owned by other extraction identities. Each run prints one sorted JSON counter report (`scanned`, `eligible`, `processed`, `succeeded`, `skipped`, `empty`, `failed`, `lease_lost`, `relations`, and `skip_reasons`).
+`--document-id` restricts the scan to one document. `--dry-run` classifies eligibility without calling the extraction provider. `--retry-failed` re-attempts chunks whose current identity owner previously failed or whose lease has expired. Backfill never modifies vector IDs, Chroma records, document readiness, or provenance rows owned by other extraction identities. Each run prints one sorted JSON counter report (`scanned`, `eligible`, `processed`, `succeeded`, `skipped`, `empty`, `failed`, `lease_lost`, `relations`, and `skip_reasons`).
 
 Exit codes: `0` when no chunk failed (including no-op runs), `1` when one or more chunks failed (successful chunks remain committed), and `2` for invalid arguments, configuration failure, or a fatal database error.
 

@@ -174,13 +174,10 @@ async def backfill(
     provider: str,
     model: str,
     document_id: Optional[int] = None,
-    batch_size: int = 20,
     retry_failed: bool = False,
     dry_run: bool = False,
 ) -> BackfillReport:
     """Run an idempotent backfill and return the exact counter report."""
-    if batch_size < 1 or batch_size > 100:
-        raise ValueError("batch_size must be between 1 and 100")
     if document_id is not None:
         exists = (
             session.query(models.Document).filter(models.Document.id == document_id).count() > 0
