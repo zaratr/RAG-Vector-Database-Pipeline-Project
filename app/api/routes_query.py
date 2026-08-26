@@ -1,6 +1,7 @@
 """Query endpoint."""
 from __future__ import annotations
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -21,7 +22,6 @@ async def query(payload: QueryRequest, session: Session = Depends(get_db)):
     settings = get_settings()
     embedding_provider = get_embedding_provider()
     vector_store = get_vector_store()
-    # llm_client = get_llm_client(api_key=settings.openai_api_key, provider="dummy")
     llm_client = get_llm_client(
             provider = settings.llm_provider,
             base_url = settings.llm_base_url,
@@ -44,4 +44,11 @@ async def query(payload: QueryRequest, session: Session = Depends(get_db)):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except GraphTraversalLimitError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        # The answer LLM is an external provider: transport failures
+        # (connection refused, timeout, 5xx via raise_for_status) surface as
+        # a stable, typed 503 instead of an unhandled 500 with a traceback.
+        raise HTTPException(
+            status_code=503, detail="LLM provider unavailable"
+        ) from exc
     return QueryResponse(**result)

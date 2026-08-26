@@ -474,6 +474,18 @@ def test_query_vector_mode_accepts_filters_and_remains_default():
     assert response.status_code == 200
 
 
+def test_query_with_no_matching_context_returns_200_and_empty_context():
+    """Grounded no-evidence contract over HTTP: a query whose filter matches
+    nothing returns 200 with context == [] and still produces an answer."""
+    response = client.post("/query", json={
+        "query": "anything", "filters": {"document_id": 999999},
+    })
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["context"] == []
+    assert payload["answer"].strip()
+
+
 def test_query_hybrid_traversal_limit_returns_503(monkeypatch):
     """If retrieve_graph_paths raises GraphTraversalLimitError, /query
     must return 503 (mapped in routes_query.py)."""

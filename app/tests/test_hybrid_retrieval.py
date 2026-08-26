@@ -524,3 +524,160 @@ async def test_tags_filter_membership_applies_identically_across_vector_graph_an
     finally:
         session.close()
         engine.dispose()
+
+
+# ── RRF tie-breaking, degenerate candidate sets, and the no-evidence lane ──
+
+
+def _tie_session():
+    """Seed one ready document with three chunks in a known id order:
+
+    * ``c_graph``  — "User purchases Subscription." with a relation (graph side)
+    * ``c_alpha``  — plain text (vector side only)
+    * ``c_beta``   — "Stakeholder reviews Roadmap." with a relation (graph side)
+
+    Chunk ids are assigned in creation order, so c_graph < c_alpha < c_beta.
+    """
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+
+    document = models.Document(title="Tie doc", source="unit")
+    session.add(document)
+    session.flush()
+    c_graph = models.Chunk(document_id=document.id, index=0,
+                           text="User purchases Subscription.",
+                           start_offset=0, end_offset=28, vector_id="chunk:tie:0")
+    c_alpha = models.Chunk(document_id=document.id, index=1,
+                           text="Plain vector-only evidence alpha.",
+                           start_offset=29, end_offset=61, vector_id="chunk:tie:1")
+    c_beta = models.Chunk(document_id=document.id, index=2,
+                          text="Stakeholder reviews Roadmap.",
+                          start_offset=62, end_offset=90, vector_id="chunk:tie:2")
+    session.add_all([c_graph, c_alpha, c_beta])
+    session.flush()
+    for chunk, source, predicate, target in (
+        (c_graph, "User", "purchases", "Subscription"),
+        (c_beta, "Stakeholder", "reviews", "Roadmap"),
+    ):
+        persist_chunk_extraction(
+            session, chunk=chunk,
+            relations=[ExtractedRelation(
+                source=ExtractedEntity(name=source, canonical_name=source.casefold(),
+                                       entity_type="person"),
+                predicate=predicate,
+                target=ExtractedEntity(name=target, canonical_name=target.casefold(),
+                                       entity_type="concept"),
+                evidence=chunk.text, evidence_start=0, evidence_end=len(chunk.text),
+                confidence=0.9)],
+            provider="ollama", model="gemma4:latest")
+    session.commit()
+    return session, engine, document, c_graph, c_alpha, c_beta
+
+
+async def test_hybrid_exact_tie_breaks_deterministically_by_chunk_id():
+    """Two single-side chunks at the same rank on their own sides tie exactly
+    (vector rank 2 vs graph rank 2 -> both 1/62). The fused order must be
+    deterministic: ascending chunk_id for equal hybrid_score."""
+    session, engine, document, c_graph, c_alpha, c_beta = _tie_session()
+    try:
+        # Vector side ranks: c_graph 1st, c_alpha 2nd.
+        vector = FixedVectorStore([
+            RetrievedChunk(text=c_graph.text, score=0.1, vector_id=c_graph.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": c_graph.id}),
+            RetrievedChunk(text=c_alpha.text, score=0.2, vector_id=c_alpha.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": c_alpha.id}),
+        ])
+        # Query names both relation sources so the graph side resolves both
+        # seeds lexically; graph candidates sort by (-score, hop, chunk_id):
+        # c_graph (conf 0.9, id lower) rank 1, c_beta rank 2.
+        contexts = await retrieve_contexts(
+            query="User Stakeholder", embedding_provider=FixedEmbeddingProvider(),
+            vector_store=vector, session=session, mode="hybrid",
+            top_k=5, graph_max_hops=1)
+
+        by_id = {c["metadata"]["chunk_id"]: c for c in contexts}
+        assert set(by_id) == {c_graph.id, c_alpha.id, c_beta.id}
+        # c_graph is rank 1 on BOTH sides: 1/61 + 1/61.
+        assert by_id[c_graph.id]["metadata"]["hybrid_score"] == (1 / 61 + 1 / 61)
+        # c_alpha: vector rank 2 only; c_beta: graph rank 2 only -> exact tie.
+        alpha_score = by_id[c_alpha.id]["metadata"]["hybrid_score"]
+        beta_score = by_id[c_beta.id]["metadata"]["hybrid_score"]
+        assert alpha_score == 1 / 62
+        assert beta_score == 1 / 62
+        assert alpha_score == beta_score
+        # Deterministic tie-break: ascending chunk_id among equal scores,
+        # and the both-sides chunk outranks every single-side chunk.
+        ordered = [c["metadata"]["chunk_id"] for c in contexts]
+        assert ordered == [c_graph.id, c_alpha.id, c_beta.id]
+    finally:
+        session.close(); engine.dispose()
+
+
+async def test_hybrid_zero_candidates_returns_empty_without_error():
+    """Empty vector side and a query matching no entities: hybrid returns
+    [] cleanly (no error, no placeholder rows)."""
+    session, engine, document, graph_chunk, vector_chunk = _graph_session()
+    try:
+        contexts = await retrieve_contexts(
+            query="zzz nothing matches this",
+            embedding_provider=FixedEmbeddingProvider(),
+            vector_store=FixedVectorStore([]),
+            session=session, mode="hybrid", top_k=5, graph_max_hops=1)
+        assert contexts == []
+    finally:
+        session.close(); engine.dispose()
+
+
+async def test_hybrid_single_candidate_fuses_single_side_score():
+    """Exactly one candidate (vector side only, graph side empty): the fused
+    list has one entry whose hybrid_score is 1/(60+1) from that side alone."""
+    session, engine, document, graph_chunk, vector_chunk = _graph_session()
+    try:
+        vector = FixedVectorStore([
+            RetrievedChunk(text=vector_chunk.text, score=0.4,
+                           vector_id=vector_chunk.vector_id,
+                           metadata={"document_id": document.id,
+                                     "chunk_id": vector_chunk.id}),
+        ])
+        contexts = await retrieve_contexts(
+            query="zzz nothing matches this",
+            embedding_provider=FixedEmbeddingProvider(),
+            vector_store=vector, session=session, mode="hybrid",
+            top_k=5, graph_max_hops=1)
+        assert len(contexts) == 1
+        assert contexts[0]["metadata"]["chunk_id"] == vector_chunk.id
+        assert contexts[0]["metadata"]["retrieval_sources"] == ["vector"]
+        assert contexts[0]["metadata"]["hybrid_score"] == 1 / 61
+    finally:
+        session.close(); engine.dispose()
+
+
+async def test_answer_query_with_no_evidence_invokes_llm_with_empty_context():
+    """Grounded no-evidence contract: a query matching nothing still produces
+    an answer, with context == [] and the LLM invoked with an empty context
+    list (never placeholder rows, never a crash)."""
+    from app.services.rag import answer_query
+
+    class RecordingLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def generate_answer(self, query, context):
+            self.calls.append((query, list(context)))
+            return "No evidence available for this question."
+
+    session, engine, document, graph_chunk, vector_chunk = _graph_session()
+    try:
+        llm = RecordingLLM()
+        result = await answer_query(
+            query="zzz nothing matches this",
+            embedding_provider=FixedEmbeddingProvider(),
+            vector_store=FixedVectorStore([]),
+            llm_client=llm, session=session,
+            retrieval_mode="vector", top_k=5)
+        assert result["context"] == []
+        assert result["answer"] == "No evidence available for this question."
+        assert llm.calls == [("zzz nothing matches this", [])]
+    finally:
+        session.close(); engine.dispose()
