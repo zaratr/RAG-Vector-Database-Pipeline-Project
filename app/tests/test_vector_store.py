@@ -43,13 +43,29 @@ def test_ephemeral_mode_when_no_host_no_persist(monkeypatch):
 
 
 def test_http_mode_when_host_set(monkeypatch):
-    """When chroma_host is set, _create_client returns an HttpClient."""
+    """When chroma_host is set, _create_client builds an HttpClient bound to
+    that host/port. chromadb.HttpClient eagerly connects, so a recording stub
+    is installed in its place: the construction contract (client type + bound
+    host/port) is pinned without a live Chroma server."""
     from app.config import Settings
+    import app.services.vector_store as vector_store_module
+
+    created = {}
+
+    class RecordingHttpClient:
+        def __init__(self, host, port):
+            created["host"] = host
+            created["port"] = port
+
+    monkeypatch.setattr(
+        vector_store_module.chromadb, "HttpClient", RecordingHttpClient
+    )
     monkeypatch.setattr("app.services.vector_store.get_settings", lambda: Settings(
-        chroma_host="vectordb", chroma_port=8000
+        chroma_host="vectordb.example", chroma_port=8000
     ))
     client = _create_client()
-    assert _client_backend_name(client) == "FastAPI"
+    assert isinstance(client, RecordingHttpClient)
+    assert created == {"host": "vectordb.example", "port": 8000}
 
 
 def test_persistent_mode_when_directory_set(monkeypatch, tmp_path):

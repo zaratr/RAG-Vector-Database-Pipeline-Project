@@ -59,6 +59,28 @@ PINNED_FULL = {
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def live_provider_env(monkeypatch):
+    """Pin the live lane's provider env regardless of ambient values.
+
+    The in-process live lane constructs its extractor via
+    ``get_graph_extractor()``, which reads the (cached) settings: an ambient
+    ``RAG_LLM_PROVIDER=dummy`` or disabled graph extraction would turn every
+    live-lane test into a configuration failure instead of exercising the
+    patched ``OllamaGraphExtractor.extract``. Pin the ollama provider — the
+    same pin ``_run_validator_script`` applies for the subprocess lane — and
+    rebuild the settings cache, clearing it again on teardown so the pinned
+    values cannot leak into later tests.
+    """
+    from app.config import get_settings
+
+    monkeypatch.setenv("RAG_LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("RAG_GRAPH_EXTRACTION_ENABLED", "true")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
 async def _grounded_extract(self, text):
     """Mirror a real non-canned provider: build one relation whose evidence
     is an exact substring of the actual unique text passed in."""
@@ -297,7 +319,7 @@ async def test_deterministic_lane_fails_on_broken_topology(
 
 @pytest.mark.asyncio
 async def test_live_lane_persists_through_production_ingest_path(
-    monkeypatch, tmp_path
+    live_provider_env, monkeypatch, tmp_path
 ):
     """The live document must go through the production ingest_text path with
     a REAL (non-disabled) extractor, then verify from persisted SQL rows."""
@@ -329,7 +351,7 @@ async def test_live_lane_persists_through_production_ingest_path(
 
 
 @pytest.mark.asyncio
-async def test_live_lane_provider_unavailable_raises(monkeypatch, tmp_path):
+async def test_live_lane_provider_unavailable_raises(live_provider_env, monkeypatch, tmp_path):
     from scripts import validate_phase10a as validator
 
     async def unavailable(self, text):
@@ -347,7 +369,7 @@ async def test_live_lane_provider_unavailable_raises(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_live_lane_rejects_canned_output(monkeypatch, tmp_path):
+async def test_live_lane_rejects_canned_output(live_provider_env, monkeypatch, tmp_path):
     """A provider echoing a CANNED, token-free relation (schema-valid and
     even grounded as a substring) must fail the non_canned check rather than
     pass the live lane."""
@@ -386,7 +408,7 @@ async def test_live_lane_rejects_canned_output(monkeypatch, tmp_path):
 
 
 def test_main_fails_nonzero_when_production_fingerprint_changes(
-    monkeypatch, tmp_path, capsys
+    live_provider_env, monkeypatch, tmp_path, capsys
 ):
     """restored:true must be withheld when configured production state does
     not restore exactly; exit code must be non-zero with a machine-readable

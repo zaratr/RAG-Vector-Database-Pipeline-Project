@@ -1,4 +1,5 @@
 import chromadb
+import os
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -14,6 +15,7 @@ from app.services.graph_extraction import (
     GraphProviderUnavailable,
     get_graph_extractor,
 )
+from app.services.llm import DummyLLMClient
 from app.services.vector_store import ChromaVectorStore
 from app.api import routes_documents, routes_query
 
@@ -41,6 +43,10 @@ app.dependency_overrides[get_db] = override_get_db
 app.dependency_overrides[get_graph_extractor] = lambda: DisabledGraphExtractor()
 client = TestClient(app)
 
+# Captured at import time, before the module fixture swaps the factory, so
+# the opt-in live-LLM lane can exercise the settings-configured client.
+_REAL_GET_LLM_CLIENT = routes_query.get_llm_client
+
 
 @pytest.fixture(scope="module", autouse=True)
 def setup_db():
@@ -50,13 +56,21 @@ def setup_db():
     )
     original_documents_store = routes_documents.get_vector_store
     original_query_store = routes_query.get_vector_store
+    original_query_llm = routes_query.get_llm_client
     routes_documents.get_vector_store = lambda: vector_store
     routes_query.get_vector_store = lambda: vector_store
+    # Hermetic answer lane: /query builds its LLM client from settings
+    # (default provider "ollama"), which would make a live HTTP call for
+    # every query test. Swap the factory for the echo dummy — the same
+    # pattern as test_graph_api — so query tests prove the retrieval ->
+    # generation wiring without a running Ollama.
+    routes_query.get_llm_client = lambda *args, **kwargs: DummyLLMClient()
     Base.metadata.create_all(bind=test_engine)
     yield
     Base.metadata.drop_all(bind=test_engine)
     routes_documents.get_vector_store = original_documents_store
     routes_query.get_vector_store = original_query_store
+    routes_query.get_llm_client = original_query_llm
     client.delete_collection("test-rag-api")
 
 
@@ -74,6 +88,11 @@ def test_ingest_and_query():
     assert "answer" in payload
     assert len(payload["context"]) >= 1
     assert "vector" in payload["context"][0]["metadata"]["retrieval_sources"]
+    # Grounding: the answer must be built from the retrieved context. The
+    # dummy LLM echoes the exact context strings it receives, so a regression
+    # that breaks retrieval-into-generation wiring (wrong/empty context list
+    # reaching the LLM) fails this assertion instead of passing on HTTP 200.
+    assert payload["context"][0]["text"] in payload["answer"]
 
     detail = client.get(f"/documents/{doc_id}")
     assert detail.status_code == 200
@@ -418,6 +437,8 @@ def test_query_hybrid_mode_returns_200_with_context():
     payload = response.json()
     assert "answer" in payload
     assert isinstance(payload["context"], list)
+    if payload["context"]:
+        assert payload["context"][0]["text"] in payload["answer"]
 
 
 def test_query_graph_mode_returns_200_without_embedding_dependency():
@@ -506,3 +527,30 @@ def test_post_image_documents_vector_failure_returns_503_with_stable_detail(monk
 
     assert response.status_code == 503
     assert "Vector index unavailable" in response.json().get("detail", "")
+
+
+@pytest.mark.skipif(
+    not os.environ.get("RAG_LIVE_LLM"),
+    reason="opt-in live lane: set RAG_LIVE_LLM=1 with a reachable LLM at RAG_LLM_BASE_URL",
+)
+def test_query_answer_lane_with_live_llm_optin():
+    """Opt-in live-LLM lane: exercises the settings-configured LLM client
+    (real Ollama/Gemma) through POST /query. Skipped in the hermetic suite;
+    enabled by setting RAG_LIVE_LLM=1 with a reachable RAG_LLM_BASE_URL."""
+    ingest_response = client.post(
+        "/documents",
+        data={"title": "Live LLM Doc", "text": "FastAPI enables quick APIs", "source": "unit"},
+    )
+    assert ingest_response.status_code == 201
+
+    module_llm_factory = routes_query.get_llm_client
+    routes_query.get_llm_client = _REAL_GET_LLM_CLIENT
+    try:
+        response = client.post("/query", json={"query": "What does FastAPI do?", "top_k": 1})
+    finally:
+        routes_query.get_llm_client = module_llm_factory
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["answer"].strip()
+    assert len(payload["context"]) >= 1
