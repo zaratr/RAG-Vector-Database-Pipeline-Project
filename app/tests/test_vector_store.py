@@ -81,6 +81,41 @@ def test_persistent_mode_when_directory_set(monkeypatch, tmp_path):
     assert client._identifier != "ephemeral"
 
 
+@pytest.mark.asyncio
+async def test_persistent_client_survives_across_client_instances(tmp_path):
+    """Persistent mode is genuinely persistent: records written through one
+    client instance are visible to a fresh client opened on the same
+    directory (and absent from an unrelated directory)."""
+    import chromadb
+
+    name = "persist-" + uuid.uuid4().hex[:8]
+    writer = ChromaVectorStore(
+        collection_name=name, client=chromadb.PersistentClient(path=str(tmp_path))
+    )
+    await writer.index_embeddings(
+        embeddings=[[0.1] * 8],
+        metadatas=[{"doc": "persisted"}],
+        ids=["p-1"],
+        documents=["persisted payload"],
+    )
+
+    reader = ChromaVectorStore(
+        collection_name=name, client=chromadb.PersistentClient(path=str(tmp_path))
+    )
+    hits = await reader.query([0.1] * 8, top_k=1)
+    assert len(hits) == 1
+    assert hits[0].vector_id == "p-1"
+    assert hits[0].text == "persisted payload"
+    assert hits[0].metadata["doc"] == "persisted"
+
+    unrelated_dir = tmp_path / "elsewhere"
+    unrelated_dir.mkdir()
+    stranger = ChromaVectorStore(
+        collection_name=name, client=chromadb.PersistentClient(path=str(unrelated_dir))
+    )
+    assert len(await stranger.query([0.1] * 8, top_k=1)) == 0
+
+
 # ── Roundtrip tests ────────────────────────────────────────────────
 
 @pytest.mark.asyncio
