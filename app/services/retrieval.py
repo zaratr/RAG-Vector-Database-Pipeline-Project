@@ -31,7 +31,11 @@ def _context_key(context: dict) -> tuple:
     metadata = context.get("metadata") or {}
     chunk_id = metadata.get("chunk_id")
     if chunk_id is not None:
-        return ("chunk", str(chunk_id))
+        # Numeric SQL chunk identity: fused contexts key and tie-break by the
+        # integer chunk id (2 before 10). The stringified form would order
+        # multi-digit ids lexicographically and invert the deterministic
+        # (-hybrid_score, chunk_id) ordering.
+        return ("chunk", int(chunk_id))
     return ("text", context.get("text", ""))
 
 

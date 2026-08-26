@@ -614,6 +614,172 @@ async def test_hybrid_exact_tie_breaks_deterministically_by_chunk_id():
         session.close(); engine.dispose()
 
 
+def _multi_digit_tie_session():
+    """Seed one ready document whose chunk ids reach double digits:
+
+    * ``c_top`` (id 1) — relation chunk, rank 1 on both sides
+    * ``c_two`` (id 2) — plain text, vector side only
+    * seven filler chunks (ids 3-9) — never retrieved
+    * ``c_ten`` (id 10) — relation chunk, graph side only
+    """
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+
+    document = models.Document(title="Multi-digit tie doc", source="unit")
+    session.add(document)
+    session.flush()
+    c_top = models.Chunk(document_id=document.id, index=0,
+                         text="User purchases Subscription.",
+                         start_offset=0, end_offset=28, vector_id="chunk:multi:0")
+    c_two = models.Chunk(document_id=document.id, index=1,
+                         text="Plain vector-only evidence two.",
+                         start_offset=29, end_offset=61, vector_id="chunk:multi:1")
+    session.add_all([c_top, c_two])
+    session.flush()
+    for filler_index in range(2, 9):
+        session.add(models.Chunk(
+            document_id=document.id, index=filler_index,
+            text=f"Filler chunk {filler_index}.",
+            start_offset=62, end_offset=80, vector_id=None))
+    session.flush()
+    c_ten = models.Chunk(document_id=document.id, index=9,
+                         text="Stakeholder reviews Roadmap.",
+                         start_offset=81, end_offset=109, vector_id="chunk:multi:9")
+    session.add(c_ten)
+    session.flush()
+    for chunk, source, predicate, target in (
+        (c_top, "User", "purchases", "Subscription"),
+        (c_ten, "Stakeholder", "reviews", "Roadmap"),
+    ):
+        persist_chunk_extraction(
+            session, chunk=chunk,
+            relations=[ExtractedRelation(
+                source=ExtractedEntity(name=source, canonical_name=source.casefold(),
+                                       entity_type="person"),
+                predicate=predicate,
+                target=ExtractedEntity(name=target, canonical_name=target.casefold(),
+                                       entity_type="concept"),
+                evidence=chunk.text, evidence_start=0, evidence_end=len(chunk.text),
+                confidence=0.9)],
+            provider="ollama", model="gemma4:latest")
+    session.commit()
+    assert (c_top.id, c_two.id, c_ten.id) == (1, 2, 10)
+    return session, engine, document, c_top, c_two, c_ten
+
+
+async def test_hybrid_tie_break_orders_multi_digit_chunk_ids_numerically():
+    """Single-side tie across a digit boundary: c_two (id 2, vector rank 2)
+    and c_ten (id 10, graph rank 2) both score exactly 1/62. The fused order
+    must be ascending NUMERIC chunk id ([2, 10]); a stringified-id sort would
+    place "10" before "2" and invert the deterministic order."""
+    session, engine, document, c_top, c_two, c_ten = _multi_digit_tie_session()
+    try:
+        vector = FixedVectorStore([
+            RetrievedChunk(text=c_top.text, score=0.1, vector_id=c_top.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": c_top.id}),
+            RetrievedChunk(text=c_two.text, score=0.2, vector_id=c_two.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": c_two.id}),
+        ])
+        contexts = await retrieve_contexts(
+            query="User Stakeholder", embedding_provider=FixedEmbeddingProvider(),
+            vector_store=vector, session=session, mode="hybrid",
+            top_k=5, graph_max_hops=1)
+
+        by_id = {c["metadata"]["chunk_id"]: c for c in contexts}
+        assert set(by_id) == {c_top.id, c_two.id, c_ten.id}
+        # Rank-2 single-side chunks tie exactly.
+        assert by_id[c_two.id]["metadata"]["hybrid_score"] == 1 / 62
+        assert by_id[c_ten.id]["metadata"]["hybrid_score"] == 1 / 62
+        assert by_id[c_top.id]["metadata"]["hybrid_score"] == (1 / 61 + 1 / 61)
+        assert by_id[c_two.id]["metadata"]["retrieval_sources"] == ["vector"]
+        assert by_id[c_ten.id]["metadata"]["retrieval_sources"] == ["graph"]
+        # Numeric ordering contract: 2 before 10 among tied scores, and the
+        # both-sides chunk first.
+        ordered = [c["metadata"]["chunk_id"] for c in contexts]
+        assert ordered == [c_top.id, c_two.id, c_ten.id]
+        assert ordered == [1, 2, 10]
+    finally:
+        session.close(); engine.dispose()
+
+
+async def test_hybrid_both_sides_tie_orders_multi_digit_chunk_ids_numerically():
+    """Both-sides-present tie across a digit boundary: the vector side ranks
+    c_ten (id 10) first while the graph side orders c_two (id 2) first, so
+    each chunk scores exactly 1/61 + 1/62. The tie must resolve by ascending
+    NUMERIC chunk id ([2, 10]), never the lexicographic "10" < "2"."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    try:
+        document = models.Document(title="Both-sides tie doc", source="unit")
+        session.add(document)
+        session.flush()
+        session.add(models.Chunk(document_id=document.id, index=0,
+                                 text="Filler head chunk.", start_offset=0,
+                                 end_offset=18, vector_id=None))
+        c_two = models.Chunk(document_id=document.id, index=1,
+                             text="User purchases Subscription.",
+                             start_offset=19, end_offset=47, vector_id="chunk:both:1")
+        session.add(c_two)
+        session.flush()
+        for filler_index in range(2, 9):
+            session.add(models.Chunk(
+                document_id=document.id, index=filler_index,
+                text=f"Filler chunk {filler_index}.",
+                start_offset=48, end_offset=66, vector_id=None))
+        session.flush()
+        c_ten = models.Chunk(document_id=document.id, index=9,
+                             text="Stakeholder reviews Roadmap.",
+                             start_offset=67, end_offset=95, vector_id="chunk:both:9")
+        session.add(c_ten)
+        session.flush()
+        for chunk, source, predicate, target in (
+            (c_two, "User", "purchases", "Subscription"),
+            (c_ten, "Stakeholder", "reviews", "Roadmap"),
+        ):
+            persist_chunk_extraction(
+                session, chunk=chunk,
+                relations=[ExtractedRelation(
+                    source=ExtractedEntity(name=source, canonical_name=source.casefold(),
+                                           entity_type="person"),
+                    predicate=predicate,
+                    target=ExtractedEntity(name=target, canonical_name=target.casefold(),
+                                           entity_type="concept"),
+                    evidence=chunk.text, evidence_start=0, evidence_end=len(chunk.text),
+                    confidence=0.9)],
+                provider="ollama", model="gemma4:latest")
+        session.commit()
+        assert (c_two.id, c_ten.id) == (2, 10)
+
+        # Vector side deliberately ranks the higher-id chunk first.
+        vector = FixedVectorStore([
+            RetrievedChunk(text=c_ten.text, score=0.1, vector_id=c_ten.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": c_ten.id}),
+            RetrievedChunk(text=c_two.text, score=0.2, vector_id=c_two.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": c_two.id}),
+        ])
+        contexts = await retrieve_contexts(
+            query="User Stakeholder", embedding_provider=FixedEmbeddingProvider(),
+            vector_store=vector, session=session, mode="hybrid",
+            top_k=5, graph_max_hops=1)
+
+        ordered = [c["metadata"]["chunk_id"] for c in contexts]
+        assert ordered == [c_two.id, c_ten.id]
+        assert ordered == [2, 10]
+        by_id = {c["metadata"]["chunk_id"]: c for c in contexts}
+        # Both chunks are present on BOTH sides with mirrored ranks: exact tie.
+        assert by_id[c_two.id]["metadata"]["hybrid_score"] == (1 / 62 + 1 / 61)
+        assert by_id[c_ten.id]["metadata"]["hybrid_score"] == (1 / 61 + 1 / 62)
+        assert by_id[c_two.id]["metadata"]["hybrid_score"] == \
+            by_id[c_ten.id]["metadata"]["hybrid_score"]
+        for chunk_id in (c_two.id, c_ten.id):
+            assert set(by_id[chunk_id]["metadata"]["retrieval_sources"]) == \
+                {"vector", "graph"}
+    finally:
+        session.close(); engine.dispose()
+
+
 async def test_hybrid_zero_candidates_returns_empty_without_error():
     """Empty vector side and a query matching no entities: hybrid returns
     [] cleanly (no error, no placeholder rows)."""
