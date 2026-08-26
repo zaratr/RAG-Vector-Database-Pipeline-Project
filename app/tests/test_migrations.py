@@ -1228,7 +1228,7 @@ def test_b7_migration_fails_on_unrecognized_predecessor_status(tmp_path):
 def test_b7_migrated_schema_rejects_lifecycle_violations(
     tmp_path, status, input_sha256, attempt_count, completed_at, error_code
 ):
-    """W4: the migrated table enforces the plan's exact per-status lifecycle CHECKs."""
+    """The migrated table enforces exact per-status lifecycle CHECKs."""
     db_url = _db_url(tmp_path / f"lifecycle-{status}-{attempt_count}-{completed_at}.db")
     upgrade_database(db_url)
     engine = create_engine(db_url)
@@ -1342,7 +1342,7 @@ def test_b7_mid_upgrade_failure_rolls_back_completely_and_retry_succeeds(tmp_pat
 def test_export_unrepresentable_rows_exports_skipped_rows_preserving_database(
     tmp_path, capsys
 ):
-    """Plan B-14 (10A.3 half): the b7 downgrade-refusal export is deterministic,
+    """The b7 downgrade-refusal export is deterministic,
     exports exactly the skipped rows, and preserves every database row."""
     from scripts.export_unrepresentable_rows import export_unrepresentable_rows
 

@@ -1,6 +1,6 @@
 """Persistence operations for normalized graph extraction provenance.
 
-Task 10A.3 introduces an idempotent extraction lifecycle: every eligible
+The extraction lifecycle is idempotent: every eligible
 chunk/version has exactly one durable extraction identity, and the repository
 exposes a begin/complete/fail/skip API that returns an :class:`ExtractionLease`
 telling the caller whether to call the provider.
@@ -140,7 +140,7 @@ def begin_chunk_extraction(
     """Begin (or resume) extraction for a chunk/version.
 
     Returns an :class:`ExtractionLease`. The caller branches only on
-    ``should_call_provider``. See the state-transition table in the plan.
+    ``should_call_provider``.
 
     When two workers begin the same absent identity concurrently, the partial
     unique index ``uq_graph_extractions_identity_owner`` admits exactly one

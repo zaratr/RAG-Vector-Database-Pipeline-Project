@@ -1,10 +1,10 @@
-"""Tests for bounded relational multi-hop graph traversal (10A.5).
+"""Tests for bounded relational multi-hop graph traversal.
 
 Production surface under test is ``retrieve_graph_paths`` (SQL directional
 path traversal). The legacy ``retrieve_graph_contexts`` helper is retained
 by the service for its parity role only; former legacy-only tests that
 duplicated production coverage were retired in favor of the production
-suite below (remediation W7/F13).
+suite below.
 """
 from __future__ import annotations
 
@@ -95,7 +95,7 @@ def _session_with_chain():
 
 
 # ---------------------------------------------------------------------------
-# 10A.5 — directional path traversal via the production retrieve_graph_paths
+# Directional path traversal via the production retrieve_graph_paths
 # ---------------------------------------------------------------------------
 
 
@@ -323,7 +323,7 @@ def test_retrieve_graph_paths_parallel_predicates_keep_distinct_paths():
 def test_retrieve_graph_paths_multiple_evidence_rows_for_same_edge_dedup():
     """If the same edge is supported by two evidence rows from two chunks,
     traversal must still terminate and paths must dedupe by evidence-ID
-    sequence per the 10A.6 contract; here we assert at least one path
+    sequence; here we assert at least one path
     carries evidence and ordering is stable across calls."""
     session, engine, document, chunks = _session_with_chain()
     try:
@@ -452,13 +452,13 @@ def test_retrieve_graph_paths_scalar_tags_filter_matches_membership():
     {"unknown_key": 1},               # unsupported key
     {"document_id": [1, 2]},          # list value
     {"document_id": {"$gt": 0}},      # dict value
-    {"document_id": True},            # boolean rejected (10A.5 matrix)
+    {"document_id": True},            # boolean rejected (filter matrix)
     {"document_id": "not-an-int"},    # invalid integer form
     {"$or": [{"document_id": 1}]},    # mongo-style operator
 ])
 def test_retrieve_graph_paths_rejects_unsupported_filter(bad_filter):
     """All unsupported filter shapes raise UnsupportedGraphFilter
-    (maps to HTTP 422 per plan 10A.5 filter matrix)."""
+    (maps to HTTP 422 per the filter matrix)."""
     session, engine, document, chunks = _session_with_chain()
     try:
         with pytest.raises(UnsupportedGraphFilter):
@@ -606,7 +606,7 @@ def test_retrieve_graph_paths_evidence_row_cap_enforced():
 
 
 def test_retrieve_graph_paths_later_seed_survives_candidate_budget_exhaustion():
-    """W2 regression: plan 10A.5 accepts up to MAX_SEEDS (20) distinct
+    """Regression: traversal accepts up to MAX_SEEDS (20) distinct
     seeds, and selection is the documented global deterministic sort —
     an earlier seed exhausting a large candidate budget must not
     silently exclude a later seed's paths from selection."""
@@ -654,7 +654,7 @@ def test_retrieve_graph_paths_later_seed_survives_candidate_budget_exhaustion():
 
 
 def test_retrieve_graph_paths_tags_filter_membership_after_csv_split_and_trim():
-    """Plan 10A.5 matrix: `tags` is "one scalar tag; exact membership after
+    """Filter matrix: `tags` is "one scalar tag; exact membership after
     splitting stored comma-separated tags and trimming whitespace" — not
     whole-column equality."""
     session, engine, document, chunks = _session_with_chain()

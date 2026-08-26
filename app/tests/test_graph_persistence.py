@@ -1,4 +1,4 @@
-"""Phase 10A.3 — idempotent extraction lifecycle persistence tests.
+"""Idempotent extraction lifecycle persistence tests.
 
 Exercises the repository API: ``derive_extraction_identity``,
 ``begin_chunk_extraction``, ``complete_chunk_extraction``,
@@ -741,7 +741,7 @@ def test_skip_with_unsupported_media_type_reason_code():
 
 def test_skip_chunk_extraction_rejects_invalid_reason_code_with_typed_error():
     """An invalid reason_code raises the repository's typed ValueError before
-    any DB write instead of surfacing the W4 lifecycle CHECK
+    any DB write instead of surfacing the lifecycle CHECK
     (``skipped -> error_code IN ('extraction_disabled',
     'unsupported_media_type')``) as a raw IntegrityError at flush time."""
     session, engine = _session()
@@ -857,7 +857,7 @@ def test_direct_sql_rejects_short_input_sha256():
 
 
 def test_direct_sql_rejects_long_input_sha256():
-    """Plan acceptance #7: the 64-hex CHECK also rejects values longer than 64."""
+    """The 64-hex CHECK also rejects values longer than 64."""
     session, engine = _session()
     _, chunk = _document_chunk(session)
 
@@ -877,7 +877,7 @@ def test_direct_sql_rejects_long_input_sha256():
 
 
 def test_direct_sql_rejects_punctuation_input_sha256():
-    """Plan acceptance #7: the 64-hex CHECK rejects punctuation inside the value."""
+    """The 64-hex CHECK rejects punctuation inside the value."""
     session, engine = _session()
     _, chunk = _document_chunk(session)
 

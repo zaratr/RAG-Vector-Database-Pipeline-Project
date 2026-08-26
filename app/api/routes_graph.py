@@ -1,4 +1,4 @@
-"""Graph inspection endpoints (Task 10A.7).
+"""Graph inspection endpoints.
 
 Exposes the persisted graph for verifiable entity, relationship, and path
 inspection. All inspection routes are read-only over ready-document evidence
@@ -17,7 +17,7 @@ from app.core.db import get_db
 from app.persistence import models
 # The two provider factories below are intentionally unused by inspection
 # routes; they are imported so tests can monkeypatch them and prove these
-# routes never call the embedding/Chroma layer (appendix 10A.7 purity test).
+# routes never call the embedding/Chroma layer (inspection purity contract).
 from app.services.embeddings import get_embedding_provider  # noqa: F401
 from app.services.graph_retrieval import (
     GraphPath,
@@ -235,8 +235,8 @@ async def list_relationships(
         .filter(*edge_filter)
         .all()
     )
-    # Plan 10A.7: items sort by source canonical name, predicate, target
-    # canonical name, edge ID (F15a — canonical-name order, not entity-ID order).
+    # Items sort by source canonical name, predicate, target canonical
+    # name, edge ID (canonical-name order, not entity-ID order).
     sorted_items: list[tuple[tuple, RelationshipItem]] = []
     for edge in all_edges:
         evidence_rows = _ready_edge_evidence(session, edge.id)
@@ -308,14 +308,14 @@ class GraphPathsRequest(BaseModel):
     query: str
     max_hops: int = 3
     direction: Literal["outbound", "inbound", "both"] = "outbound"
-    # Plan 10A.5 caps returned paths at 50; a limit outside 1-50 is invalid
-    # input (F15b) and must fail validation with 422 rather than clamp.
+    # Returned paths are capped at 50; a limit outside 1-50 is invalid
+    # input and must fail validation with 422 rather than clamp.
     limit: int = Field(default=20, ge=1, le=50)
     filters: dict | None = None
 
 
 class GraphPathsResponse(BaseModel):
-    # F8: typed as the canonical GraphPath (single-sourced from
+    # Typed as the canonical GraphPath (single-sourced from
     # app/services/graph_retrieval) so OpenAPI documents every GraphPathStep
     # field instead of an opaque dict.
     paths: List[GraphPath]

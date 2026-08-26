@@ -128,7 +128,7 @@ async def test_hybrid_rrf_deduplicates_chunk_and_preserves_native_score_and_path
     assert merged["metadata"]["title"] == "Graph doc"
     assert merged["score"] == 0.1
     assert merged["metadata"]["retrieval_sources"] == ["vector", "graph"]
-    # 10A.6: graph_paths is a list of complete GraphPath objects; the predicate
+    # graph_paths is a list of complete GraphPath objects; the predicate
     # is on the first step of the path.
     assert merged["metadata"]["graph_paths"][0]["steps"][0]["predicate"] == "purchases"
     assert merged["metadata"]["hybrid_score"] > vector_only["metadata"]["hybrid_score"]
@@ -288,7 +288,7 @@ async def test_hybrid_filters_apply_identically_to_vector_and_graph_candidates()
         engine.dispose()
 
 
-# ── 10A.6 appendix tests (F14 fill) ──────────────────────────────────
+# ── Hybrid retrieval contract tests ──────────────────────────────────
 
 
 async def test_hybrid_two_document_two_hop_query_includes_both_supporting_chunks():

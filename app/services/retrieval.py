@@ -262,7 +262,7 @@ async def retrieve_contexts(
                 metadata["graph_score"] = graph_score
 
     for key, context in fused.items():
-        # Exact RRF-60 sum, never rounded: the plan pins hybrid_score as the
+        # Exact RRF-60 sum, never rounded: hybrid_score is the
         # sum of 1/(60+rank) over the candidate's sides, and rounding would
         # perturb that arithmetic (and could fabricate ties).
         context["metadata"]["hybrid_score"] = rrf_scores[key]

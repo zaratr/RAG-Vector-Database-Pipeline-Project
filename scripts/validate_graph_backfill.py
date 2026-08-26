@@ -1,4 +1,4 @@
-"""Disposable graph backfill validator for Task 10A.8 (plan L930-L941, F11).
+"""Disposable graph backfill validator.
 
 Hardened contract (the pre-remediation script asserted nothing, invoked the
 service instead of the CLI, and took no fingerprints):
@@ -17,10 +17,10 @@ service instead of the CLI, and took no fingerprints):
     calls, and zero writes are ASSERTED, including the skip precedence the
     seed supports (``document_not_ready`` over ``unsupported_media_type``;
     ``current_terminal`` over ``failed_not_retried``);
-  - the plan-pinned first real run (exact counters, sorted minified JSON,
+  - the first real run (exact counters, sorted minified JSON,
     exit 0) and the idempotent second run (``current_terminal`` skip, no new
     graph/evidence rows, still exactly one provider call);
-* proves the plan's two-worker duplicate-protection expectation
+* proves the two-worker duplicate-protection expectation
   deterministically (no sleeps): worker A's REAL ``backfill()`` provider call
   parks while a second worker reclaims the expired lease through the
   repository API with an injected clock 7200s past A's
@@ -36,9 +36,9 @@ service instead of the CLI, and took no fingerprints):
 * removes the disposable DB/WAL/SHM files and stops the provider endpoint in
   ``finally`` and VERIFIES the removal before reporting ``restored: true``.
 
-Exit codes (mirrors the P8a/P8b validator conventions):
+Exit codes (mirrors the acceptance-validator conventions):
 
-* ``0`` — success; stdout is exactly the plan-pinned JSON
+* ``0`` — success; stdout is exactly the pinned JSON
   ``{"first": {...}, "second": {...}, "restored": true}``.
 * ``1`` — backfill counter/proof/cleanup assertion failure
   (machine-readable JSON on stderr).
@@ -353,7 +353,7 @@ def _check_dry_run_shape(lane: str, probe: str, payload: dict, expected: dict) -
 
 
 # ---------------------------------------------------------------------------
-# CLI invocation (the plan pins backfill_graph.py for the seeded scenario)
+# CLI invocation is backfill_graph.py for the seeded scenario
 # ---------------------------------------------------------------------------
 
 
@@ -428,7 +428,7 @@ def _disposable_engine(db_url: str):
     because the driver never tracked the transaction the SAVEPOINT started —
     the fenced worker's "rolled back" pending row then stays visible on the
     pooled connection. Disabling the driver's implicit handling and issuing
-    explicit ``BEGIN`` (the pattern used by the 10A.8 service tests) makes
+    explicit ``BEGIN`` (the pattern used by the backfill service tests) makes
     SAVEPOINT/ROLLBACK behave exactly as the concurrency proof requires.
     """
     engine = create_engine(db_url)

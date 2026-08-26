@@ -1,4 +1,4 @@
-"""Phase 10A.5 — CLI tests for src/graph_rag.py (retrieve_graph_paths migration)."""
+"""CLI tests for src/graph_rag.py (retrieve_graph_paths traversal)."""
 from __future__ import annotations
 
 import json
@@ -254,7 +254,7 @@ def test_graph_rag_cli_scalar_title_source_tags_filters_restrict_results(
 
 
 def test_graph_rag_cli_accepts_repeated_filters(tmp_path):
-    """Appendix 10A.5: --filters takes repeated key=value occurrences."""
+    """--filters takes repeated key=value occurrences."""
     db_path = tmp_path / "graph-rag-cli-repeated.db"
     doc_a_id, doc_b_id = _seed_two_document_db(db_path)
     env = {**os.environ, "RAG_DATABASE_URL": f"sqlite:///{db_path}"}
@@ -283,7 +283,7 @@ def test_graph_rag_cli_unknown_filter_key_surfaces_mapped_error(tmp_path):
 
 
 def test_graph_rag_cli_non_integer_document_id_surfaces_mapped_error(tmp_path):
-    """document_id=abc is an invalid integer form: the plan-pinned
+    """document_id=abc is an invalid integer form: the pinned
     UnsupportedGraphFilter message must surface with exit 2."""
     db_path = tmp_path / "graph-rag-cli-badint.db"
     _seed_two_document_db(db_path)

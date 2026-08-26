@@ -1,4 +1,4 @@
-"""Tests for the hardened Phase 10A.7 acceptance validator (F9 remediation).
+"""Tests for the hardened acceptance validator.
 
 ``scripts/validate_phase10a.py`` is the acceptance validator whose exit code
 separates success from validation failure and provider unavailability. These
@@ -484,7 +484,7 @@ def test_rrf_constant_is_sixty():
     from scripts import validate_phase10a as validator
 
     # A chunk ranked 1st on the vector side and 2nd on the graph side fuses to
-    # 1/(60+1) + 1/(60+2): the plan 10A.6 fusion constant is pinned at 60.
+    # 1/(60+1) + 1/(60+2): the fusion constant is pinned at 60.
     # Production emits the exact RRF sum (no rounding); the helper mirrors it.
     assert validator._rrf_score({"vector": 1, "graph": 2}) == pytest.approx(
         1 / 61 + 1 / 62

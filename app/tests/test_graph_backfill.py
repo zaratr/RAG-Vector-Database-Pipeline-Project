@@ -1,4 +1,4 @@
-"""Phase 10A.8 — idempotent graph backfill tests."""
+"""Idempotent graph backfill tests."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -506,7 +506,7 @@ async def test_backfill_conservation_equations_hold_when_lease_lost_mid_processi
     Drives the REAL backfill() service loop through expiry-during-processing:
     worker A begins the lease and starts the provider call; while the call is
     in flight the lease expires and a second worker reclaims it; worker A's
-    complete then raises ExtractionLeaseLost. The plan's conservation
+    complete then raises ExtractionLeaseLost. The conservation
     equations must hold for every report in every interleaving:
 
         eligible = processed + lease_lost
@@ -514,7 +514,7 @@ async def test_backfill_conservation_equations_hold_when_lease_lost_mid_processi
         scanned = skipped + processed + lease_lost
         skipped = sum(skip_reasons.values())
 
-    Two-worker expectation (plan 10A.8): exactly one worker reports
+    Two-worker expectation: exactly one worker reports
     processed=1/lease_lost=0; the other reports lease_lost=1.
     """
     session, engine = _transactional_session()

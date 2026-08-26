@@ -1,4 +1,4 @@
-"""Live acceptance script for real Ollama/Gemma graph extraction (10A.2).
+"""Live acceptance script for real Ollama/Gemma graph extraction.
 
 Runs the configured provider against a fixture text and prints a bounded JSON
 summary to stdout. Exit codes:

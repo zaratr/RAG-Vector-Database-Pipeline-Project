@@ -1,7 +1,7 @@
 """Idempotent graph backfill for ready text chunks lacking the current extraction identity.
 
-Task 10A.8: extracts graph facts for ready text chunks that predate GraphRAG or
-lack the current extraction identity. Reuses the 10A.3 repository API; never
+Extracts graph facts for ready text chunks that predate GraphRAG or
+lack the current extraction identity. Reuses the extraction repository API; never
 modifies vector IDs, Chroma records, document readiness, or old extraction
 evidence rows from other versions.
 """
@@ -258,7 +258,7 @@ async def backfill(
             # worker reclaimed the expired lease (expiry-during-processing)
             # or terminalized the identity first, so complete/fail raised.
             # The chunk must count ONLY in lease_lost — never additionally
-            # in processed — so the plan's conservation equations hold in
+            # in processed — so the conservation equations hold in
             # every interleaving: eligible = processed + lease_lost,
             # processed = succeeded + empty + failed, and scanned = skipped
             # + processed + lease_lost.

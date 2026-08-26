@@ -114,7 +114,7 @@ def test_query_rejects_invalid_retrieval_controls(payload):
 
 
 def test_graph_extraction_provider_failure_returns_502_and_persists_failed_state():
-    """10A.4: invalid provider output → HTTP 502; failed state persists (operator-visible)."""
+    """Invalid provider output → HTTP 502; failed state persists (operator-visible)."""
     class FailingExtractor:
         async def extract(self, text):
             raise GraphExtractionError("unavailable")
@@ -139,7 +139,7 @@ def test_graph_extraction_provider_failure_returns_502_and_persists_failed_state
 
 
 def test_graph_provider_unavailable_returns_503_and_persists_failed_state():
-    """10A.4: provider unavailable → HTTP 503; failed doc operator-visible, not query-visible."""
+    """Provider unavailable → HTTP 503; failed doc operator-visible, not query-visible."""
     class UnavailableExtractor:
         async def extract(self, text):
             raise GraphProviderUnavailable("offline")
@@ -278,7 +278,7 @@ def test_ingest_valid_pdf_no_extractable_text_returns_400():
     assert "No text content" in response.json()["detail"]
 
 
-# ── 10A.4 HTTP behavior tests (phase10-test-specifications appendix) ──
+# ── HTTP behavior tests ──
 # Adapted to the implemented API surface: routes are mounted without an
 # /api/v1 prefix, /documents takes Form fields, and the graph extractor is
 # injected via app.dependency_overrides (the established pattern above).
@@ -425,7 +425,7 @@ def test_query_excludes_non_ready_documents():
         assert item.get("metadata", {}).get("document_id") != doc_id
 
 
-# ── 10A.6 /query retrieval-mode tests (phase10-test-specifications appendix) ──
+# ── /query retrieval-mode tests ──
 
 
 def test_query_hybrid_mode_returns_200_with_context():
@@ -492,8 +492,8 @@ def test_query_hybrid_traversal_limit_returns_503(monkeypatch):
     from app.services import rag
     from app.services.graph_retrieval import GraphTraversalLimitError
 
-    # retrieve_graph_paths is synchronous in production; the appendix's
-    # ``async def _boom(**kwargs)`` shape is adapted to the sync signature
+    # retrieve_graph_paths is synchronous in production; the raising
+    # helper is adapted to the sync signature
     # (and ``session`` is passed positionally), preserving the patch point,
     # the raised exception, and the asserted 503.
     def _boom(*args, **kwargs):
@@ -508,8 +508,8 @@ def test_query_hybrid_traversal_limit_returns_503(monkeypatch):
 
 
 def test_post_image_documents_vector_failure_returns_503_with_stable_detail(monkeypatch):
-    """W1: image ingestion vector failure maps to the same stable 503 detail
-    as the text route (10A.4 HTTP behavior contract)."""
+    """Image ingestion vector failure maps to the same stable 503 detail
+    as the text route (shared HTTP behavior contract)."""
     class FakeImageProvider:
         async def embed_images(self, paths):
             return [[0.1] * 10]

@@ -1,4 +1,4 @@
-"""Idempotent graph backfill CLI (Task 10A.8).
+"""Idempotent graph backfill CLI.
 
 Exit codes:
 * ``0`` — completed with ``failed=0`` (including no-op/idempotent runs).

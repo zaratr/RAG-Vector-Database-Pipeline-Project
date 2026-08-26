@@ -124,7 +124,7 @@ class GraphExtraction(Base):
             name="ck_graph_extractions_input_sha256_hex",
         ),
         CheckConstraint(
-            # Plan-exact per-status lifecycle rules (10A.3 W4); mirrors the
+            # Per-status lifecycle rules; mirrors the
             # b7f3d5a9c2e1 migration CHECK of the same name.
             "CASE status "
             "WHEN 'pending' THEN completed_at IS NULL AND error_code IS NULL "
@@ -163,7 +163,7 @@ class GraphExtraction(Base):
     error_code = Column(String(100), nullable=True)
     error_detail = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    # 10A.3 lifecycle/identity columns.
+    # Lifecycle/identity columns.
     input_sha256 = Column(String(64), nullable=False)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     completed_at = Column(DateTime(timezone=True), nullable=True)

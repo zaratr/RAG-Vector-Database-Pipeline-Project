@@ -150,7 +150,7 @@ async def create_document(
         ) from exc
     except RuntimeError as exc:
         # Remaining vector-store failures (e.g. upsert/list raised by the
-        # backend) map to the plan's stable public detail; the internal
+        # backend) map to a stable public detail; the internal
         # exception type is already stored as the bounded failure code.
         raise HTTPException(
             status_code=503, detail="Vector index unavailable"

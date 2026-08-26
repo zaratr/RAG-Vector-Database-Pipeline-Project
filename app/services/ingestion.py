@@ -1,6 +1,6 @@
 """Document ingestion pipeline.
 
-Phase 10A.4 aligns ingestion with the durable extraction lifecycle. The text
+Ingestion is aligned with the durable extraction lifecycle. The text
 ingestion state machine is:
 
 1. Normalize/chunk input.
@@ -46,7 +46,7 @@ class VectorIndexIncomplete(RuntimeError):
 
     Maps to HTTP 503 with the stable public detail ``Vector index unavailable``;
     distinct from graph-provider failures so the route handler can produce the
-    exact 10A.4 status/detail.
+    exact status/detail.
     """
 
 
@@ -63,11 +63,11 @@ async def ingest_text(
     graph_extraction_provider: str = EXTRACTION_PROVIDER,
     graph_extraction_model: str = "unknown",
 ) -> dict:
-    """Ingest raw text into the system following the 10A.4 state machine."""
+    """Ingest raw text through the staged lifecycle state machine."""
     # A disabled extractor passed directly (service level) is treated exactly
     # like the route does: no provider call, extraction recorded as skipped
     # with reason extraction_disabled — never mislabeled as an empty provider
-    # result (plan 10A.4: "no disabled run is labeled empty").
+    # result (a disabled run is never labeled empty).
     if isinstance(graph_extractor, DisabledGraphExtractor):
         graph_extractor = None
     normalized = " ".join(text.split())
