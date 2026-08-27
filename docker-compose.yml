@@ -37,12 +37,8 @@ services:
       RAG_INGESTION_EXTRACTED_MAX_BYTES: ${RAG_INGESTION_EXTRACTED_MAX_BYTES:-5242880}
       RAG_INGEST_RATE_LIMIT_REQUESTS: ${RAG_INGEST_RATE_LIMIT_REQUESTS:-30}
       RAG_INGEST_RATE_LIMIT_WINDOW_SECONDS: ${RAG_INGEST_RATE_LIMIT_WINDOW_SECONDS:-60}
-      RAG_PLAN_PATH: ${RAG_PLAN_PATH:-/plan-archive}
     volumes:
       - relational_data:/data
-      # Read-only mount of the external Phase 10 plan archive; the plan is
-      # normative and read-only, never copied into the image.
-      - ${RAG_PLAN_ARCHIVE:-../random_archive/.hermes/plans}:/plan-archive:ro
     depends_on:
       migrate:
         condition: service_completed_successfully

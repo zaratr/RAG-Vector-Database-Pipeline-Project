@@ -124,7 +124,7 @@ class ChromaVectorStore:
 
     async def query(self, embedding: List[float], top_k: int, filters: dict | None = None) -> List[RetrievedChunk]:
         logger.info("Querying vector store with top_k=%s", top_k)
-        # Plan 10A.5 pins `tags` as exact membership after splitting the stored
+        # `tags` is exact membership after splitting the stored
         # comma-separated tags; a Chroma where clause cannot express membership
         # over the indexed list tags metadata (raw equality silently matches
         # nothing). `tags` is therefore never pushed to Chroma and is enforced

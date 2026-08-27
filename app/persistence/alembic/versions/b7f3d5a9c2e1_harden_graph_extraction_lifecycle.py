@@ -4,7 +4,7 @@ Revision ID: b7f3d5a9c2e1
 Revises: a6e2c4f8b1d9
 Create Date: 2026-08-09
 
-This revision is owned by Task 10A.3. The upgrade is a deterministic SQLite
+The upgrade is a deterministic SQLite
 table rebuild of ``graph_extractions``:
 
 * adds ``media_type`` to ``chunks`` (default ``text/plain``);
@@ -322,7 +322,7 @@ def downgrade() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Conversion matrix (plan L427-436)
+# Conversion matrix
 # ---------------------------------------------------------------------------
 
 

@@ -6,10 +6,12 @@ import json
 import logging
 from typing import List
 
+import httpx
+
 from sqlalchemy.orm import Session
 
 from app.services.embeddings import EmbeddingProvider
-from app.services.llm import LLMClient
+from app.services.llm import LLMClient, LLMProviderOutputError
 from app.services.vector_store import VectorStore
 from app.services import retrieval
 from app.services.context_security import detect_context_injection, get_context_security_policy
@@ -242,6 +244,13 @@ async def answer_query(
         answer = await llm_client.generate_answer(
             query, evidence, system_prompt=CONTEXT_SECURITY_SYSTEM_PROMPT
         )
+    except (LLMProviderOutputError, httpx.HTTPError):
+        # Typed answer-provider contracts (malformed envelope -> 502,
+        # transport failure -> 503, mapped in the route): terminalize the
+        # audit truthfully, then re-raise so the typed mappings apply
+        # instead of the generic 503 fail-close lane.
+        _fail_audit(audit, session, audit_id, "generation_provider_failed")
+        raise
     except Exception as exc:
         _fail_audit(audit, session, audit_id, "generation_provider_failed")
         raise GenerationProviderFailure("generation provider failed") from exc

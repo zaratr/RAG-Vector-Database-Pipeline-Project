@@ -15,13 +15,13 @@ MAX_GRAPH_HOPS = 3
 MAX_SEEDS = 20
 MAX_EVIDENCE_ROWS = 5000
 MAX_RETURNED_PATHS = 50
-# Per-seed fair candidate budget (W2): every accepted seed contributes up to
-# this many candidate paths to the global deterministic sort. Plan 10A.5
-# selection semantics consider all seeds (up to MAX_SEEDS) and pick the top
+# Per-seed fair candidate budget: every accepted seed contributes up to
+# this many candidate paths to the global deterministic sort. Selection
+# semantics consider all seeds (up to MAX_SEEDS) and pick the top
 # ``limit`` (<= MAX_RETURNED_PATHS) paths by the documented sort key, so no
 # seed may be silently dropped because an earlier seed produced many paths.
 # The budget keeps total candidates bounded at MAX_SEEDS * this value while
-# preserving the plan's seed and returned-path caps.
+# preserving the seed and returned-path caps.
 MAX_SEED_CANDIDATE_PATHS = MAX_RETURNED_PATHS * 4
 
 TraversalDirection = Literal["outbound", "inbound", "both"]
@@ -84,7 +84,7 @@ def _validate_filters(filters: dict | None) -> dict:
     # Validate document_id's scalar type up front: the SQL-side check in
     # apply_document_filters is skipped when traversal short-circuits (no
     # seeds/empty evidence), and an unsupported filter must be rejected,
-    # never silently ignored, regardless of graph content (plan 10A.6).
+    # never silently ignored, regardless of graph content.
     if "document_id" in filters and (
         isinstance(filters["document_id"], bool)
         or not isinstance(filters["document_id"], int)
@@ -99,7 +99,7 @@ def _validate_filters(filters: dict | None) -> dict:
 def split_document_tags(stored_tags: str | None) -> list[str]:
     """Split stored comma-separated document tags and trim whitespace.
 
-    Plan 10A.5 scalar filter matrix: ``tags`` is "one scalar tag; exact
+    Scalar filter matrix: ``tags`` is "one scalar tag; exact
     membership after splitting stored comma-separated tags and trimming
     whitespace". Empty elements are dropped. Mirrors the split performed by
     ``Chunk.get_chunk_metadata`` and is shared by graph retrieval and vector
@@ -262,16 +262,16 @@ def retrieve_graph_contexts(
 
 
 # ---------------------------------------------------------------------------
-# 10A.5 — directional path traversal returning complete GraphPath objects
+# Directional path traversal returning complete GraphPath objects
 # ---------------------------------------------------------------------------
 
 
 def apply_document_filters(query, filters: dict | None, session: Session):
-    """Apply the plan 10A.5 scalar filter matrix to a Document-joined query.
+    """Apply the scalar filter matrix to a Document-joined query.
 
     ``document_id`` is integer equality with booleans and non-integer forms
-    (strings like ``"7"``, floats like ``7.0``) rejected rather than coerced
-    (W5), ``title`` and ``source`` are exact case-sensitive SQL equality, and
+    (strings like ``"7"``, floats like ``7.0``) rejected rather than coerced,
+    ``title`` and ``source`` are exact case-sensitive SQL equality, and
     ``tags`` is exact membership after splitting the stored comma-separated
     tags and trimming whitespace. Shared by graph traversal and vector
     hydration so identical filter values yield identical candidate semantics
@@ -298,6 +298,13 @@ def apply_document_filters(query, filters: dict | None, session: Session):
 
 
 def _ready_evidence_rows(session: Session, filters: dict):
+    """Ready-document evidence rows for path traversal.
+
+    The query is bounded at ``MAX_EVIDENCE_ROWS + 1`` rows (the same pattern
+    as ``retrieve_graph_contexts``) so the caller's cap check never needs to
+    materialize an unbounded result set first; the extra row is the
+    over-cap signal.
+    """
     query = (
         session.query(models.GraphEdgeEvidence)
         .join(models.GraphEdgeEvidence.extraction)
@@ -313,7 +320,7 @@ def _ready_evidence_rows(session: Session, filters: dict):
         .filter(models.Document.ingestion_status == "ready")
     )
     query = apply_document_filters(query, filters, session)
-    return query.all()
+    return query.limit(MAX_EVIDENCE_ROWS + 1).all()
 
 
 def resolve_graph_seeds(
@@ -479,7 +486,7 @@ def _bfs_paths(
 ) -> list[GraphPath]:
     """Breadth-first expansion from ``seed`` yielding complete GraphPath objects.
 
-    Results are capped at ``MAX_SEED_CANDIDATE_PATHS`` per seed (W2 fair
+    Results are capped at ``MAX_SEED_CANDIDATE_PATHS`` per seed (fair
     budget). The cap is deterministic because both the per-entity evidence
     lists and the FIFO queue are explored in sorted order.
     """

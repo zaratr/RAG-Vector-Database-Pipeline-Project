@@ -1,4 +1,4 @@
-"""Phase 10A.3 — idempotent extraction lifecycle persistence tests.
+"""Idempotent extraction lifecycle persistence tests.
 
 Exercises the repository API: ``derive_extraction_identity``,
 ``begin_chunk_extraction``, ``complete_chunk_extraction``,
@@ -741,7 +741,7 @@ def test_skip_with_unsupported_media_type_reason_code():
 
 def test_skip_chunk_extraction_rejects_invalid_reason_code_with_typed_error():
     """An invalid reason_code raises the repository's typed ValueError before
-    any DB write instead of surfacing the W4 lifecycle CHECK
+    any DB write instead of surfacing the lifecycle CHECK
     (``skipped -> error_code IN ('extraction_disabled',
     'unsupported_media_type')``) as a raw IntegrityError at flush time."""
     session, engine = _session()
@@ -857,7 +857,7 @@ def test_direct_sql_rejects_short_input_sha256():
 
 
 def test_direct_sql_rejects_long_input_sha256():
-    """Plan acceptance #7: the 64-hex CHECK also rejects values longer than 64."""
+    """The 64-hex CHECK also rejects values longer than 64."""
     session, engine = _session()
     _, chunk = _document_chunk(session)
 
@@ -877,7 +877,7 @@ def test_direct_sql_rejects_long_input_sha256():
 
 
 def test_direct_sql_rejects_punctuation_input_sha256():
-    """Plan acceptance #7: the 64-hex CHECK rejects punctuation inside the value."""
+    """The 64-hex CHECK rejects punctuation inside the value."""
     session, engine = _session()
     _, chunk = _document_chunk(session)
 
@@ -1064,6 +1064,79 @@ def test_complete_by_stale_owner_after_reclaim_raises_lease_lost():
     assert ext.attempt_count == stale_attempt_count + 1
 
     session.close()
+    engine.dispose()
+
+
+def test_complete_by_stale_owner_after_uncommitted_cross_session_reclaim_raises_lease_lost():
+    """W-1 regression: the 0-row UPDATE diagnosis must re-read database state.
+
+    The same-session committed-reclaim variant above never exercised the
+    defect: committing between the reclaim and the fenced complete expires the
+    ORM instance, so SQLAlchemy's evaluate synchronization refreshes it from
+    the database and the stale SET values are never applied in memory.
+
+    This test constructs the shape that variant misses. Worker A begins the
+    lease and holds its instance un-expired in its own session (no commit).
+    Worker B — a SECOND session over the same in-memory engine; both sessions
+    share the SingletonThreadPool DBAPI connection, so B's uncommitted reclaim
+    flush is visible to A's conditional UPDATE — reclaims the expired lease
+    with no commit in between. A's conditional UPDATE then matches 0 rows
+    while evaluate-sync applies the UPDATE's SET values to A's un-expired
+    in-memory instance (it reads status="succeeded"). The diagnosis must
+    therefore consult the database, not the identity map, and raise
+    ExtractionLeaseLost — never InvalidExtractionTransition.
+    """
+    session_a, engine = _session()
+    _, chunk = _document_chunk(session_a)
+
+    clock_start = _frozen_clock(offset_seconds=0)
+    lease_a = begin_chunk_extraction(
+        session_a, chunk=chunk, provider="ollama", model="gemma4:latest",
+        prompt_version="graph-v1", schema_version="graph-relations-v1",
+        now_utc=clock_start,
+    )
+    stale_attempt_count = lease_a.lease_attempt_count
+    # NO commit: worker A's instance stays live (un-expired) in its session.
+
+    # Worker B reclaims in a second session over the same engine without any
+    # commit in between; its flush rides the shared DBAPI connection.
+    session_b = sessionmaker(bind=engine)()
+    chunk_b = session_b.get(models.Chunk, chunk.id)
+    lease_b = begin_chunk_extraction(
+        session_b, chunk=chunk_b, provider="ollama", model="gemma4:latest",
+        prompt_version="graph-v1", schema_version="graph-relations-v1",
+        retry_failed=True, now_utc=_frozen_clock(offset_seconds=601),
+    )
+    assert lease_b.should_call_provider is True
+    assert lease_b.lease_attempt_count == stale_attempt_count + 1
+
+    # Worker A completes with its stale attempt_count: fenced, lease lost.
+    with pytest.raises(ExtractionLeaseLost):
+        complete_chunk_extraction(
+            session_a, extraction=lease_a.extraction,
+            relations=[_valid_relation(chunk.text)],
+            expected_attempt_count=stale_attempt_count,
+        )
+
+    # Worker B's reclaim survives; worker A's poisoned objects are discarded.
+    # B must commit BEFORE A rolls back: both sessions share one DBAPI
+    # connection, so A's rollback would otherwise discard B's uncommitted
+    # reclaim flush.
+    session_b.commit()
+    session_a.rollback()
+
+    verify = sessionmaker(bind=engine)()
+    ext = verify.query(models.GraphExtraction).one()
+    assert ext.status == "pending"
+    assert ext.attempt_count == stale_attempt_count + 1
+    assert ext.error_code is None
+    # The fenced worker wrote no evidence for its failed completion.
+    assert verify.query(models.GraphEdgeEvidence).count() == 0
+    assert verify.query(models.EntityMention).count() == 0
+
+    verify.close()
+    session_b.close()
+    session_a.close()
     engine.dispose()
 
 

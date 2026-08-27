@@ -128,7 +128,7 @@ async def test_hybrid_rrf_deduplicates_chunk_and_preserves_native_score_and_path
     assert merged["metadata"]["title"] == "Graph doc"
     assert merged["score"] == 0.1
     assert merged["metadata"]["retrieval_sources"] == ["vector", "graph"]
-    # 10A.6: graph_paths is a list of complete GraphPath objects; the predicate
+    # graph_paths is a list of complete GraphPath objects; the predicate
     # is on the first step of the path.
     assert merged["metadata"]["graph_paths"][0]["steps"][0]["predicate"] == "purchases"
     assert merged["metadata"]["hybrid_score"] > vector_only["metadata"]["hybrid_score"]
@@ -288,7 +288,7 @@ async def test_hybrid_filters_apply_identically_to_vector_and_graph_candidates()
         engine.dispose()
 
 
-# ── 10A.6 appendix tests (F14 fill) ──────────────────────────────────
+# ── Hybrid retrieval contract tests ──────────────────────────────────
 
 
 async def test_hybrid_two_document_two_hop_query_includes_both_supporting_chunks():
@@ -524,3 +524,444 @@ async def test_tags_filter_membership_applies_identically_across_vector_graph_an
     finally:
         session.close()
         engine.dispose()
+
+
+# ── RRF tie-breaking, degenerate candidate sets, and the no-evidence lane ──
+
+
+def _tie_session():
+    """Seed one ready document with three chunks in a known id order:
+
+    * ``c_graph``  — "User purchases Subscription." with a relation (graph side)
+    * ``c_alpha``  — plain text (vector side only)
+    * ``c_beta``   — "Stakeholder reviews Roadmap." with a relation (graph side)
+
+    Chunk ids are assigned in creation order, so c_graph < c_alpha < c_beta.
+    """
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+
+    document = models.Document(title="Tie doc", source="unit")
+    session.add(document)
+    session.flush()
+    c_graph = models.Chunk(document_id=document.id, index=0,
+                           text="User purchases Subscription.",
+                           start_offset=0, end_offset=28, vector_id="chunk:tie:0")
+    c_alpha = models.Chunk(document_id=document.id, index=1,
+                           text="Plain vector-only evidence alpha.",
+                           start_offset=29, end_offset=61, vector_id="chunk:tie:1")
+    c_beta = models.Chunk(document_id=document.id, index=2,
+                          text="Stakeholder reviews Roadmap.",
+                          start_offset=62, end_offset=90, vector_id="chunk:tie:2")
+    session.add_all([c_graph, c_alpha, c_beta])
+    session.flush()
+    for chunk, source, predicate, target in (
+        (c_graph, "User", "purchases", "Subscription"),
+        (c_beta, "Stakeholder", "reviews", "Roadmap"),
+    ):
+        persist_chunk_extraction(
+            session, chunk=chunk,
+            relations=[ExtractedRelation(
+                source=ExtractedEntity(name=source, canonical_name=source.casefold(),
+                                       entity_type="person"),
+                predicate=predicate,
+                target=ExtractedEntity(name=target, canonical_name=target.casefold(),
+                                       entity_type="concept"),
+                evidence=chunk.text, evidence_start=0, evidence_end=len(chunk.text),
+                confidence=0.9)],
+            provider="ollama", model="gemma4:latest")
+    session.commit()
+    return session, engine, document, c_graph, c_alpha, c_beta
+
+
+async def test_hybrid_exact_tie_breaks_deterministically_by_chunk_id():
+    """Two single-side chunks at the same rank on their own sides tie exactly
+    (vector rank 2 vs graph rank 2 -> both 1/62). The fused order must be
+    deterministic: ascending chunk_id for equal hybrid_score."""
+    session, engine, document, c_graph, c_alpha, c_beta = _tie_session()
+    try:
+        # Vector side ranks: c_graph 1st, c_alpha 2nd.
+        vector = FixedVectorStore([
+            RetrievedChunk(text=c_graph.text, score=0.1, vector_id=c_graph.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": c_graph.id}),
+            RetrievedChunk(text=c_alpha.text, score=0.2, vector_id=c_alpha.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": c_alpha.id}),
+        ])
+        # Query names both relation sources so the graph side resolves both
+        # seeds lexically; graph candidates sort by (-score, hop, chunk_id):
+        # c_graph (conf 0.9, id lower) rank 1, c_beta rank 2.
+        contexts = await retrieve_contexts(
+            query="User Stakeholder", embedding_provider=FixedEmbeddingProvider(),
+            vector_store=vector, session=session, mode="hybrid",
+            top_k=5, graph_max_hops=1)
+
+        by_id = {c["metadata"]["chunk_id"]: c for c in contexts}
+        assert set(by_id) == {c_graph.id, c_alpha.id, c_beta.id}
+        # c_graph is rank 1 on BOTH sides: 1/61 + 1/61.
+        assert by_id[c_graph.id]["metadata"]["hybrid_score"] == (1 / 61 + 1 / 61)
+        # c_alpha: vector rank 2 only; c_beta: graph rank 2 only -> exact tie.
+        alpha_score = by_id[c_alpha.id]["metadata"]["hybrid_score"]
+        beta_score = by_id[c_beta.id]["metadata"]["hybrid_score"]
+        assert alpha_score == 1 / 62
+        assert beta_score == 1 / 62
+        assert alpha_score == beta_score
+        # Deterministic tie-break: ascending chunk_id among equal scores,
+        # and the both-sides chunk outranks every single-side chunk.
+        ordered = [c["metadata"]["chunk_id"] for c in contexts]
+        assert ordered == [c_graph.id, c_alpha.id, c_beta.id]
+    finally:
+        session.close(); engine.dispose()
+
+
+def _multi_digit_tie_session():
+    """Seed one ready document whose chunk ids reach double digits:
+
+    * ``c_top`` (id 1) — relation chunk, rank 1 on both sides
+    * ``c_two`` (id 2) — plain text, vector side only
+    * seven filler chunks (ids 3-9) — never retrieved
+    * ``c_ten`` (id 10) — relation chunk, graph side only
+    """
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+
+    document = models.Document(title="Multi-digit tie doc", source="unit")
+    session.add(document)
+    session.flush()
+    c_top = models.Chunk(document_id=document.id, index=0,
+                         text="User purchases Subscription.",
+                         start_offset=0, end_offset=28, vector_id="chunk:multi:0")
+    c_two = models.Chunk(document_id=document.id, index=1,
+                         text="Plain vector-only evidence two.",
+                         start_offset=29, end_offset=61, vector_id="chunk:multi:1")
+    session.add_all([c_top, c_two])
+    session.flush()
+    for filler_index in range(2, 9):
+        session.add(models.Chunk(
+            document_id=document.id, index=filler_index,
+            text=f"Filler chunk {filler_index}.",
+            start_offset=62, end_offset=80, vector_id=None))
+    session.flush()
+    c_ten = models.Chunk(document_id=document.id, index=9,
+                         text="Stakeholder reviews Roadmap.",
+                         start_offset=81, end_offset=109, vector_id="chunk:multi:9")
+    session.add(c_ten)
+    session.flush()
+    for chunk, source, predicate, target in (
+        (c_top, "User", "purchases", "Subscription"),
+        (c_ten, "Stakeholder", "reviews", "Roadmap"),
+    ):
+        persist_chunk_extraction(
+            session, chunk=chunk,
+            relations=[ExtractedRelation(
+                source=ExtractedEntity(name=source, canonical_name=source.casefold(),
+                                       entity_type="person"),
+                predicate=predicate,
+                target=ExtractedEntity(name=target, canonical_name=target.casefold(),
+                                       entity_type="concept"),
+                evidence=chunk.text, evidence_start=0, evidence_end=len(chunk.text),
+                confidence=0.9)],
+            provider="ollama", model="gemma4:latest")
+    session.commit()
+    assert (c_top.id, c_two.id, c_ten.id) == (1, 2, 10)
+    return session, engine, document, c_top, c_two, c_ten
+
+
+async def test_hybrid_tie_break_orders_multi_digit_chunk_ids_numerically():
+    """Single-side tie across a digit boundary: c_two (id 2, vector rank 2)
+    and c_ten (id 10, graph rank 2) both score exactly 1/62. The fused order
+    must be ascending NUMERIC chunk id ([2, 10]); a stringified-id sort would
+    place "10" before "2" and invert the deterministic order."""
+    session, engine, document, c_top, c_two, c_ten = _multi_digit_tie_session()
+    try:
+        vector = FixedVectorStore([
+            RetrievedChunk(text=c_top.text, score=0.1, vector_id=c_top.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": c_top.id}),
+            RetrievedChunk(text=c_two.text, score=0.2, vector_id=c_two.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": c_two.id}),
+        ])
+        contexts = await retrieve_contexts(
+            query="User Stakeholder", embedding_provider=FixedEmbeddingProvider(),
+            vector_store=vector, session=session, mode="hybrid",
+            top_k=5, graph_max_hops=1)
+
+        by_id = {c["metadata"]["chunk_id"]: c for c in contexts}
+        assert set(by_id) == {c_top.id, c_two.id, c_ten.id}
+        # Rank-2 single-side chunks tie exactly.
+        assert by_id[c_two.id]["metadata"]["hybrid_score"] == 1 / 62
+        assert by_id[c_ten.id]["metadata"]["hybrid_score"] == 1 / 62
+        assert by_id[c_top.id]["metadata"]["hybrid_score"] == (1 / 61 + 1 / 61)
+        assert by_id[c_two.id]["metadata"]["retrieval_sources"] == ["vector"]
+        assert by_id[c_ten.id]["metadata"]["retrieval_sources"] == ["graph"]
+        # Numeric ordering contract: 2 before 10 among tied scores, and the
+        # both-sides chunk first.
+        ordered = [c["metadata"]["chunk_id"] for c in contexts]
+        assert ordered == [c_top.id, c_two.id, c_ten.id]
+        assert ordered == [1, 2, 10]
+    finally:
+        session.close(); engine.dispose()
+
+
+async def test_hybrid_both_sides_tie_orders_multi_digit_chunk_ids_numerically():
+    """Both-sides-present tie across a digit boundary: the vector side ranks
+    c_ten (id 10) first while the graph side orders c_two (id 2) first, so
+    each chunk scores exactly 1/61 + 1/62. The tie must resolve by ascending
+    NUMERIC chunk id ([2, 10]), never the lexicographic "10" < "2"."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    try:
+        document = models.Document(title="Both-sides tie doc", source="unit")
+        session.add(document)
+        session.flush()
+        session.add(models.Chunk(document_id=document.id, index=0,
+                                 text="Filler head chunk.", start_offset=0,
+                                 end_offset=18, vector_id=None))
+        c_two = models.Chunk(document_id=document.id, index=1,
+                             text="User purchases Subscription.",
+                             start_offset=19, end_offset=47, vector_id="chunk:both:1")
+        session.add(c_two)
+        session.flush()
+        for filler_index in range(2, 9):
+            session.add(models.Chunk(
+                document_id=document.id, index=filler_index,
+                text=f"Filler chunk {filler_index}.",
+                start_offset=48, end_offset=66, vector_id=None))
+        session.flush()
+        c_ten = models.Chunk(document_id=document.id, index=9,
+                             text="Stakeholder reviews Roadmap.",
+                             start_offset=67, end_offset=95, vector_id="chunk:both:9")
+        session.add(c_ten)
+        session.flush()
+        for chunk, source, predicate, target in (
+            (c_two, "User", "purchases", "Subscription"),
+            (c_ten, "Stakeholder", "reviews", "Roadmap"),
+        ):
+            persist_chunk_extraction(
+                session, chunk=chunk,
+                relations=[ExtractedRelation(
+                    source=ExtractedEntity(name=source, canonical_name=source.casefold(),
+                                           entity_type="person"),
+                    predicate=predicate,
+                    target=ExtractedEntity(name=target, canonical_name=target.casefold(),
+                                           entity_type="concept"),
+                    evidence=chunk.text, evidence_start=0, evidence_end=len(chunk.text),
+                    confidence=0.9)],
+                provider="ollama", model="gemma4:latest")
+        session.commit()
+        assert (c_two.id, c_ten.id) == (2, 10)
+
+        # Vector side deliberately ranks the higher-id chunk first.
+        vector = FixedVectorStore([
+            RetrievedChunk(text=c_ten.text, score=0.1, vector_id=c_ten.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": c_ten.id}),
+            RetrievedChunk(text=c_two.text, score=0.2, vector_id=c_two.vector_id,
+                           metadata={"document_id": document.id, "chunk_id": c_two.id}),
+        ])
+        contexts = await retrieve_contexts(
+            query="User Stakeholder", embedding_provider=FixedEmbeddingProvider(),
+            vector_store=vector, session=session, mode="hybrid",
+            top_k=5, graph_max_hops=1)
+
+        ordered = [c["metadata"]["chunk_id"] for c in contexts]
+        assert ordered == [c_two.id, c_ten.id]
+        assert ordered == [2, 10]
+        by_id = {c["metadata"]["chunk_id"]: c for c in contexts}
+        # Both chunks are present on BOTH sides with mirrored ranks: exact tie.
+        assert by_id[c_two.id]["metadata"]["hybrid_score"] == (1 / 62 + 1 / 61)
+        assert by_id[c_ten.id]["metadata"]["hybrid_score"] == (1 / 61 + 1 / 62)
+        assert by_id[c_two.id]["metadata"]["hybrid_score"] == \
+            by_id[c_ten.id]["metadata"]["hybrid_score"]
+        for chunk_id in (c_two.id, c_ten.id):
+            assert set(by_id[chunk_id]["metadata"]["retrieval_sources"]) == \
+                {"vector", "graph"}
+    finally:
+        session.close(); engine.dispose()
+
+
+async def test_hybrid_zero_candidates_returns_empty_without_error():
+    """Empty vector side and a query matching no entities: hybrid returns
+    [] cleanly (no error, no placeholder rows)."""
+    session, engine, document, graph_chunk, vector_chunk = _graph_session()
+    try:
+        contexts = await retrieve_contexts(
+            query="zzz nothing matches this",
+            embedding_provider=FixedEmbeddingProvider(),
+            vector_store=FixedVectorStore([]),
+            session=session, mode="hybrid", top_k=5, graph_max_hops=1)
+        assert contexts == []
+    finally:
+        session.close(); engine.dispose()
+
+
+async def test_hybrid_single_candidate_fuses_single_side_score():
+    """Exactly one candidate (vector side only, graph side empty): the fused
+    list has one entry whose hybrid_score is 1/(60+1) from that side alone."""
+    session, engine, document, graph_chunk, vector_chunk = _graph_session()
+    try:
+        vector = FixedVectorStore([
+            RetrievedChunk(text=vector_chunk.text, score=0.4,
+                           vector_id=vector_chunk.vector_id,
+                           metadata={"document_id": document.id,
+                                     "chunk_id": vector_chunk.id}),
+        ])
+        contexts = await retrieve_contexts(
+            query="zzz nothing matches this",
+            embedding_provider=FixedEmbeddingProvider(),
+            vector_store=vector, session=session, mode="hybrid",
+            top_k=5, graph_max_hops=1)
+        assert len(contexts) == 1
+        assert contexts[0]["metadata"]["chunk_id"] == vector_chunk.id
+        assert contexts[0]["metadata"]["retrieval_sources"] == ["vector"]
+        assert contexts[0]["metadata"]["hybrid_score"] == 1 / 61
+    finally:
+        session.close(); engine.dispose()
+
+
+async def test_answer_query_with_no_evidence_invokes_llm_with_empty_context():
+    """Grounded no-evidence contract: a query matching nothing still produces
+    an answer, with context == [] and the LLM invoked with an empty context
+    list (never placeholder rows, never a crash)."""
+    from app.services.rag import answer_query
+
+    class RecordingLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def generate_answer(self, query, context):
+            self.calls.append((query, list(context)))
+            return "No evidence available for this question."
+
+    session, engine, document, graph_chunk, vector_chunk = _graph_session()
+    try:
+        llm = RecordingLLM()
+        result = await answer_query(
+            query="zzz nothing matches this",
+            embedding_provider=FixedEmbeddingProvider(),
+            vector_store=FixedVectorStore([]),
+            llm_client=llm, session=session,
+            retrieval_mode="vector", top_k=5)
+        assert result["context"] == []
+        assert result["answer"] == "No evidence available for this question."
+        assert llm.calls == [("zzz nothing matches this", [])]
+    finally:
+        session.close(); engine.dispose()
+
+
+# ── Vector-store inconsistency hardening at retrieval time ─────────────
+
+
+async def test_hybrid_duplicate_ids_in_one_store_response_yield_chunk_once():
+    """A single Chroma response returning the SAME chunk id twice (same
+    deterministic vector id, two score entries) must hydrate to exactly one
+    context entry. Without hydration-time dedup the duplicate would be fused
+    twice and inflate the RRF score to 1/61 + 1/62 from the vector side
+    alone; the pinned value proves the second occurrence never reaches the
+    fusion ranking."""
+    session, engine, document, graph_chunk, vector_chunk = _graph_session()
+    try:
+        vector = FixedVectorStore([
+            RetrievedChunk(text="first copy", score=0.1,
+                           vector_id=vector_chunk.vector_id,
+                           metadata={"document_id": document.id,
+                                     "chunk_id": vector_chunk.id}),
+            RetrievedChunk(text="second copy", score=0.3,
+                           vector_id=vector_chunk.vector_id,
+                           metadata={"document_id": document.id,
+                                     "chunk_id": vector_chunk.id}),
+        ])
+        contexts = await retrieve_contexts(
+            query="zzz nothing matches this",
+            embedding_provider=FixedEmbeddingProvider(),
+            vector_store=vector, session=session, mode="hybrid",
+            top_k=5, graph_max_hops=1)
+
+        assert len(contexts) == 1
+        assert contexts[0]["text"] == vector_chunk.text
+        assert contexts[0]["score"] == 0.1  # first occurrence wins
+        assert contexts[0]["metadata"]["chunk_id"] == vector_chunk.id
+        assert contexts[0]["metadata"]["hybrid_score"] == 1 / 61
+    finally:
+        session.close(); engine.dispose()
+
+
+def _cross_document_session():
+    """Two ready documents; ``chunk_a`` belongs to doc A but the store hit
+    for it claims doc B's identity (document_id, title, and text)."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine)()
+    doc_a = models.Document(title="Doc A title", source="unit")
+    doc_b = models.Document(title="Doc B title", source="unit")
+    session.add_all([doc_a, doc_b])
+    session.flush()
+    chunk_a = models.Chunk(document_id=doc_a.id, index=0,
+                           text="Authoritative SQL text for doc A.",
+                           start_offset=0, end_offset=33,
+                           vector_id="chunk:docA:0")
+    chunk_b = models.Chunk(document_id=doc_b.id, index=0,
+                           text="Doc B chunk text.",
+                           start_offset=0, end_offset=16,
+                           vector_id="chunk:docB:0")
+    session.add_all([chunk_a, chunk_b])
+    session.commit()
+    lying_hit = RetrievedChunk(
+        text="stolen doc B text riding a doc A vector",
+        score=0.2,
+        vector_id=chunk_a.vector_id,
+        metadata={"document_id": doc_b.id, "chunk_id": chunk_a.id,
+                  "title": "Doc B title", "index": 9},
+    )
+    return session, engine, doc_a, doc_b, chunk_a, chunk_b, lying_hit
+
+
+async def test_vector_hit_claiming_foreign_document_yields_sql_identity():
+    """Cross-document metadata lie: the hit's chunk_id resolves to a chunk of
+    a DIFFERENT document than the hit's own metadata claims, while the vector
+    record id matches the chunk's deterministic id. SQL identity must win:
+    the hydrated entry carries doc A's document_id/title/index/text, never
+    the claimed doc B identity as one blended context entry."""
+    session, engine, doc_a, doc_b, chunk_a, chunk_b, lying_hit = (
+        _cross_document_session()
+    )
+    try:
+        contexts = await retrieve_contexts(
+            query="anything",
+            embedding_provider=FixedEmbeddingProvider(),
+            vector_store=FixedVectorStore([lying_hit]),
+            session=session, mode="vector", top_k=5)
+
+        assert len(contexts) == 1
+        entry = contexts[0]
+        assert entry["text"] == chunk_a.text
+        assert entry["metadata"]["document_id"] == doc_a.id
+        assert entry["metadata"]["chunk_id"] == chunk_a.id
+        assert entry["metadata"]["title"] == doc_a.title
+        assert entry["metadata"]["index"] == chunk_a.index
+        assert entry["metadata"]["document_id"] != doc_b.id
+    finally:
+        session.close(); engine.dispose()
+
+
+async def test_document_id_filter_uses_sql_identity_not_store_metadata():
+    """The scalar document_id filter is re-applied against SQL during
+    hydration, so filtering for the LIED-about document excludes the hit and
+    filtering for the SQL-true document keeps it — Chroma metadata can never
+    smuggle a foreign-document chunk into a filtered result set."""
+    session, engine, doc_a, doc_b, chunk_a, chunk_b, lying_hit = (
+        _cross_document_session()
+    )
+    try:
+        for filters, expected in (
+            ({"document_id": doc_b.id}, []),   # the lie matches nothing in SQL
+            ({"document_id": doc_a.id}, [chunk_a.id]),  # SQL truth admits it
+        ):
+            contexts = await retrieve_contexts(
+                query="anything",
+                embedding_provider=FixedEmbeddingProvider(),
+                vector_store=FixedVectorStore([lying_hit]),
+                session=session, mode="vector", top_k=5, filters=filters)
+            assert [c["metadata"]["chunk_id"] for c in contexts] == expected
+    finally:
+        session.close(); engine.dispose()

@@ -41,7 +41,7 @@ class FailingGraphExtractor:
 
 
 class FailingAfterFirstChunkExtractor:
-    """Fails on the second chunk to test partial failure behavior (10A.4)."""
+    """Fails on the second chunk to test partial failure behavior."""
 
     def __init__(self):
         self.call_count = 0
@@ -92,25 +92,64 @@ def setup_db():
 
 @pytest.mark.asyncio
 async def test_ingest_text_creates_document():
+    """Real-Chroma write-path lock: ingest_text must persist exactly the
+    deterministic ``chunk:<id>`` vector set, queryable with the SQL chunk
+    text and metadata (chunk_id/document_id). A silent upsert no-op,
+    metadata serialization breakage, or deterministic-ID drift fails here,
+    not just ``chunks > 0``."""
+    import uuid
+
+    import chromadb
+
+    client = chromadb.EphemeralClient()
+    collection_name = "test-ingestion-" + uuid.uuid4().hex[:8]
+    store = ChromaVectorStore(collection_name=collection_name, client=client)
     provider = LocalEmbeddingProvider()
-    store = ChromaVectorStore(collection_name="test-ingestion")
 
     session: Session = TestSessionLocal()
-    result = await ingest_text(
-        title="Test Doc",
-        source="unit",
-        tags=["one"],
-        text="hello world",
-        embedding_provider=provider,
-        vector_store=store,
-        session=session,
-    )
-    assert result["chunks"] > 0
-    docs = repositories.list_documents(session)
-    assert len(docs) == 1
-    session.delete(docs[0])
-    session.commit()
-    session.close()
+    try:
+        result = await ingest_text(
+            title="Test Doc",
+            source="unit",
+            tags=["one"],
+            text="hello world",
+            embedding_provider=provider,
+            vector_store=store,
+            session=session,
+        )
+        assert result["chunks"] == 1
+        docs = repositories.list_documents(session)
+        assert len(docs) == 1
+        doc = docs[0]
+        assert doc.ingestion_status == "ready"
+        chunk = doc.chunks[0]
+        expected_vector_ids = {f"chunk:{chunk.id}"}
+
+        # The store contains EXACTLY the document's deterministic vector IDs.
+        assert set(await store.list_ids()) == expected_vector_ids
+        assert chunk.vector_id in expected_vector_ids
+
+        # Query-back: the stored record round-trips the chunk text and the
+        # SQL-authored metadata (chunk_id, document_id, title).
+        embedding = (await provider.embed_texts(["hello world"]))[0]
+        hits = await store.query(embedding, top_k=5)
+        assert len(hits) == 1
+        assert hits[0].vector_id == chunk.vector_id
+        assert hits[0].text == "hello world"
+        assert hits[0].metadata["chunk_id"] == chunk.id
+        assert hits[0].metadata["document_id"] == doc.id
+        assert hits[0].metadata["title"] == "Test Doc"
+    finally:
+        session.rollback()
+        doc_rows = session.query(models.Document).all()
+        for row in doc_rows:
+            session.delete(row)
+        session.commit()
+        session.close()
+        try:
+            client.delete_collection(collection_name)
+        except Exception:
+            pass
 
 
 @pytest.mark.asyncio
@@ -178,7 +217,7 @@ async def test_graph_extraction_failure_prevents_vector_indexing():
         )
 
     assert store.calls == []
-    # 10A.4: the failed document persists as operator-visible evidence (it is
+    # The failed document persists as operator-visible evidence (it is
     # not query-visible), and its extraction row records the failure.
     doc = session.query(models.Document).filter_by(title="Failed Graph Doc").one()
     assert doc.ingestion_status == "failed"
@@ -212,7 +251,7 @@ async def test_vector_failure_marks_staged_document_failed_and_hidden():
     session.close()
 
 
-# ── 10A.4 lifecycle state machine tests (phase10-test-specifications appendix) ──
+# ── Lifecycle state machine tests ──
 
 
 @pytest.mark.asyncio
@@ -274,7 +313,7 @@ async def test_ingest_text_provider_unavailable_marks_document_failed_and_not_qu
     doc = session.query(models.Document).filter_by(title="Provider Fail").one()
     assert doc.ingestion_status == "failed"
 
-    # Extraction must be recorded as failed (10A.4 contract: provider failure persists audit row)
+    # Extraction must be recorded as failed (provider failure persists audit row)
     extraction = session.query(models.GraphExtraction).filter_by(chunk_id=doc.chunks[0].id).one()
     assert extraction.status == "failed"
 
@@ -420,7 +459,7 @@ async def test_ingest_text_embedding_failure_marks_all_pending_as_failed_embeddi
             session=session,
         )
 
-    # 10A.4 contract (plan L575): every pending run becomes failed/error_code=
+    # Contract: every pending run becomes failed/error_code=
     # embedding_failed and no pending run may remain after a handled failure.
     doc = session.query(models.Document).filter_by(title="Embedding Fail").one()
     assert doc.ingestion_status == "failed"

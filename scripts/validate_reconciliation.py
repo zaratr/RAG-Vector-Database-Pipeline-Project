@@ -1,4 +1,4 @@
-"""Disposable reconciliation validator for Task 10A.4 (plan L613/L625, F10).
+"""Disposable reconciliation validator.
 
 Creates a collision-resistant disposable migrated SQLite database and a REAL
 disposable Chroma collection (never the configured production stores, never an
@@ -33,9 +33,9 @@ verified before success is reported. Any failed proof, unreadable configured
 production store, fingerprint mismatch, or incomplete self-cleaning exits
 non-zero; success output is emitted only when genuinely verified.
 
-Exit codes (mirrors the P8a validate_phase10a.py conventions):
+Exit codes (mirrors the acceptance-validator conventions):
 
-* ``0`` — success; stdout is exactly the plan-pinned converged second-run JSON.
+* ``0`` — success; stdout is exactly the pinned converged second-run JSON.
 * ``1`` — reconciliation counter/proof/cleanup assertion failure
   (machine-readable JSON on stderr).
 * ``2`` — configuration/infrastructure failure, including production-identity
@@ -70,7 +70,7 @@ from app.services.embeddings import HashEmbeddingProvider
 from app.services.reconciliation import reconcile_ingestion
 from app.services.vector_store import ChromaVectorStore
 
-# 10A.4: the drift matrix's ready component is exactly three self-created
+# The drift matrix's ready component is exactly three self-created
 # fixtures, so ready_chunks_upserted=3 is an invariant on EVERY run.
 READY_FIXTURE_COUNT = 3
 
@@ -185,7 +185,7 @@ def _add_document(session, title: str, status: str, vector_id: str):
 
 
 def _add_extraction(session, chunk_id: int, label: str, status: str, error_code: str | None = None):
-    """Seed a lifecycle-CHECK-valid extraction row (10A.3 W4: terminal rows
+    """Seed a lifecycle-CHECK-valid extraction row (terminal rows
     need completed_at; failed rows need error_code). Each row gets a distinct
     input identity so the partial identity-owner unique index is respected."""
     completed_at = (

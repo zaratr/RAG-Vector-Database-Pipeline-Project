@@ -1,6 +1,6 @@
 """Persistence operations for normalized graph extraction provenance.
 
-Task 10A.3 introduces an idempotent extraction lifecycle: every eligible
+The extraction lifecycle is idempotent: every eligible
 chunk/version has exactly one durable extraction identity, and the repository
 exposes a begin/complete/fail/skip API that returns an :class:`ExtractionLease`
 telling the caller whether to call the provider.
@@ -140,7 +140,7 @@ def begin_chunk_extraction(
     """Begin (or resume) extraction for a chunk/version.
 
     Returns an :class:`ExtractionLease`. The caller branches only on
-    ``should_call_provider``. See the state-transition table in the plan.
+    ``should_call_provider``.
 
     When two workers begin the same absent identity concurrently, the partial
     unique index ``uq_graph_extractions_identity_owner`` admits exactly one
@@ -254,9 +254,18 @@ def _diagnose_update_failure(session: Session, extraction_id: int,
     (InvalidExtractionTransition) or a stale-owner (ExtractionLeaseLost).
 
     This diagnostic read occurs AFTER the failed atomic UPDATE, so no
-    read-then-write gap exists.
+    read-then-write gap exists. The row is re-read with a fresh populate
+    instead of ``session.get``: the identity-map instance is the stale
+    caller's own object, which SQLAlchemy's evaluate synchronization may have
+    mutated with the UPDATE's SET values during the 0-row statement (the
+    in-memory object still matched the WHERE criteria), so it can read the
+    terminal status the caller attempted instead of the row's actual state.
     """
-    current = session.get(models.GraphExtraction, extraction_id)
+    current = session.execute(
+        select(models.GraphExtraction)
+        .where(models.GraphExtraction.id == extraction_id)
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
     if current is None:
         raise InvalidExtractionTransition(
             f"extraction {extraction_id} no longer exists"

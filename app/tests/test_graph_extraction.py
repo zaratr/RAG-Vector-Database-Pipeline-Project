@@ -1,4 +1,4 @@
-"""Phase 10A.1/10A.2 — structured extraction contract freeze + provider behavior.
+"""Structured extraction contract freeze + provider behavior.
 
 All tests use ``httpx.MockTransport`` so no live Ollama call is required. The
 contract under test lives in ``app/services/graph_extraction.py``.
@@ -57,7 +57,7 @@ def _extractor(handler, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# 10A.1 — contract freeze tests
+# Contract freeze tests
 # ---------------------------------------------------------------------------
 
 
@@ -290,7 +290,7 @@ async def test_more_than_100_relations_is_rejected():
 
 
 # ---------------------------------------------------------------------------
-# 10A.2 — real Ollama/Gemma provider behavior (mocked transport)
+# Real Ollama/Gemma provider behavior (mocked transport)
 # ---------------------------------------------------------------------------
 
 
@@ -535,7 +535,7 @@ async def test_provider_exponential_backoff_uses_powers_of_two():
 
 
 # ---------------------------------------------------------------------------
-# 10A.2 — live acceptance script CLI contract (appendix exit codes 0/1/2)
+# Live acceptance script CLI contract (exit codes 0/1/2)
 # ---------------------------------------------------------------------------
 
 _SCRIPT_PATH = (
@@ -637,7 +637,7 @@ def _run_validation_script(monkeypatch, tmp_path, mode="grounded", provider="oll
 
 
 def test_validate_graph_extraction_exits_0_with_grounded_relation(monkeypatch, tmp_path):
-    """Script run with a mocked grounded relation exits 0 with plan-shaped JSON."""
+    """Script run with a mocked grounded relation exits 0 with the pinned JSON shape."""
     result = _run_validation_script(monkeypatch, tmp_path, "grounded")
 
     assert result.returncode == 0, result.stderr

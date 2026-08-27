@@ -12,7 +12,10 @@ class Settings(BaseSettings):
     app_name: str = Field(default="RAG Pipeline API")
     debug: bool = Field(default=False)  # never ship tracebacks in 500 bodies
     database_url: str = Field(default="sqlite:///./rag.db")
-    embedding_provider: Literal["local", "fastembed", "openai"] = Field(default="fastembed")
+    # "local" (deterministic hash embeddings, no model downloads) matches the
+    # Dockerfile ENV default and keeps a bare environment runnable; production
+    # deployments opt into "fastembed" via environment or .env.
+    embedding_provider: Literal["local", "fastembed", "openai"] = Field(default="local")
     embedding_model: str = Field(default="jinaai/jina-clip-v1")
     vector_store: Literal["chroma"] = Field(default="chroma")
     llm_provider: Literal["dummy", "ollama", "openai"] = Field(default="ollama")
@@ -21,7 +24,7 @@ class Settings(BaseSettings):
     graph_extraction_enabled: bool = Field(default=True)
     graph_extraction_model: Optional[str] = Field(default=None)
     graph_max_hops: int = Field(default=2, ge=1, le=3)
-    # 10A.3 extraction lease duration (seconds). Default 600 (10 min); 60–3600.
+    # Extraction lease duration (seconds). Default 600 (10 min); 60–3600.
     extraction_lease_seconds: int = Field(default=600, ge=60, le=3600)
 
     # 10B.2 provenance/security settings.

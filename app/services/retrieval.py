@@ -62,7 +62,11 @@ def _context_key(context: dict) -> tuple:
     metadata = context.get("metadata") or {}
     chunk_id = metadata.get("chunk_id")
     if chunk_id is not None:
-        return ("chunk", str(chunk_id))
+        # Numeric SQL chunk identity: fused contexts key and tie-break by the
+        # integer chunk id (2 before 10). The stringified form would order
+        # multi-digit ids lexicographically and invert the deterministic
+        # (-hybrid_score, chunk_id) ordering.
+        return ("chunk", int(chunk_id))
     return ("text", context.get("text", ""))
 
 
@@ -300,7 +304,7 @@ async def retrieve_contexts_detailed(
                 metadata["graph_score"] = graph_score
 
     for key, context in fused.items():
-        # Exact RRF-60 sum, never rounded: the plan pins hybrid_score as the
+        # Exact RRF-60 sum, never rounded: hybrid_score is the
         # sum of 1/(60+rank) over the candidate's sides, and rounding would
         # perturb that arithmetic (and could fabricate ties).
         context["metadata"]["hybrid_score"] = rrf_scores[key]

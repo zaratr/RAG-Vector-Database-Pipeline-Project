@@ -1,11 +1,9 @@
 """Export rows that block a downgrade because its predecessor cannot represent them.
 
-Implements the 10A.3 half of the plan's unrepresentable-data recovery contract
-(B-14): when the ``b7f3d5a9c2e1`` downgrade refuses with
+Implements the unrepresentable-data recovery contract: when the ``b7f3d5a9c2e1`` downgrade refuses with
 ``downgrade_skipped_rows_present``, this script exports the blocking
 ``skipped`` rows to a deterministic JSON file so the operator can review and
-explicitly delete them; the downgrade then proceeds. Task 10C.4 later extends
-the revision registry with ``d9b5f7c1e4a3`` for its safety-blocked rows.
+explicitly delete them; the downgrade then proceeds.
 
 The script is strictly read-only: export preserves every database row, never
 deletes anything, asserts the exported row count against the database, and
