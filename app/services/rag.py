@@ -220,7 +220,10 @@ async def answer_query(
         "audit_id": audit_id,
     }
 
-    if not allowed:
+    if not allowed and final_decisions:
+        # Security fail-close lane: candidates existed and every one was
+        # rejected — the deterministic no-safe-context answer is returned and
+        # the LLM is never invoked without safe evidence.
         try:
             audit.complete(audit_id)
             session.commit()
@@ -234,6 +237,10 @@ async def answer_query(
             "query_id": audit_id,
             "security_summary": security_summary,
         }
+    # A pure retrieval miss (no candidates at all) falls through to
+    # generation: the grounded no-evidence contract invokes the answer LLM
+    # with an empty evidence list and returns its answer (never placeholder
+    # rows, never a crash), with context == [].
 
     # Generation starts only after all final candidate decisions are durable.
     evidence = [

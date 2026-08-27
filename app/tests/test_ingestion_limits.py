@@ -197,6 +197,7 @@ def test_file_over_limit_returns_ingestion_too_large_file(app_client):
     db_path = get_settings().database_url.replace("sqlite:///", "")
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+    conn.close()
 
 
 def test_extracted_bytes_over_limit_returns_ingestion_too_large_extracted(app_client):
@@ -265,6 +266,7 @@ def test_image_ingestion_consumes_rate_slot_and_throttles(app_client, monkeypatc
     with sqlite3.connect(db_path) as conn:
         count = conn.execute(
             "SELECT COUNT(*) FROM ingestion_rate_buckets").fetchone()[0]
+    conn.close()
     assert count == 1
     second = app_client.post(
         "/documents",
@@ -389,6 +391,7 @@ def test_client_disconnect_during_streaming_produces_no_partial_rows(app_client)
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] == 0
+    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +457,7 @@ def test_rate_limit_rejects_persist_increment_for_visibility(app_client, monkeyp
         cnt = conn.execute(
             "SELECT request_count FROM ingestion_rate_buckets"
         ).fetchone()[0]
+    conn.close()
     assert cnt == RATE_LIMIT + 1
 
 
@@ -529,6 +533,7 @@ def test_rate_limit_operator_identity_hashed_from_token(app_client, monkeypatch)
         ident = conn.execute(
             "SELECT identity_sha256 FROM ingestion_rate_buckets"
         ).fetchone()[0]
+    conn.close()
     assert ident == expected
 
 
@@ -543,6 +548,7 @@ def test_rate_limit_client_identity_hashed_from_remote_host(app_client, monkeypa
         ident = conn.execute(
             "SELECT identity_sha256 FROM ingestion_rate_buckets"
         ).fetchone()[0]
+    conn.close()
     assert ident == expected
 
 

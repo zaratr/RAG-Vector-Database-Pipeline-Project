@@ -49,6 +49,7 @@ _REAL_GET_LLM_CLIENT = routes_query.get_llm_client
 
 
 _rate_db_path = None
+_original_policy_cache = None
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -69,6 +70,31 @@ def setup_db(tmp_path_factory):
     original_db_url = os.environ.get("RAG_DATABASE_URL")
     os.environ["RAG_DATABASE_URL"] = f"sqlite:///{rate_db}"
     get_settings.cache_clear()
+    # This module pins API wiring/grounding/auth/rate semantics with
+    # deterministic hash embeddings whose l2 distances exceed 10B's
+    # production-calibrated max_distance; neutralize the retrieval-security
+    # distance/cap controls via the shipped _POLICY_CACHE hook (restored
+    # below). Poisoning controls themselves are pinned by test_poisoning.py
+    # and test_security_api.py under the real policy.
+    from app.services import retrieval as retrieval_module
+    from app.services.retrieval_security import RetrievalSecurityPolicy
+
+    global _original_policy_cache
+    _original_policy_cache = retrieval_module._POLICY_CACHE
+    retrieval_module._POLICY_CACHE = RetrievalSecurityPolicy(
+        version="retrieval-security-v1",
+        metric="l2",
+        max_distance=1e9,
+        per_source_cap=1000,
+        per_document_cap=1000,
+        max_candidates=1000,
+        near_duplicate_jaccard=1.0,
+        calibration_fixture_sha256="deterministic-lane",
+        calibration_clean_recall=1.0,
+        calibration_poison_share=0.0,
+        calibration_tool_version="calibrate-v1",
+        calibration_embedding_model="jinaai/jina-clip-v1",
+    )
 
     client = chromadb.EphemeralClient()
     vector_store = ChromaVectorStore(
@@ -92,6 +118,8 @@ def setup_db(tmp_path_factory):
     routes_query.get_vector_store = original_query_store
     routes_query.get_llm_client = original_query_llm
     client.delete_collection("test-rag-api")
+    from app.services import retrieval as retrieval_module
+    retrieval_module._POLICY_CACHE = _original_policy_cache
     if original_db_url is None:
         os.environ.pop("RAG_DATABASE_URL", None)
     else:

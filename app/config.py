@@ -27,15 +27,18 @@ class Settings(BaseSettings):
     # Extraction lease duration (seconds). Default 600 (10 min); 60–3600.
     extraction_lease_seconds: int = Field(default=600, ge=60, le=3600)
 
-    # 10B.2 provenance/security settings.
-    source_trust_policy_path: str = Field(default="/app/config/source-trust-policy.json")
+    # 10B.2 provenance/security settings. Policy paths are repo-relative so a
+    # clean checkout works bare (no .env required); in the container WORKDIR
+    # is /app with config/ copied alongside, so the same relative default
+    # resolves to the documented /app/config/*.json location.
+    source_trust_policy_path: str = Field(default="config/source-trust-policy.json")
     operator_api_enabled: bool = Field(default=False)
     operator_token: SecretStr = Field(default=SecretStr(""))
     security_audit_retention_days: int = Field(default=30)
 
     # 10B.3 ingestion limits + retrieval security.
-    retrieval_security_policy_path: str = Field(default="/app/config/retrieval-security-policy.json")
-    context_security_policy_path: str = Field(default="/app/config/context-security-policy.json")
+    retrieval_security_policy_path: str = Field(default="config/retrieval-security-policy.json")
+    context_security_policy_path: str = Field(default="config/context-security-policy.json")
     ingestion_request_max_bytes: int = Field(default=11534336, ge=2048, le=53477376)
     ingestion_file_max_bytes: int = Field(default=10485760, ge=1024, le=52428800)
     ingestion_extracted_max_bytes: int = Field(default=5242880, ge=1024, le=26214400)

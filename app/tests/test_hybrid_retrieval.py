@@ -15,6 +15,55 @@ from app.services.retrieval import retrieve_contexts
 pytestmark = pytest.mark.asyncio
 
 
+
+def _install_permissive_retrieval_policy(monkeypatch):
+    """Neutralize 10B's retrieval-security distance/cap controls in-process.
+
+    This module pins retrieval/fusion semantics (topology, RRF-60 fusion,
+    numeric tie-breaks, grounding) with deterministic synthetic embeddings
+    whose l2 distances exceed the production-calibrated max_distance and
+    whose single-document candidate sets exceed the calibrated per-document
+    cap. Poisoning/cap controls themselves are pinned by test_poisoning.py
+    and test_security_api.py under the real policy; here the controls are
+    neutralized through the shipped ``_POLICY_CACHE`` hook (restored
+    automatically by monkeypatch).
+    """
+    from app.services import retrieval as retrieval_module
+    from app.services.retrieval_security import RetrievalSecurityPolicy
+
+    monkeypatch.setattr(
+        retrieval_module,
+        "_POLICY_CACHE",
+        RetrievalSecurityPolicy(
+            version="retrieval-security-v1",
+            metric="l2",
+            max_distance=1e9,
+            per_source_cap=1000,
+            per_document_cap=1000,
+            max_candidates=1000,
+            near_duplicate_jaccard=1.0,
+            calibration_fixture_sha256="deterministic-lane",
+            calibration_clean_recall=1.0,
+            calibration_poison_share=0.0,
+            calibration_tool_version="calibrate-v1",
+            calibration_embedding_model="jinaai/jina-clip-v1",
+        ),
+    )
+
+@pytest.fixture(autouse=True)
+def _permissive_retrieval_security(monkeypatch):
+    """Neutralize 10B's calibrated distance/cap controls for this module.
+
+    The module pins hybrid fusion semantics (deterministic ordering, RRF-60
+    fusion, numeric tie-breaks, grounded no-evidence handling) with synthetic
+    fixed scores; the production-calibrated max_distance / per-document caps
+    would drop synthetic candidates. Poisoning controls are pinned by
+    test_poisoning.py / test_security_api.py under the real policy.
+    """
+    _install_permissive_retrieval_policy(monkeypatch)
+    yield
+
+
 class FixedEmbeddingProvider:
     def __init__(self):
         self.calls = []
@@ -829,7 +878,7 @@ async def test_answer_query_with_no_evidence_invokes_llm_with_empty_context():
         def __init__(self):
             self.calls = []
 
-        async def generate_answer(self, query, context):
+        async def generate_answer(self, query, context, system_prompt=None):
             self.calls.append((query, list(context)))
             return "No evidence available for this question."
 

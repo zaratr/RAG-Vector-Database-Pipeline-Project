@@ -55,12 +55,14 @@ _COLLECTION = "test-query-llm-failures-" + uuid.uuid4().hex[:8]
 
 
 class ConnectionRefusedLLM:
-    async def generate_answer(self, query, context):
+    # system_prompt: the merged /query lane passes 10B's immutable
+    # context-security prompt through the LLMClient protocol.
+    async def generate_answer(self, query, context, system_prompt=None):
         raise httpx.ConnectError("connection refused")
 
 
 class TimedOutLLM:
-    async def generate_answer(self, query, context):
+    async def generate_answer(self, query, context, system_prompt=None):
         raise httpx.ReadTimeout("timed out")
 
 
@@ -81,11 +83,78 @@ def _llm_malformed_envelope_transport() -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
+def _install_permissive_retrieval_policy(monkeypatch):
+    """Neutralize 10B's retrieval-security distance/cap controls in-process.
+
+    This module pins the answer-provider failure contract (503 transport /
+    502 malformed envelope) with deterministic hash embeddings whose l2
+    distances exceed the production-calibrated max_distance; without the
+    neutralization, retrieval would reject every candidate and the provider
+    failure lanes would never be reached. Poisoning controls are pinned by
+    test_poisoning.py / test_security_api.py under the real policy.
+    """
+    from app.services import retrieval as retrieval_module
+    from app.services.retrieval_security import RetrievalSecurityPolicy
+
+    monkeypatch.setattr(
+        retrieval_module,
+        "_POLICY_CACHE",
+        RetrievalSecurityPolicy(
+            version="retrieval-security-v1",
+            metric="l2",
+            max_distance=1e9,
+            per_source_cap=1000,
+            per_document_cap=1000,
+            max_candidates=1000,
+            near_duplicate_jaccard=1.0,
+            calibration_fixture_sha256="deterministic-lane",
+            calibration_clean_recall=1.0,
+            calibration_poison_share=0.0,
+            calibration_tool_version="calibrate-v1",
+            calibration_embedding_model="jinaai/jina-clip-v1",
+        ),
+    )
+
 @pytest.fixture(scope="module", autouse=True)
-def setup_db():
+def setup_db(tmp_path_factory):
     """Bind the app to this module's engine/store/dummy-LLM for the module's
     duration, restoring whatever the previously-run module left in place
-    (same order-safe pattern as test_graph_api.graph_api_environment)."""
+    (same order-safe pattern as test_graph_api.graph_api_environment).
+
+    The ingestion rate limiter builds its own engine from
+    settings.database_url (10B D-8/D-36), so env + settings cache must point
+    at a disposable, fully-migrated database for /documents to succeed — the
+    same isolation pattern as test_rag_api.setup_db. 10B's retrieval-security
+    controls are neutralized for the module via the _POLICY_CACHE hook (the
+    module pins the provider-failure contract, not poisoning controls)."""
+    import os
+
+    from app.config import get_settings
+    from app.services import retrieval as retrieval_module
+    from app.services.retrieval_security import RetrievalSecurityPolicy
+
+    rate_db = tmp_path_factory.mktemp("qpf-rate") / "rate.db"
+    original_db_url = os.environ.get("RAG_DATABASE_URL")
+    os.environ["RAG_DATABASE_URL"] = f"sqlite:///{rate_db}"
+    get_settings.cache_clear()
+    rate_engine = create_engine(f"sqlite:///{rate_db}")
+    Base.metadata.create_all(bind=rate_engine)
+    rate_engine.dispose()
+    original_policy_cache = retrieval_module._POLICY_CACHE
+    retrieval_module._POLICY_CACHE = RetrievalSecurityPolicy(
+        version="retrieval-security-v1",
+        metric="l2",
+        max_distance=1e9,
+        per_source_cap=1000,
+        per_document_cap=1000,
+        max_candidates=1000,
+        near_duplicate_jaccard=1.0,
+        calibration_fixture_sha256="deterministic-lane",
+        calibration_clean_recall=1.0,
+        calibration_poison_share=0.0,
+        calibration_tool_version="calibrate-v1",
+        calibration_embedding_model="jinaai/jina-clip-v1",
+    )
     ephemeral = chromadb.EphemeralClient()
     vector_store = ChromaVectorStore(collection_name=_COLLECTION, client=ephemeral)
     original_documents_store = routes_documents.get_vector_store
@@ -108,6 +177,12 @@ def setup_db():
     else:
         app.dependency_overrides.pop(get_db, None)
     test_engine.dispose()
+    retrieval_module._POLICY_CACHE = original_policy_cache
+    if original_db_url is None:
+        os.environ.pop("RAG_DATABASE_URL", None)
+    else:
+        os.environ["RAG_DATABASE_URL"] = original_db_url
+    get_settings.cache_clear()
 
 
 def _ingest_one_document():
