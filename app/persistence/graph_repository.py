@@ -254,9 +254,18 @@ def _diagnose_update_failure(session: Session, extraction_id: int,
     (InvalidExtractionTransition) or a stale-owner (ExtractionLeaseLost).
 
     This diagnostic read occurs AFTER the failed atomic UPDATE, so no
-    read-then-write gap exists.
+    read-then-write gap exists. The row is re-read with a fresh populate
+    instead of ``session.get``: the identity-map instance is the stale
+    caller's own object, which SQLAlchemy's evaluate synchronization may have
+    mutated with the UPDATE's SET values during the 0-row statement (the
+    in-memory object still matched the WHERE criteria), so it can read the
+    terminal status the caller attempted instead of the row's actual state.
     """
-    current = session.get(models.GraphExtraction, extraction_id)
+    current = session.execute(
+        select(models.GraphExtraction)
+        .where(models.GraphExtraction.id == extraction_id)
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
     if current is None:
         raise InvalidExtractionTransition(
             f"extraction {extraction_id} no longer exists"
