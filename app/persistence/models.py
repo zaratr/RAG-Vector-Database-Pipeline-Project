@@ -362,6 +362,14 @@ class RetrievalCandidateDecision(Base):
             "provenance_score >= 0 AND provenance_score <= 1",
             name="ck_candidate_decisions_provenance_score",
         ),
+        # The complete 10B.3 decision enum (enforced physically by revision
+        # c9f5b3e7a1d8 on top of c8a4e6b0d3f2).
+        CheckConstraint(
+            "decision IN ('selected', 'rejected_distance', 'rejected_blocked_source', "
+            "'rejected_source_cap', 'rejected_document_cap', 'rejected_duplicate', "
+            "'rejected_injection')",
+            name="ck_candidate_decisions_decision",
+        ),
         Index("ix_candidate_decisions_audit_decision", "audit_id", "decision"),
         Index("ix_candidate_decisions_live_doc", "document_id"),
         Index("ix_candidate_decisions_live_chunk", "chunk_id"),

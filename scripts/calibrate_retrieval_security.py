@@ -46,7 +46,7 @@ from app.services.retrieval_security import (  # noqa: E402
 # Backward-compatible alias for earlier callers.
 validate_corpus = validate_calibration_corpus
 
-EXPECTED_MIGRATION_HEAD = "c8a4e6b0d3f2"
+EXPECTED_MIGRATION_HEAD = "c9f5b3e7a1d8"
 PRODUCTION_COLLECTION_NAME = "rag-collection"
 DISPOSABLE_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 DISPOSABLE_DB_URL_RE = re.compile(r"^sqlite:////tmp/calibration-(?P<run_id>[0-9a-f]{32})\.db$")

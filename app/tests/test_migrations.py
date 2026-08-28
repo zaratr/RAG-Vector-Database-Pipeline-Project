@@ -26,8 +26,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
 BASELINE_REVISION = "dee48bc24a7f"
 GRAPH_REVISION = "4c9a8d7e6f5b"
-# Merged chain head: the 10B security/provenance revision on top of b7.
-REVISION = "c8a4e6b0d3f2"
+# Merged chain head: the decision-CHECK follow-up on top of the 10B
+# security/provenance revision.
+REVISION = "c9f5b3e7a1d8"
+SECURITY_HEAD = "c8a4e6b0d3f2"
 PREDECESSOR_HEAD = "a6e2c4f8b1d9"
 NEW_HEAD = "b7f3d5a9c2e1"
 HEAD_TABLES = {

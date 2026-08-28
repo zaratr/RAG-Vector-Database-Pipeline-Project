@@ -374,7 +374,9 @@ a6e2c4f8b1d9  database constraint for document lifecycle states
       ↓
 b7f3d5a9c2e1  hardened graph extraction lifecycle: idempotent identity owner, attempt counters, pending lease
       ↓
-c8a4e6b0d3f2  security provenance and audits: document trust fields, retrieval audits/decisions, ingestion rate buckets (head)
+c8a4e6b0d3f2  security provenance and audits: document trust fields, retrieval audits/decisions, ingestion rate buckets
+      ↓
+c9f5b3e7a1d8  candidate decision CHECK: retrieval_candidate_decisions.decision restricted to the 10B.3 decision enum (head)
 ```
 
 Application import and API startup do not run migrations. The one-shot `migrate` Compose service owns schema adoption and upgrades.
