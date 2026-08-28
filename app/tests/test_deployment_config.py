@@ -35,6 +35,11 @@ API_ENVIRONMENT_KEYS = {
     "RAG_INGESTION_EXTRACTED_MAX_BYTES",
     "RAG_INGEST_RATE_LIMIT_REQUESTS",
     "RAG_INGEST_RATE_LIMIT_WINDOW_SECONDS",
+    # 10C.1 extends the documented environment with the content-safety
+    # controls (merged from content-safety).
+    "RAG_CONTENT_SAFETY_ENABLED",
+    "RAG_CONTENT_SAFETY_POLICY_PATH",
+    "RAG_SAFETY_LLM_MODE",
 }
 
 

@@ -252,7 +252,7 @@ def test_fingerprint_reports_heads_counts_and_pks_without_content(tmp_path):
                    "SENTRY-CHUNK-TEXT-never-emit"):
         assert marker not in raw
     payload = json.loads(raw)
-    assert payload["alembic_head"] == "c9f5b3e7a1d8"
+    assert payload["alembic_head"] == "d9b5f7c1e4a3"
     assert payload["chroma_ids"] == []
     assert payload["tables"]["documents"]["row_count"] == 1
     assert payload["tables"]["documents"]["primary_keys"] == [[1]]

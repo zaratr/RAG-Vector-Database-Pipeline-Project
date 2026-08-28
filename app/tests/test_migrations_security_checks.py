@@ -26,6 +26,8 @@ ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
 SECURITY_REVISION = "c8a4e6b0d3f2"
 SECURITY_DOWN_REVISION = "b7f3d5a9c2e1"
 DECISION_CHECK_HEAD = "c9f5b3e7a1d8"
+# Merged chain head (content-safety + rag-poisoning): d9 on top of c9.
+CHAIN_HEAD = "d9b5f7c1e4a3"
 
 
 def _db_url(path: Path) -> str:
@@ -272,7 +274,7 @@ def test_c8_downgrade_to_b7_refused_when_skipped_rows_absent_preserves_data(tmp_
     # Re-upgrade is lossless.
     upgrade_database(db_url)
     engine = create_engine(db_url)
-    assert _revision(engine) == DECISION_CHECK_HEAD
+    assert _revision(engine) == CHAIN_HEAD
     with engine.connect() as conn:
         assert conn.execute(
             text("SELECT title FROM documents WHERE id=1")).scalar() == "Pre"
@@ -307,14 +309,16 @@ def test_c9_decision_check_rejects_invalid_value(tmp_path):
     engine = create_engine(db_url)
     with engine.begin() as conn:
         _insert_audit(conn, "a", candidates=1, selected=1)
-    for bad in ("accepted", "rejected", "rejected_safety", "maybe"):
+    for bad in ("accepted", "rejected", "maybe"):
         with pytest.raises(IntegrityError):
             with engine.begin() as conn:
                 _insert_decision(conn, "a", doc=1, chunk=1, decision=bad, sha="bad")
-    # Every documented 10B.3 decision value is accepted at the boundary.
+    # Every documented 10B.3 decision value is accepted at the boundary, and
+    # the merged d9 head additionally accepts 10C.4's rejected_safety (its
+    # legality is pinned by test_migrations.py's d9 CHECK tests).
     legal = ("selected", "rejected_distance", "rejected_blocked_source",
              "rejected_source_cap", "rejected_document_cap",
-             "rejected_duplicate", "rejected_injection")
+             "rejected_duplicate", "rejected_injection", "rejected_safety")
     with engine.begin() as conn:
         for i, decision in enumerate(legal, start=1):
             _insert_decision(conn, "a", doc=i, chunk=i, decision=decision,
@@ -338,7 +342,7 @@ def test_c9_upgrade_from_c8_head_preserves_decision_rows(tmp_path):
 
     upgrade_database(db_url)
     engine = create_engine(db_url)
-    assert _revision(engine) == DECISION_CHECK_HEAD
+    assert _revision(engine) == CHAIN_HEAD
     with engine.connect() as conn:
         rows = conn.execute(text(
             "SELECT chunk_id_snapshot, decision, provenance_score, "

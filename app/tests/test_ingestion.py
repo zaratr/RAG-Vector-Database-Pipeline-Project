@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -15,6 +17,8 @@ from app.services.graph_extraction import (
     GraphProviderUnavailable,
 )
 from app.services.ingestion import ingest_image, ingest_text
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 from app.services.vector_store import ChromaVectorStore
 
 test_engine = create_engine(
@@ -255,7 +259,7 @@ async def test_vector_failure_marks_staged_document_failed_and_hidden():
 # 10C.4 extensions: safety-aware ingestion lifecycle
 # ---------------------------------------------------------------------------
 
-def test_safety_enabled_block_persists_failed_doc_and_safety_review(monkeypatch):
+def test_safety_enabled_block_persists_failed_doc_and_safety_review(monkeypatch, tmp_path):
     """Ingestion-scope block: HTTP 422, failed document, succeeded safety
     review with a linked finding, safety_blocked skipped identity."""
     from fastapi.testclient import TestClient
@@ -273,6 +277,13 @@ def test_safety_enabled_block_persists_failed_doc_and_safety_review(monkeypatch)
 
     monkeypatch.setenv("RAG_CONTENT_SAFETY_ENABLED", "true")
     monkeypatch.setenv("RAG_SAFETY_LLM_MODE", "disabled")
+    monkeypatch.setenv(
+        "RAG_CONTENT_SAFETY_POLICY_PATH",
+        str(PROJECT_ROOT / "config" / "content-safety-policy.json"))
+    monkeypatch.setenv("RAG_DATABASE_URL", f"sqlite:///{tmp_path / 'rate.db'}")
+    rl_engine = create_engine(f"sqlite:///{tmp_path / 'rate.db'}")
+    Base.metadata.create_all(bind=rl_engine)
+    rl_engine.dispose()
     get_settings.cache_clear()
 
     engine = create_engine(
@@ -328,7 +339,7 @@ def test_safety_enabled_block_persists_failed_doc_and_safety_review(monkeypatch)
         engine.dispose()
 
 
-def test_safety_disabled_skips_ingestion_review(monkeypatch):
+def test_safety_disabled_skips_ingestion_review(monkeypatch, tmp_path):
     """RAG_CONTENT_SAFETY_ENABLED=false: no safety rows, original 10A.4 flow."""
     from fastapi.testclient import TestClient
     from sqlalchemy import create_engine
@@ -343,10 +354,13 @@ def test_safety_disabled_skips_ingestion_review(monkeypatch):
         get_graph_extractor,
     )
 
-    # Pin the disabled flag explicitly: the recorded phase10c gate runs the
-    # suite under ambient safety-enabled env, and this test must still
-    # exercise the disabled path hermetically.
+    # Pin the disabled flag explicitly so the disabled path is exercised
+    # hermetically regardless of ambient settings.
     monkeypatch.setenv("RAG_CONTENT_SAFETY_ENABLED", "false")
+    monkeypatch.setenv("RAG_DATABASE_URL", f"sqlite:///{tmp_path / 'rate.db'}")
+    rl_engine = create_engine(f"sqlite:///{tmp_path / 'rate.db'}")
+    Base.metadata.create_all(bind=rl_engine)
+    rl_engine.dispose()
     get_settings.cache_clear()
     engine = create_engine(
         "sqlite:///:memory:",
