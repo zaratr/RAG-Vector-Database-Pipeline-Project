@@ -1,6 +1,7 @@
 # Version-control and local agent metadata
 .git
 .git/**
+.hermes
 
 # Secrets and local configuration
 .env
