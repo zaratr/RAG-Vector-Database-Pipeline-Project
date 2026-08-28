@@ -285,7 +285,10 @@ explicit reason:
   `test_validate_phase10c.py` live-API lane
   (`RAG_PHASE10C_LIVE_BASE_URL` against a running safety-enabled API), and
   `test_named_volume_durability.py::test_validate_named_volume_durability_argv_exact`
-  (`RAG_LIVE_DURABILITY` against a live Docker Compose deployment).
+  (`RAG_LIVE_DURABILITY` against a live Docker Compose deployment); the
+  in-process durability lanes fake the heartbeat health stage
+  (`_wait_heartbeat`), so real HTTP heartbeats occur only in that
+  opt-in subprocess lane.
 - POSIX-only lanes: the retrieval-security calibration runs, the phase-10D
   attack-harness disposable-store lanes, and one symlink-refusal lane pin
   their disposable/production database URLs to POSIX absolute

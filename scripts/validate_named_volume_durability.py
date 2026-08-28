@@ -238,6 +238,12 @@ def _heartbeat(url: str) -> bool:
 
 def _wait_heartbeat(url: str, attempts: int = 30, interval: float = 2.0
                     ) -> bool:
+    """Probe ``url`` until it answers 2xx or attempts run out.
+
+    This function is the single injectable health seam: ``run_durability_check``
+    resolves it as this module's attribute so the hermetic in-process tests can
+    substitute a fake; the live opt-in lane (subprocess) uses the real probes.
+    """
     import time
 
     for attempt in range(attempts):
