@@ -186,6 +186,13 @@ def test_output_is_canonical_non_sensitive_json(monkeypatch, tmp_path):
         assert forbidden not in blob.lower()
 
 
+@pytest.mark.skipif(
+    not os.environ.get("RAG_LIVE_DURABILITY"),
+    reason="opt-in live lane: runs scripts/validate_named_volume_durability.py "
+    "as a real subprocess against a live Docker Compose deployment "
+    "(docker compose up --force-recreate + exec into the running api); set "
+    "RAG_LIVE_DURABILITY=1 with the deployment up to execute",
+)
 def test_validate_named_volume_durability_argv_exact(monkeypatch, tmp_path):
     argv = [sys.executable, "scripts/validate_named_volume_durability.py",
             "--output", str(tmp_path / "durability.json")]

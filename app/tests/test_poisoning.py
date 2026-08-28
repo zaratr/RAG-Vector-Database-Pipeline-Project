@@ -960,7 +960,22 @@ def test_production_graph_contexts_pre_rank_by_min_hop_on_equal_graph_score():
 
     from app.core.db import Base
     from app.persistence import models  # noqa: F401 — register models
+    from app.services import retrieval as retrieval_module
     from app.services.retrieval import _apply_security_filter
+    from app.services.retrieval_security import (
+        load_retrieval_security_policy_strict,
+    )
+
+    # Hermetic lane shim (merged 10D R2): _apply_security_filter loads the
+    # policy lazily; under the bare ``local`` hash regime the R2
+    # regime-identity precondition would refuse the committed
+    # fastembed-calibrated policy at that load. Pre-install it through the
+    # shipped ``_POLICY_CACHE`` hook (the documented full bypass) so the
+    # production caps keep their exact pre-merge bare behavior.
+    _prior_policy_cache = retrieval_module._POLICY_CACHE
+    retrieval_module._POLICY_CACHE = load_retrieval_security_policy_strict(
+        PROJECT_ROOT / "config" / "retrieval-security-policy.json"
+    )
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -982,6 +997,7 @@ def test_production_graph_contexts_pre_rank_by_min_hop_on_equal_graph_score():
             session, contexts, mode="graph"
         )
     finally:
+        retrieval_module._POLICY_CACHE = _prior_policy_cache
         session.close()
         engine.dispose()
     assert [c["metadata"]["chunk_id"] for c in result] == [2, 1]

@@ -276,9 +276,21 @@ local `.env` selects the production recipe instead, override it for the run:
 RAG_EMBEDDING_PROVIDER=local RAG_CHROMA_HOST= python -m pytest -q
 ```
 
-One test is skipped by default: `test_rag_api.py::test_query_answer_lane_with_live_llm_optin`
-is an opt-in lane that exercises the real LLM only when the `RAG_LIVE_LLM`
-environment variable is set and the configured `RAG_LLM_BASE_URL` answers.
+A small set of environment-conditional lanes are skipped, each with an
+explicit reason:
+
+- Opt-in live lanes, executed only when their variable is set:
+  `test_rag_api.py::test_query_answer_lane_with_live_llm_optin`
+  (`RAG_LIVE_LLM` plus a reachable `RAG_LLM_BASE_URL`), the
+  `test_validate_phase10c.py` live-API lane
+  (`RAG_PHASE10C_LIVE_BASE_URL` against a running safety-enabled API), and
+  `test_named_volume_durability.py::test_validate_named_volume_durability_argv_exact`
+  (`RAG_LIVE_DURABILITY` against a live Docker Compose deployment).
+- POSIX-only lanes: the retrieval-security calibration runs, the phase-10D
+  attack-harness disposable-store lanes, and one symlink-refusal lane pin
+  their disposable/production database URLs to POSIX absolute
+  `sqlite:////` paths as a destructive-tool path guard; they are skipped on
+  Windows.
 
 
 ### 10. Stop or reset

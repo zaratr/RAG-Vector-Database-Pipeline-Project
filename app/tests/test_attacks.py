@@ -19,6 +19,18 @@ import pytest
 CORPUS = "app/tests/fixtures/attack_payloads.json"
 
 
+_POSIX_ONLY_HARNESS = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="attack harness pins disposable/production DB URLs to POSIX "
+    "absolute sqlite://// paths as an operational-safety guard "
+    "(destructive disposable-store path restriction, mirroring the "
+    "calibration CLI guard) and its symlink-refusal lane needs symlink "
+    "privilege; Windows drive-letter paths cannot satisfy the guard, so "
+    "these lanes execute on POSIX filesystems only",
+)
+
+
+
 def _uuid32() -> str:
     return uuid.uuid4().hex
 
@@ -96,6 +108,7 @@ def test_refuses_production_collection_name_equality(monkeypatch):
         _run_harness(monkeypatch)
 
 
+@_POSIX_ONLY_HARNESS
 def test_refuses_symlink_to_production(tmp_path, monkeypatch):
     import os
 
@@ -137,6 +150,7 @@ def test_disabled_and_enabled_uuids_distinct(monkeypatch):
         _run_harness(monkeypatch)
 
 
+@_POSIX_ONLY_HARNESS
 def test_migration_runs_per_mode_via_subprocess_wrapper(monkeypatch):
     # Assert subprocess.run([sys.executable, "-m", "app.core.migrations"], ...)
     # is called exactly twice with each mode URL, shell=False, check=True.
@@ -195,11 +209,13 @@ def test_no_create_all_or_in_memory_fallback():
             )
 
 
+@_POSIX_ONLY_HARNESS
 def test_fixture_input_manifest_byte_equal_across_modes(monkeypatch):
     manifests = _capture_manifests(monkeypatch)
     assert manifests["disabled"] == manifests["enabled"]
 
 
+@_POSIX_ONLY_HARNESS
 def test_every_accepted_fixture_document_produces_exactly_one_chunk(monkeypatch):
     # Multi-chunk fixture -> corpus-invalid exit 2 before measurement.
     from app.services import ingestion
@@ -218,6 +234,7 @@ def test_every_accepted_fixture_document_produces_exactly_one_chunk(monkeypatch)
     assert exc_info.value.code == 2
 
 
+@_POSIX_ONLY_HARNESS
 def test_bijection_document_fixture_id_to_sql_id(monkeypatch):
     # Every accepted fixture document maps to exactly one sql_document_id and
     # chunk_fixture_id "<doc_fix_id>:0" maps to one sql_chunk_id and vector_id.
@@ -253,6 +270,7 @@ def test_bijection_document_fixture_id_to_sql_id(monkeypatch):
         assert len(set(vector_ids)) == len(ready)
 
 
+@_POSIX_ONLY_HARNESS
 def test_bijection_refuses_alias_or_duplicate(monkeypatch):
     duplicate_corpus = [
         {"document_fixture_id": "doc-A", "title": "first", "text": "first body"},
@@ -268,6 +286,7 @@ def test_bijection_refuses_alias_or_duplicate(monkeypatch):
     assert exc_info.value.code == 2
 
 
+@_POSIX_ONLY_HARNESS
 def test_enabled_ingestion_block_persists_failed_no_vectors(monkeypatch):
     # In enabled mode, a block|filter ingestion must produce no chunks/vectors.
     report = _run_harness(monkeypatch)
@@ -286,6 +305,7 @@ def test_enabled_ingestion_block_persists_failed_no_vectors(monkeypatch):
         assert fix in disabled
 
 
+@_POSIX_ONLY_HARNESS
 def test_disabled_mode_retains_ready_status(monkeypatch):
     # In disabled mode, the same input that enabled blocks may remain ready.
     report = _run_harness(monkeypatch)
@@ -323,6 +343,7 @@ def test_client_payload_cannot_set_mode(monkeypatch):
     assert request_fields.isdisjoint(setting_fields)
 
 
+@_POSIX_ONLY_HARNESS
 def test_production_sql_fingerprint_captured_before_setup(monkeypatch):
     import sqlite3
     import subprocess as _sp
@@ -365,6 +386,7 @@ def test_production_sql_fingerprint_captured_before_setup(monkeypatch):
     assert first_fingerprint < first_migrate
 
 
+@_POSIX_ONLY_HARNESS
 def test_production_sql_fingerprint_unchanged_after_each_fixture(monkeypatch):
     report = _run_harness(monkeypatch)
     fingerprints = report["production_sql_fingerprints"]
@@ -381,6 +403,7 @@ def test_production_sql_fingerprint_unchanged_after_each_fixture(monkeypatch):
     assert len(set(fingerprints)) == 1
 
 
+@_POSIX_ONLY_HARNESS
 def test_production_chroma_fingerprint_unchanged_at_exit(monkeypatch):
     report = _run_harness(monkeypatch)
     fingerprints = report["production_chroma_fingerprints"]
@@ -396,6 +419,7 @@ def test_production_chroma_fingerprint_unchanged_at_exit(monkeypatch):
     assert len(set(fingerprints)) == 1
 
 
+@_POSIX_ONLY_HARNESS
 def test_cleanup_runs_in_finally_on_success(monkeypatch, tmp_path):
     # After successful run, both disposable collections and DB/WAL/SHM files
     # are gone.
@@ -419,6 +443,7 @@ def test_cleanup_runs_in_finally_on_success(monkeypatch, tmp_path):
             assert not (tmp_path / (database.name + suffix)).exists()
 
 
+@_POSIX_ONLY_HARNESS
 def test_cleanup_runs_in_finally_on_failure(monkeypatch, tmp_path):
     # Force a mid-run failure; assert cleanup still runs and production
     # fingerprint is unchanged.
@@ -473,6 +498,7 @@ def test_cleanup_runs_in_finally_on_failure(monkeypatch, tmp_path):
     assert all("mode=ro" in target for target in production_connections)
 
 
+@_POSIX_ONLY_HARNESS
 def test_keep_artifacts_marks_report_non_acceptance(monkeypatch):
     # --keep-artifacts retains disposable stores but sets non_acceptance=true
     # and can never yield exit 0.
@@ -499,6 +525,7 @@ def test_keep_artifacts_marks_report_non_acceptance(monkeypatch):
     shutil.rmtree(workdir, ignore_errors=True)
 
 
+@_POSIX_ONLY_HARNESS
 def test_cli_argv_uses_subprocess_run_shell_false(monkeypatch):
     # Inspect the subprocess.run calls made by run_redteam; assert every call
     # has shell=False (or default) and a list argv.

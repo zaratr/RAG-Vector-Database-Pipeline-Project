@@ -104,8 +104,32 @@ def client(monkeypatch, tmp_path):
     routes_documents.get_vector_store = lambda: store
     routes_query.get_vector_store = lambda: store
 
+    # Hermetic lane shim (merged 10D R2): pre-install the configured
+    # retrieval-security policy through the shipped ``_POLICY_CACHE`` hook.
+    # The R2 regime-identity precondition refuses the committed
+    # fastembed-calibrated policy under the bare ``local`` hash regime; this
+    # lane uses constant unit embeddings (distance 0), so the production
+    # caps/thresholds keep their exact pre-merge bare behavior. The hook is
+    # the documented full bypass (test_poisoning.py::
+    # test_preinstalled_policy_cache_is_a_full_regime_bypass).
+    from pathlib import Path
+
+    from app.services import retrieval as retrieval_module
+    from app.services.retrieval_security import (
+        load_retrieval_security_policy_strict,
+    )
+
+    _policy_path = Path(get_settings().retrieval_security_policy_path)
+    if not _policy_path.is_absolute():
+        _policy_path = Path(__file__).resolve().parents[2] / _policy_path
+    _prior_policy_cache = retrieval_module._POLICY_CACHE
+    retrieval_module._POLICY_CACHE = (
+        load_retrieval_security_policy_strict(_policy_path)
+    )
+
     yield TestClient(app)
 
+    retrieval_module._POLICY_CACHE = _prior_policy_cache
     app.dependency_overrides.clear()
     app.dependency_overrides.update(previous_overrides)
     app.state.source_trust_policy = previous_trust_policy
