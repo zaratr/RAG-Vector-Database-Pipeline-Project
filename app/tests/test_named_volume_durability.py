@@ -41,12 +41,22 @@ def _isolate_stores(monkeypatch, tmp_path):
 
     import chromadb
 
+    # Per-test Chroma isolation: chromadb's in-process SharedSystemClient
+    # registry keys EphemeralClients identically across the whole pytest
+    # process, so a bare EphemeralClient() can leak collection state
+    # between test modules. A PersistentClient over a per-test tmp_path
+    # gets a unique registry key per test (mirroring production's
+    # persist_directory branch of vector_store._create_client) while all
+    # ChromaVectorStore() instances built inside one test share that
+    # test's store. Test-only; production client construction unchanged.
+    chroma_dir = tmp_path / "chroma"
+
     monkeypatch.setattr(vector_store, "_create_client",
-                        lambda: chromadb.EphemeralClient())
+                        lambda: chromadb.PersistentClient(path=str(chroma_dir)))
     from app.services import attack_simulator
 
     monkeypatch.setattr(attack_simulator, "_chroma_client",
-                        lambda: chromadb.EphemeralClient())
+                        lambda: chromadb.PersistentClient(path=str(chroma_dir)))
 
 
 _API_HEARTBEAT_URL = "http://127.0.0.1:8000/"

@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import sqlite3
+import traceback
 import subprocess
 import sys
 import urllib.error
@@ -254,6 +255,25 @@ def _wait_heartbeat(url: str, attempts: int = 30, interval: float = 2.0
     return False
 
 
+_ERROR_TRACEBACK_LINES = 30  # bounded: enough to locate the failing frame
+
+
+def _error_detail(exc: BaseException) -> dict:
+    """Exception type + message + bounded traceback, secret-safe.
+
+    Follows the script's redaction discipline: only structured exception
+    metadata is recorded (no command output, environment, or connection
+    strings are included by construction).
+    """
+    lines = traceback.format_exception(
+        type(exc), exc, exc.__traceback__)
+    return {
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "traceback": "".join(lines[-_ERROR_TRACEBACK_LINES:]),
+    }
+
+
 def run_durability_check(output) -> int:
     """Execute the durability check; write canonical JSON; return 0/2."""
     record: dict = {"ok": False, "stage": "setup", "sentinels": {},
@@ -294,9 +314,11 @@ def run_durability_check(output) -> int:
         if not (record["api_healthy"] and record["chroma_healthy"]):
             raise RuntimeError("service unhealthy after recreate")
         record["ok"] = True
-    except Exception:
+    except Exception as exc:
         record["ok"] = False
-        # keep the failing stage (setup/verify) in the record
+        # keep the failing stage (setup/verify) and the failure detail in
+        # the record so a flap is diagnosable from the record alone
+        record["error"] = _error_detail(exc)
     finally:
         if sentinels:
             try:
@@ -306,9 +328,10 @@ def run_durability_check(output) -> int:
                     record["sentinels"].get("sql_parent_id"),
                     record["sentinels"].get("sql_child_id"),
                     record["sentinels"].get("chroma_sentinel_id")}
-            except Exception:
+            except Exception as exc:
                 record["ok"] = False
                 record["stage"] = "cleanup"
+                record.setdefault("error", _error_detail(exc))
         else:
             record["cleanup_complete"] = True
         try:
