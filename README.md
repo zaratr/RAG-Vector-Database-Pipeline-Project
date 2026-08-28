@@ -376,7 +376,9 @@ b7f3d5a9c2e1  hardened graph extraction lifecycle: idempotent identity owner, at
       ↓
 c8a4e6b0d3f2  security provenance and audits: document trust fields, retrieval audits/decisions, ingestion rate buckets
       ↓
-c9f5b3e7a1d8  candidate decision CHECK: retrieval_candidate_decisions.decision restricted to the 10B.3 decision enum (head)
+c9f5b3e7a1d8  candidate decision CHECK: retrieval_candidate_decisions.decision restricted to the 10B.3 decision enum
+      ↓
+d9b5f7c1e4a3  safety reviews: safety_review_runs/safety_findings, safety_blocked skip reason, rejected_safety decision value (head)
 ```
 
 Application import and API startup do not run migrations. The one-shot `migrate` Compose service owns schema adoption and upgrades.

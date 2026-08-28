@@ -30,8 +30,6 @@ GRAPH_REVISION = "4c9a8d7e6f5b"
 # decision-CHECK revision c9, which sits on the 10B security/provenance
 # revision c8 and the 10A.3 b7 lifecycle rebuild of graph_extractions.
 REVISION = "d9b5f7c1e4a3"
-SECURITY_HEAD = "c8a4e6b0d3f2"
-DECISION_CHECK_HEAD = "c9f5b3e7a1d8"
 PREDECESSOR_HEAD = "a6e2c4f8b1d9"
 NEW_HEAD = "b7f3d5a9c2e1"
 HEAD_TABLES = {
@@ -744,6 +742,14 @@ def test_required_columns_reject_null(tmp_path, statement, missing_column):
 
 D9_HEAD = "d9b5f7c1e4a3"
 
+# The exact seven-value decision CHECK installed by revision c9f5b3e7a1d8;
+# the d9 downgrade rebuild must restore this text verbatim.
+C9_DECISION_CHECK_SQL = (
+    "decision IN ('selected', 'rejected_distance', 'rejected_blocked_source', "
+    "'rejected_source_cap', 'rejected_document_cap', 'rejected_duplicate', "
+    "'rejected_injection')"
+)
+
 
 def test_d9_upgrade_creates_safety_tables_with_exact_columns(tmp_path):
     db_url = _db_url(tmp_path / "d9.db")
@@ -924,6 +930,117 @@ def test_d9_downgrade_representable_data_restores_c8_b7_exactly(tmp_path):
     engine.dispose()
 
 
+def test_d9_downgrade_to_exactly_c9_restores_decision_check_and_preserves_rows(tmp_path):
+    """Downgrade head -> exactly c9f5b3e7a1d8 pins the intermediate state:
+    the decision CHECK is present with the exact seven-value c9 text,
+    rejected_safety and garbage values are rejected there while all seven
+    c9-legal values are accepted, and every seeded row is preserved."""
+    db_url = _db_url(tmp_path / "d9-to-c9.db")
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO documents (id, title, ingestion_status) "
+            "VALUES (1, 'Pinned', 'ready')"))
+        conn.execute(text(
+            'INSERT INTO chunks (id, document_id, "index", text, '
+            "start_offset, end_offset) VALUES (1, 1, 0, 'one', 0, 3), "
+            "(2, 1, 1, 'two', 0, 3)"))
+        conn.execute(text(
+            "INSERT INTO retrieval_audits (id, query_sha256, retrieval_mode, "
+            "status, provenance_policy_version, retrieval_policy_version, "
+            "context_policy_version, completed_at) "
+            "VALUES ('audit-1', :qsha, 'vector', 'completed', 'p', 'r', 'c', "
+            "'2026-08-01T00:00:00Z')"
+        ), {"qsha": "b" * 64})
+        conn.execute(text(
+            "INSERT INTO retrieval_candidate_decisions "
+            "(audit_id, chunk_id_snapshot, document_id_snapshot, "
+            "content_sha256, decision, reason_codes, provenance_score) "
+            "VALUES ('audit-1', 1, 1, :sha, 'rejected_injection', '[]', 0.5)"
+        ), {"sha": "c" * 64})
+    _d9_insert_extraction(engine, error_code="extraction_disabled",
+                          attempt_count=0, sha="a" * 64)
+
+    with engine.connect() as conn:
+        docs_before = conn.execute(text(
+            "SELECT id, title FROM documents ORDER BY id")).fetchall()
+        chunks_before = conn.execute(text(
+            "SELECT id, text FROM chunks ORDER BY id")).fetchall()
+        audits_before = conn.execute(text(
+            "SELECT id FROM retrieval_audits ORDER BY id")).fetchall()
+        decision_before = conn.execute(text(
+            "SELECT id, decision, content_sha256 "
+            "FROM retrieval_candidate_decisions ORDER BY id")).fetchall()
+        extractions_before = conn.execute(text(
+            "SELECT id, status, error_code FROM graph_extractions ORDER BY id"
+        )).fetchall()
+
+    command.downgrade(_alembic_config(db_url), "c9f5b3e7a1d8")
+
+    assert _revision(engine) == "c9f5b3e7a1d8"
+    insp = inspect(engine)
+    tables = set(insp.get_table_names())
+    assert "safety_review_runs" not in tables
+    assert "safety_findings" not in tables
+
+    decision_checks = {
+        c["name"]: c.get("sqltext", "")
+        for c in insp.get_check_constraints("retrieval_candidate_decisions")
+    }
+    assert "ck_candidate_decisions_decision" in decision_checks
+    assert decision_checks["ck_candidate_decisions_decision"] == C9_DECISION_CHECK_SQL
+
+    # rejected_safety is a d9-only value and must be rejected at c9.
+    with pytest.raises(IntegrityError, match="ck_candidate_decisions_decision"):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO retrieval_candidate_decisions "
+                "(audit_id, chunk_id_snapshot, document_id_snapshot, "
+                "content_sha256, decision, reason_codes, provenance_score) "
+                "VALUES ('audit-1', 901, 1, :sha, 'rejected_safety', '[]', 0.5)"
+            ), {"sha": "d" * 64})
+    # garbage is rejected at c9 by the same CHECK.
+    with pytest.raises(IntegrityError, match="ck_candidate_decisions_decision"):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO retrieval_candidate_decisions "
+                "(audit_id, chunk_id_snapshot, document_id_snapshot, "
+                "content_sha256, decision, reason_codes, provenance_score) "
+                "VALUES ('audit-1', 902, 1, :sha, 'garbage_value', '[]', 0.5)"
+            ), {"sha": "e" * 64})
+
+    # every one of the seven c9-legal values is accepted at c9.
+    for position, value in enumerate((
+        "selected", "rejected_distance", "rejected_blocked_source",
+        "rejected_source_cap", "rejected_document_cap",
+        "rejected_duplicate", "rejected_injection",
+    ), start=1):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO retrieval_candidate_decisions "
+                "(audit_id, chunk_id_snapshot, document_id_snapshot, "
+                "content_sha256, decision, reason_codes, provenance_score) "
+                "VALUES ('audit-1', :snap, 1, :sha, :decision, '[]', 0.5)"
+            ), {"snap": 100 + position, "sha": f"{position:064d}",
+                "decision": value})
+
+    with engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT id, title FROM documents ORDER BY id")).fetchall() == docs_before
+        assert conn.execute(text(
+            "SELECT id, text FROM chunks ORDER BY id")).fetchall() == chunks_before
+        assert conn.execute(text(
+            "SELECT id FROM retrieval_audits ORDER BY id")).fetchall() == audits_before
+        assert conn.execute(text(
+            "SELECT id, status, error_code FROM graph_extractions ORDER BY id"
+        )).fetchall() == extractions_before
+        assert decision_before[0] == (1, "rejected_injection", "c" * 64)
+        assert conn.execute(text(
+            "SELECT COUNT(*) FROM retrieval_candidate_decisions")).scalar() == 8
+    engine.dispose()
+
+
 def test_d9_re_upgrade_after_downgrade_is_lossless(tmp_path):
     db_url = _db_url(tmp_path / "d9-roundtrip.db")
     upgrade_database(db_url)
@@ -989,15 +1106,26 @@ def test_d9_upgrade_from_c8_with_data_preserves_all_rows(tmp_path):
     engine.dispose()
 
 
-def test_d9_upgrade_from_every_prior_head(tmp_path):
-    for head in ["dee48bc24a7f", "4c9a8d7e6f5b", "a6e2c4f8b1d9",
-                 "b7f3d5a9c2e1", "c8a4e6b0d3f2"]:
-        db_url = _db_url(tmp_path / f"from-{head}.db")
-        command.upgrade(_alembic_config(db_url), head)
-        upgrade_database(db_url)
-        engine = create_engine(db_url)
-        assert _revision(engine) == D9_HEAD
-        engine.dispose()
+@pytest.mark.parametrize(
+    "prior_head",
+    [
+        "dee48bc24a7f",
+        "4c9a8d7e6f5b",
+        "a6e2c4f8b1d9",
+        "b7f3d5a9c2e1",
+        "c8a4e6b0d3f2",
+        # d9's direct predecessor after the re-chain: the upgrade from c9
+        # exercises exactly the one-step c9 -> d9 path.
+        "c9f5b3e7a1d8",
+    ],
+)
+def test_d9_upgrade_from_every_prior_head(tmp_path, prior_head):
+    db_url = _db_url(tmp_path / f"from-{prior_head}.db")
+    command.upgrade(_alembic_config(db_url), prior_head)
+    upgrade_database(db_url)
+    engine = create_engine(db_url)
+    assert _revision(engine) == D9_HEAD
+    engine.dispose()
 
 
 def test_d9_fk_cascade_deletes_safety_findings_on_run_delete(tmp_path):
