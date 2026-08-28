@@ -223,6 +223,22 @@ def test_every_expected_control_id_in_closed_registry():
             assert cid in CLOSED_CONTROL_REGISTRY
 
 
+def test_control_registry_mapping_to_10b_10c():
+    # Assert closed control registry maps each ID to its owner task phase.
+    mapping = {
+        "retrieval_distance": "10B.3",
+        "retrieval_duplicate_cap": "10B.3",
+        "source_trust": "10B.2",
+        "context_injection": "10B.4",
+        "sql_authority": "10A.6",
+        "graph_evidence": "10A.2",
+        "graph_identity": "10A.3",
+        "context_caps": "10B.3",
+        "content_safety": "10C.1",
+    }
+    assert mapping.keys() == CLOSED_CONTROL_REGISTRY
+
+
 def test_evaluator_type_in_allowed_set():
     obj = json.loads(CORPUS_PATH.read_text())
     for f in obj["fixtures"]:
