@@ -159,6 +159,8 @@ def test_request_envelope_exactly_at_limit_passes_through_middleware():
 
 
 def test_request_envelope_one_byte_over_limit_rejected_before_handler():
+    # D4/Amendment-2 split, Content-Length variant: a valid Content-Length
+    # over the limit is rejected before reading with the fast-reject code.
     app = FastAPI()
     app.add_middleware(BoundedReceiveMiddleware, max_bytes=REQUEST_MAX)
 
@@ -175,11 +177,39 @@ def test_request_envelope_one_byte_over_limit_rejected_before_handler():
         headers={"Content-Type": "application/octet-stream"},
     )
     assert resp.status_code == 413
-    # A valid Content-Length over the limit is rejected before reading with
-    # code request_too_large; the streamed-count code is the other legal form.
-    assert resp.json()["detail"]["code"] in (
-        "request_envelope_too_large", "request_too_large",
+    assert resp.json()["detail"]["code"] == "request_too_large"
+    assert handler_called["v"] is False
+
+
+def test_request_envelope_streamed_count_over_limit_rejected_before_handler():
+    # D4/Amendment-2 split, streamed-count variant: with no trusted
+    # Content-Length (chunked transfer), the middleware counts every chunk
+    # from the raw receive stream and rejects with the streamed-count code.
+    app = FastAPI()
+    app.add_middleware(BoundedReceiveMiddleware, max_bytes=REQUEST_MAX)
+
+    handler_called = {"v": False}
+
+    @app.post("/echo")
+    async def echo(request: Request):
+        handler_called["v"] = True
+        return {"ok": True}
+
+    client = TestClient(app)
+
+    def stream():
+        remaining = REQUEST_MAX + 1
+        while remaining > 0:
+            n = min(64 * 1024, remaining)
+            yield b"x" * n
+            remaining -= n
+
+    resp = client.post(
+        "/echo", content=stream(),
+        headers={"Content-Type": "application/octet-stream"},
     )
+    assert resp.status_code == 413
+    assert resp.json()["detail"]["code"] == "request_envelope_too_large"
     assert handler_called["v"] is False
 
 
