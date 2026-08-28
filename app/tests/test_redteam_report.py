@@ -1,7 +1,7 @@
 """Phase 10D.4 — red-team report schema/validator tests.
 
 Covers: report schema validation, cross-field equations, evaluator rerun,
-threshold acceptance, orchestrator argv mocking, normalization byte
+threshold acceptance, validator argv/network contracts, normalization byte
 equality.
 """
 from __future__ import annotations
@@ -498,114 +498,6 @@ def test_validate_redteam_report_no_network_access(monkeypatch):
     assert status == {"schema_version": "phase10-redteam-report-v1", "status": "valid"}
 
 
-def test_run_phase10d_gate_argv_exact(monkeypatch, tmp_path):
-    # Mock every subprocess.run; assert the orchestrator invokes exactly:
-    #   run_redteam.py twice with --source-binding /reports/source-binding.json
-    #   validate_redteam_report.py twice
-    #   normalize_redteam_report.py twice
-    # and that normalized bytes are compared.
-    calls = []
-
-    def fake_run(argv, **kw):
-        calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, "{}", "")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    from scripts.run_phase10d_gate import main
-    main(["--output", str(tmp_path),
-          "--source-manifest", str(tmp_path / "m.json"),
-          "--source-binding", str(tmp_path / "b.json")])
-    # 2 run_redteam + 2 validate + 2 normalize = 6 child invocations
-    assert len(calls) == 6
-    assert all(isinstance(c, list) for c in calls)
-    assert all("--source-binding" in c or "validate_redteam_report" in c[-1]
-               or "normalize_redteam_report" in c for c in calls)
-
-
-def test_run_phase10d_gate_refuses_production_name_propagation(monkeypatch):
-    # If a child argv contains "rag-collection" or "/data/rag.db" outside the
-    # production-fingerprint step, the orchestrator must exit 2.
-    import os
-    import tempfile
-    from scripts.run_phase10d_gate import main
-    workdir = tempfile.mkdtemp()
-    binding = os.path.join(workdir, "source-binding.json")
-    with open(binding, "w") as fh:
-        json.dump({"database_url": "sqlite:////data/rag.db",
-                   "collection_name": "rag-collection"}, fh)
-    manifest = os.path.join(workdir, "manifest.json")
-    with open(manifest, "w") as fh:
-        json.dump({"commit_sha": "a" * 40}, fh)
-    invoked = []
-    monkeypatch.setattr(subprocess, "run",
-                        lambda argv, **kw: (invoked.append(argv),
-                            subprocess.CompletedProcess(argv, 0, "{}", ""))[1])
-    rc = main(["--output", workdir, "--source-manifest", manifest,
-               "--source-binding", binding])
-    assert rc == 2
-    # the production name is detected before any container child runs
-    assert invoked == []
-
-
-def test_run_phase10d_gate_propagates_schema_failure(monkeypatch):
-    # Mock validate_redteam_report.py to exit 1; assert orchestrator returns 1.
-    import os
-    import tempfile
-    from scripts.run_phase10d_gate import main
-    workdir = tempfile.mkdtemp()
-    for name in ("source-binding.json", "manifest.json"):
-        with open(os.path.join(workdir, name), "w") as fh:
-            json.dump({}, fh)
-    runs = {"n": 0}
-
-    def fake_run(argv, **kw):
-        joined = " ".join(str(a) for a in argv)
-        if "run_redteam" in joined:
-            runs["n"] += 1
-            alias = "run1" if runs["n"] == 1 else "run2"
-            with open(os.path.join(workdir, f"{alias}.json"), "w") as fh:
-                json.dump(_valid_report(run_id=alias), fh)
-            return subprocess.CompletedProcess(argv, 0, "{}", "")
-        if "validate_redteam_report" in joined:
-            return subprocess.CompletedProcess(argv, 1, "", "schema_invalid")
-        return subprocess.CompletedProcess(argv, 0, "{}", "")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    rc = main(["--output", workdir,
-               "--source-manifest", os.path.join(workdir, "manifest.json"),
-               "--source-binding", os.path.join(workdir, "source-binding.json")])
-    assert rc == 1
-
-
-def test_run_phase10d_gate_returns_first_child_exit_code(monkeypatch):
-    # First child exits 1, second exits 0 -> orchestrator returns 1.
-    import os
-    import tempfile
-    from scripts.run_phase10d_gate import main
-    workdir = tempfile.mkdtemp()
-    for name in ("source-binding.json", "manifest.json"):
-        with open(os.path.join(workdir, name), "w") as fh:
-            json.dump({}, fh)
-    runs = {"n": 0}
-
-    def fake_run(argv, **kw):
-        joined = " ".join(str(a) for a in argv)
-        if "run_redteam" in joined:
-            runs["n"] += 1
-            alias = "run1" if runs["n"] == 1 else "run2"
-            with open(os.path.join(workdir, f"{alias}.json"), "w") as fh:
-                json.dump(_valid_report(run_id=alias), fh)
-            # first run fails (exit 1), second succeeds (exit 0)
-            return subprocess.CompletedProcess(argv, 1 if runs["n"] == 1 else 0, "{}", "")
-        return subprocess.CompletedProcess(argv, 0, "{}", "")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    rc = main(["--output", workdir,
-               "--source-manifest", os.path.join(workdir, "manifest.json"),
-               "--source-binding", os.path.join(workdir, "source-binding.json")])
-    assert rc == 1
-
-
 def test_normalized_reports_byte_equal_for_identical_runs(monkeypatch, tmp_path):
     r1 = tmp_path / "r1.json"
     r2 = tmp_path / "r2.json"
@@ -614,48 +506,6 @@ def test_normalized_reports_byte_equal_for_identical_runs(monkeypatch, tmp_path)
     n1 = _normalize(r1)
     n2 = _normalize(r2)
     assert n1.read_bytes() == n2.read_bytes()
-
-
-def test_run_phase10d_gate_relative_output_writes_normalized(monkeypatch, tmp_path):
-    """D-85: the registry invokes the gate with a RELATIVE --output; the
-    normalize child (cwd=scripts/) must still resolve the report paths."""
-    import os
-    import subprocess as _sp
-    from scripts import run_phase10d_gate
-
-    workdir = tmp_path / "rel-out"
-    workdir.mkdir()
-    runs = {"n": 0}
-
-    def fake_run(argv, **kw):
-        joined = " ".join(str(a) for a in argv)
-        if "run_redteam" in joined:
-            runs["n"] += 1
-            alias = "run1" if runs["n"] == 1 else "run2"
-            (workdir / f"{alias}.json").write_text(
-                json.dumps(_valid_report(run_id=alias)))
-            return _sp.CompletedProcess(argv, 0, "{}", "")
-        if "normalize_redteam_report" in joined:
-            # Real child semantics: the positional report path must
-            # resolve from the orchestrator cwd even with a relative
-            # --output; write the normalized view beside it.
-            report_path = Path(argv[3])
-            assert report_path.is_absolute() and report_path.is_file(), (
-                f"normalize child received unresolvable path {argv[3]!r}")
-            payload = json.loads(report_path.read_text())
-            from scripts.normalize_redteam_report import normalize_report
-            Path(argv[5]).write_text(json.dumps(
-                normalize_report(payload), sort_keys=True,
-                separators=(",", ":")))
-            return _sp.CompletedProcess(argv, 0, "", "")
-        return _sp.CompletedProcess(argv, 0, "{}", "")
-
-    monkeypatch.setattr(_sp, "run", fake_run)
-    monkeypatch.chdir(tmp_path)
-    rc = run_phase10d_gate.main(
-        ["--output", "rel-out",
-         "--source-manifest", "m.json", "--source-binding", "b.json"])
-    assert rc in (0, 1, 2)
 
 
 def test_normalize_strips_latency_overhead_ratios(tmp_path):

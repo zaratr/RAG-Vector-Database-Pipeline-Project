@@ -37,7 +37,6 @@ services:
       RAG_INGESTION_EXTRACTED_MAX_BYTES: ${RAG_INGESTION_EXTRACTED_MAX_BYTES:-5242880}
       RAG_INGEST_RATE_LIMIT_REQUESTS: ${RAG_INGEST_RATE_LIMIT_REQUESTS:-30}
       RAG_INGEST_RATE_LIMIT_WINDOW_SECONDS: ${RAG_INGEST_RATE_LIMIT_WINDOW_SECONDS:-60}
-      RAG_PLAN_PATH: ${RAG_PLAN_PATH:-/plan-archive}
       RAG_CONTENT_SAFETY_ENABLED: ${RAG_CONTENT_SAFETY_ENABLED:-false}
       RAG_CONTENT_SAFETY_POLICY_PATH: ${RAG_CONTENT_SAFETY_POLICY_PATH:-/app/config/content-safety-policy.json}
       RAG_SAFETY_LLM_MODE: ${RAG_SAFETY_LLM_MODE:-disabled}
@@ -49,9 +48,6 @@ services:
       # instead of re-downloading it on every recreate. First populate is a
       # one-time download into the volume.
       - fastembed_cache:/tmp/fastembed_cache
-      # Read-only mount of the external Phase 10 plan archive; the plan is
-      # normative and read-only, never copied into the image.
-      - ${RAG_PLAN_ARCHIVE:-../random_archive/.hermes/plans}:/plan-archive:ro
     depends_on:
       migrate:
         condition: service_completed_successfully

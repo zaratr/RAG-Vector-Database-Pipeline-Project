@@ -415,3 +415,182 @@ def test_prune_c8_head_non_dry_still_prunes(tmp_path):
         "SELECT COUNT(*) FROM retrieval_audits").fetchone()[0] == 0
     conn.close()
     db_path.unlink(missing_ok=True)
+
+
+# Appendix 10B.2 subprocess entries: two-batch atomic deletion over 1001
+# eligible audits and unknown-argument refusal.
+
+def test_c8_disposable_subprocess_contract_1001_audits_two_batches(tmp_path):
+    db_path = _make_disposable_db(tmp_path, audit_count=1001, completed_days_ago=60)
+    try:
+        result = _run_prune(db_path, before_days=30)
+        assert result.returncode == 0, result.stderr
+        data = json.loads(result.stdout)
+        assert data["eligible_audits"] == 1001
+        assert data["eligible_candidate_decisions"] == 1001
+        assert data["planned_batches"] == 2
+        assert data["applied_batches"] == 2
+        assert data["deleted_audits"] == 1001
+        assert data["deleted_candidate_decisions"] == 1001
+        conn = sqlite3.connect(str(db_path))
+        remaining_audits = conn.execute(
+            "SELECT COUNT(*) FROM retrieval_audits WHERE status != 'pending'"
+        ).fetchone()[0]
+        remaining_decisions = conn.execute(
+            "SELECT COUNT(*) FROM retrieval_candidate_decisions"
+        ).fetchone()[0]
+        conn.close()
+        assert remaining_audits == 0
+        assert remaining_decisions == 0
+        # Second run is idempotent (zero-count success).
+        second = _run_prune(db_path, before_days=30)
+        assert second.returncode == 0, second.stderr
+        data2 = json.loads(second.stdout)
+        assert data2["eligible_audits"] == 0
+        assert data2["deleted_audits"] == 0
+        assert data2["applied_batches"] == 0
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            p = db_path.with_name(db_path.name + suffix)
+            if p.exists():
+                p.unlink()
+
+
+def test_c8_disposable_subprocess_contract_rejects_unknown_args(tmp_path):
+    db_path = _make_disposable_db(tmp_path, audit_count=1, completed_days_ago=60)
+    try:
+        argv = [
+            sys.executable, str(PRUNE_SCRIPT),
+            "--before-days", "30",
+            "--database-url", f"sqlite:///{db_path}",
+            "--allow-disposable-database",
+            "--bogus",
+        ]
+        result = subprocess.run(argv, capture_output=True, text=True, check=False,
+                                cwd=str(PROJECT_ROOT))
+        assert result.returncode == 2
+        # The refused invocation deleted nothing.
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute("SELECT COUNT(*) FROM retrieval_audits").fetchone()[0]
+        conn.close()
+        assert count == 2  # one completed + one pending
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            p = db_path.with_name(db_path.name + suffix)
+            if p.exists():
+                p.unlink()
+
+
+# ---------------------------------------------------------------------------
+# One-transaction rollback on an injected second-batch failure.
+# ---------------------------------------------------------------------------
+
+
+class _FaultInjectingConn:
+    """Proxy over the sqlite3 connection the CLI itself creates.
+
+    Wrapping the real connection returned by ``_connect`` lets the test raise
+    inside the script's own batch loop (its own ``BEGIN IMMEDIATE`` ... ``for``
+    batches ... ``commit`` path) instead of re-implementing any of it. The
+    fault fires on the Nth ``DELETE FROM retrieval_audits`` — the last
+    statement of each batch — so batch 1 fully applies inside the transaction
+    before batch 2 fails.
+    """
+
+    def __init__(self, real: sqlite3.Connection, fail_on_audit_delete: int) -> None:
+        self._real = real
+        self._fail_on = fail_on_audit_delete
+        self._audit_deletes = 0
+
+    def execute(self, sql, parameters=()):
+        if "DELETE FROM retrieval_audits" in sql:
+            self._audit_deletes += 1
+            if self._audit_deletes == self._fail_on:
+                raise sqlite3.OperationalError(
+                    f"injected second-batch failure "
+                    f"(audit delete #{self._audit_deletes})"
+                )
+        return self._real.execute(sql, parameters)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_second_batch_failure_rolls_back_whole_deletion(tmp_path, monkeypatch, capsys):
+    """A failure injected into the second deletion batch must roll back the
+    entire one-transaction deletion: both tables stay fully populated, the DB
+    file stays byte-identical (no partial batch), exit code is 2 with the
+    failure surfaced and no success JSON. A control run over the SAME
+    untouched DB (no injection, real subprocess CLI) then succeeds in the same
+    two batches, proving the failure came from the injection alone."""
+    from scripts import prune_security_audits as prune
+
+    db_path = _make_disposable_db(tmp_path, audit_count=1500, completed_days_ago=60)
+    try:
+        audits_before = 1500 + 1  # eligible terminal audits + pending fixture
+        decisions_before = 1500
+        sha_before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+
+        real_connect = prune._connect
+
+        def faulting_connect(db_url, read_only=False):
+            return _FaultInjectingConn(
+                real_connect(db_url, read_only=read_only),
+                fail_on_audit_delete=2,
+            )
+
+        monkeypatch.setattr(prune, "_connect", faulting_connect)
+        monkeypatch.delenv("RAG_DATABASE_URL", raising=False)
+        monkeypatch.setattr(
+            sys, "argv",
+            ["prune_security_audits.py", "--before-days", "30",
+             "--database-url", f"sqlite:///{db_path}",
+             "--allow-disposable-database"],
+        )
+
+        rc = prune.main()
+        captured = capsys.readouterr()
+        assert rc == 2
+        assert "prune_security_audits: deletion failed:" in captured.err
+        assert "injected second-batch failure" in captured.err
+        assert captured.out == ""  # no success JSON on a failed deletion
+
+        # Nothing deleted: both tables fully intact.
+        conn = sqlite3.connect(str(db_path))
+        assert conn.execute(
+            "SELECT COUNT(*) FROM retrieval_audits").fetchone()[0] == audits_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM retrieval_candidate_decisions"
+        ).fetchone()[0] == decisions_before
+        conn.close()
+
+        # Byte-consistent: the rolled-back transaction left no partial batch
+        # and no journal sidecar behind.
+        assert hashlib.sha256(db_path.read_bytes()).hexdigest() == sha_before
+        for suffix in ("-journal", "-wal", "-shm"):
+            assert not db_path.with_name(db_path.name + suffix).exists()
+
+        # Control lane: the same DB through the real subprocess CLI (no
+        # injection) prunes exactly the two batches — the rollback left the
+        # store in its full pre-failure state.
+        monkeypatch.undo()
+        result = _run_prune(db_path, before_days=30)
+        assert result.returncode == 0, result.stderr
+        data = json.loads(result.stdout)
+        assert data["eligible_audits"] == 1500
+        assert data["planned_batches"] == 2
+        assert data["applied_batches"] == 2
+        assert data["deleted_audits"] == 1500
+        assert data["deleted_candidate_decisions"] == 1500
+        conn = sqlite3.connect(str(db_path))
+        assert conn.execute(
+            "SELECT COUNT(*) FROM retrieval_audits").fetchone()[0] == 1  # pending
+        assert conn.execute(
+            "SELECT COUNT(*) FROM retrieval_candidate_decisions"
+        ).fetchone()[0] == 0
+        conn.close()
+    finally:
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            p = db_path.with_name(db_path.name + suffix)
+            if p.exists():
+                p.unlink()

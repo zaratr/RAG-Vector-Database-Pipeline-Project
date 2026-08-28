@@ -1,4 +1,4 @@
-"""Phase 10A two-lane acceptance validator (Task 10A.7).
+"""Two-lane acceptance validator.
 
 Lane 1 (deterministic topology): injects a fixed schema-valid GraphExtractionResult
 through the production persistence/retrieval services for a unique three-document
@@ -21,11 +21,11 @@ PRODUCTION ingestion path (``app.services.ingestion.ingest_text``) with the
 real Ollama/Gemma extractor, a disposable ephemeral Chroma collection, and the
 production local (hash) embedding provider — the image's own
 ``RAG_EMBEDDING_PROVIDER=local`` default — so provider dependence is isolated
-to Ollama/Gemma exactly as the plan names it. It requires a non-canned
+to Ollama/Gemma alone. It requires a non-canned
 (no token-free canned echo: some persisted surface/evidence must contain the
 unique run token), schema-valid, SQL-grounded result whose every mention and
 evidence offset matches the persisted source text, and a document that reached
-``ready`` through the 10A.4 state machine. Provider unavailability or invalid
+``ready`` through the staged ingestion state machine. Provider unavailability or invalid
 output FAILS the explicit live lane (exit 2) rather than weakening
 deterministic acceptance.
 
@@ -35,9 +35,9 @@ configured production SQL and Chroma-ID fingerprints are captured read-only
 before and after the whole run and must restore exactly. ``"restored": true``
 is emitted only when every restoration check genuinely passed.
 
-Exit codes (parsed by the recorded phase10a gate):
+Exit codes:
 
-* ``0`` — success; stdout is exactly the plan-pinned summary JSON.
+* ``0`` — success; stdout is exactly the pinned summary JSON.
 * ``1`` — acceptance assertion failure (machine-readable JSON on stderr).
 * ``2`` — provider/configuration/infrastructure failure, including provider
   unavailability and unreadable configured production fingerprints.
@@ -81,10 +81,10 @@ from app.services.ingestion import ingest_text
 from app.services.retrieval import retrieve_contexts
 from app.services.vector_store import ChromaVectorStore
 
-# Plan 10A.6 pins the reciprocal-rank-fusion constant at 60.
+# The reciprocal-rank-fusion constant is pinned at 60.
 RRF_K = 60
 
-# Plan-pinned deterministic expectations for the seeded 3-hop chain
+# Deterministic expectations for the seeded 3-hop chain
 # User -purchases-> Subscription -grants-> PremiumAccess -unlocks-> Dashboard:
 # 3 documents, 4 distinct entities, 3 edge-evidence rows, hops 1..3 present.
 EXPECTED_DOCUMENTS = 3
@@ -147,7 +147,7 @@ def _check(lane: str, check: str, condition: bool, **detail) -> None:
 
 
 def _rrf_score(ranks: dict) -> float:
-    """Reciprocal-rank-fusion score with the plan-pinned constant ``RRF_K``.
+    """Reciprocal-rank-fusion score with the constant ``RRF_K``.
 
     ``ranks`` maps side name -> 1-based rank of one candidate on that side;
     a candidate retrieved by a side at rank ``r`` contributes 1/(RRF_K + r).

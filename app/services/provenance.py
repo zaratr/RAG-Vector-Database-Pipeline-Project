@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 TrustTier = Literal["trusted", "standard", "untrusted", "blocked"]
 
@@ -94,10 +94,60 @@ class ProvenanceAssessment(BaseModel):
     document_id: int
     chunk_id: int
     trust_tier: TrustTier
-    trust_score: float       # [0,1]
-    grounding_score: float   # [0,1]
+    trust_score: float = Field(ge=0, le=1)   # [0,1]
+    grounding_score: float = Field(ge=0, le=1)  # [0,1]
     reasons: list[str]       # sorted stable codes
     policy_version: str
+
+    @property
+    def provenance_score(self) -> float:
+        """Final ``round(0.6 * trust_score + 0.4 * grounding_score, 6)``."""
+        return provenance_score(self.trust_score, self.grounding_score)
+
+
+def assess_provenance(
+    *,
+    document_id: int,
+    chunk_id: int,
+    source: str | None,
+    operator_authenticated: bool,
+    vector_id_match: bool,
+    sql_text_hash_match: bool,
+    document_ready: bool,
+    ingestion_origin: str | None,
+    has_graph_evidence: bool,
+    policy_version: str,
+    policy: SourceTrustPolicy | None = None,
+) -> ProvenanceAssessment:
+    """Deterministic server-side provenance assessment for one candidate.
+
+    Composes the trust policy's server-assigned ``(tier, score)`` with the
+    five-component grounding score and the documented ``provenance_score``
+    formula. When ``policy`` is omitted, the active committed source-trust
+    policy is loaded from the configured path (fail-closed on any policy
+    error, exactly like API startup).
+    """
+    if policy is None:
+        from app.config import get_settings
+
+        policy = load_source_trust_policy(get_settings().source_trust_policy_path)
+    trust_tier, trust_score = policy.assess(source, is_operator=operator_authenticated)
+    grounding_score_value, reasons = compute_grounding_score(
+        vector_id_matches_sql=vector_id_match,
+        text_hash_matches=sql_text_hash_match,
+        document_ready=document_ready,
+        has_ingestion_origin=bool(ingestion_origin),
+        has_graph_evidence=has_graph_evidence,
+    )
+    return ProvenanceAssessment(
+        document_id=document_id,
+        chunk_id=chunk_id,
+        trust_tier=trust_tier,
+        trust_score=trust_score,
+        grounding_score=grounding_score_value,
+        reasons=reasons,
+        policy_version=policy_version,
+    )
 
 
 def compute_grounding_score(

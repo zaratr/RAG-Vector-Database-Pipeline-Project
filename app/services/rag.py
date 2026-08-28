@@ -6,11 +6,13 @@ import json
 import logging
 from typing import List
 
+import httpx
+
 from sqlalchemy.orm import Session
 
 from app.persistence import models
 from app.services.embeddings import EmbeddingProvider
-from app.services.llm import LLMClient
+from app.services.llm import LLMClient, LLMProviderOutputError
 from app.services.vector_store import VectorStore
 from app.services import retrieval
 from app.services.context_security import detect_context_injection, get_context_security_policy
@@ -304,7 +306,10 @@ async def answer_query(
             "answer_findings": 0,
         }
 
-    if not allowed:
+    if not allowed and final_decisions:
+        # Security fail-close lane: candidates existed and every one was
+        # rejected — the deterministic no-safe-context answer is returned and
+        # the LLM is never invoked without safe evidence.
         try:
             audit.complete(audit_id)
             session.commit()
@@ -319,6 +324,10 @@ async def answer_query(
             "security_summary": security_summary,
             "safety_summary": safety_summary,
         }
+    # A pure retrieval miss (no candidates at all) falls through to
+    # generation: the grounded no-evidence contract invokes the answer LLM
+    # with an empty evidence list and returns its answer (never placeholder
+    # rows, never a crash), with context == [].
 
     # Generation starts only after all final candidate decisions are durable.
     evidence = [
@@ -329,6 +338,13 @@ async def answer_query(
         answer = await llm_client.generate_answer(
             query, evidence, system_prompt=CONTEXT_SECURITY_SYSTEM_PROMPT
         )
+    except (LLMProviderOutputError, httpx.HTTPError):
+        # Typed answer-provider contracts (malformed envelope -> 502,
+        # transport failure -> 503, mapped in the route): terminalize the
+        # audit truthfully, then re-raise so the typed mappings apply
+        # instead of the generic 503 fail-close lane.
+        _fail_audit(audit, session, audit_id, "generation_provider_failed")
+        raise
     except Exception as exc:
         _fail_audit(audit, session, audit_id, "generation_provider_failed")
         raise GenerationProviderFailure("generation provider failed") from exc

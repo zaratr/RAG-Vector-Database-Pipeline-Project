@@ -1,8 +1,8 @@
-"""Tests for the hardened Phase 10A.7 acceptance validator (F9 remediation).
+"""Tests for the hardened acceptance validator.
 
-``scripts/validate_phase10a.py`` is load-bearing inside the recorded phase10a
-gate: its exit code is parsed by ``run_recorded_gate.py``. These tests prove
-the remediation contract:
+``scripts/validate_phase10a.py`` is the acceptance validator whose exit code
+separates success from validation failure and provider unavailability. These
+tests prove the validator contract:
 
 * the deterministic lane ASSERTS exact document/entity/evidence counts,
   directional 1/2/3-hop paths with citations, genuinely executed hybrid
@@ -89,6 +89,28 @@ def _install_permissive_retrieval_policy(monkeypatch):
 # ---------------------------------------------------------------------------
 # Live-extractor fakes shared by the in-process tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def live_provider_env(monkeypatch):
+    """Pin the live lane's provider env regardless of ambient values.
+
+    The in-process live lane constructs its extractor via
+    ``get_graph_extractor()``, which reads the (cached) settings: an ambient
+    ``RAG_LLM_PROVIDER=dummy`` or disabled graph extraction would turn every
+    live-lane test into a configuration failure instead of exercising the
+    patched ``OllamaGraphExtractor.extract``. Pin the ollama provider — the
+    same pin ``_run_validator_script`` applies for the subprocess lane — and
+    rebuild the settings cache, clearing it again on teardown so the pinned
+    values cannot leak into later tests.
+    """
+    from app.config import get_settings
+
+    monkeypatch.setenv("RAG_LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("RAG_GRAPH_EXTRACTION_ENABLED", "true")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 async def _grounded_extract(self, text):
@@ -385,7 +407,7 @@ async def test_deterministic_lane_requires_distinct_seed_sources(
 
 @pytest.mark.asyncio
 async def test_live_lane_persists_through_production_ingest_path(
-    monkeypatch, tmp_path
+    live_provider_env, monkeypatch, tmp_path
 ):
     """The live document must go through the production ingest_text path with
     a REAL (non-disabled) extractor, then verify from persisted SQL rows."""
@@ -417,7 +439,7 @@ async def test_live_lane_persists_through_production_ingest_path(
 
 
 @pytest.mark.asyncio
-async def test_live_lane_provider_unavailable_raises(monkeypatch, tmp_path):
+async def test_live_lane_provider_unavailable_raises(live_provider_env, monkeypatch, tmp_path):
     from scripts import validate_phase10a as validator
 
     async def unavailable(self, text):
@@ -435,7 +457,7 @@ async def test_live_lane_provider_unavailable_raises(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_live_lane_rejects_canned_output(monkeypatch, tmp_path):
+async def test_live_lane_rejects_canned_output(live_provider_env, monkeypatch, tmp_path):
     """A provider echoing a CANNED, token-free relation (schema-valid and
     even grounded as a substring) must fail the non_canned check rather than
     pass the live lane."""
@@ -474,7 +496,7 @@ async def test_live_lane_rejects_canned_output(monkeypatch, tmp_path):
 
 
 def test_main_fails_nonzero_when_production_fingerprint_changes(
-    monkeypatch, tmp_path, capsys
+    live_provider_env, monkeypatch, tmp_path, capsys
 ):
     """restored:true must be withheld when configured production state does
     not restore exactly; exit code must be non-zero with a machine-readable
@@ -551,7 +573,7 @@ def test_rrf_constant_is_sixty():
     from scripts import validate_phase10a as validator
 
     # A chunk ranked 1st on the vector side and 2nd on the graph side fuses to
-    # 1/(60+1) + 1/(60+2): the plan 10A.6 fusion constant is pinned at 60.
+    # 1/(60+1) + 1/(60+2): the fusion constant is pinned at 60.
     # Production emits the exact RRF sum (no rounding); the helper mirrors it.
     assert validator._rrf_score({"vector": 1, "graph": 2}) == pytest.approx(
         1 / 61 + 1 / 62

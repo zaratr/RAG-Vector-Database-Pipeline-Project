@@ -1,7 +1,7 @@
 """Idempotent graph backfill for ready text chunks lacking the current extraction identity.
 
-Task 10A.8: extracts graph facts for ready text chunks that predate GraphRAG or
-lack the current extraction identity. Reuses the 10A.3 repository API; never
+Extracts graph facts for ready text chunks that predate GraphRAG or
+lack the current extraction identity. Reuses the extraction repository API; never
 modifies vector IDs, Chroma records, document readiness, or old extraction
 evidence rows from other versions.
 """
@@ -174,13 +174,10 @@ async def backfill(
     provider: str,
     model: str,
     document_id: Optional[int] = None,
-    batch_size: int = 20,
     retry_failed: bool = False,
     dry_run: bool = False,
 ) -> BackfillReport:
     """Run an idempotent backfill and return the exact counter report."""
-    if batch_size < 1 or batch_size > 100:
-        raise ValueError("batch_size must be between 1 and 100")
     if document_id is not None:
         exists = (
             session.query(models.Document).filter(models.Document.id == document_id).count() > 0
@@ -258,7 +255,7 @@ async def backfill(
             # worker reclaimed the expired lease (expiry-during-processing)
             # or terminalized the identity first, so complete/fail raised.
             # The chunk must count ONLY in lease_lost — never additionally
-            # in processed — so the plan's conservation equations hold in
+            # in processed — so the conservation equations hold in
             # every interleaving: eligible = processed + lease_lost,
             # processed = succeeded + empty + failed, and scanned = skipped
             # + processed + lease_lost.

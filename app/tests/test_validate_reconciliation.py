@@ -1,12 +1,12 @@
-"""Tests for the hardened disposable reconciliation validator (F10 remediation).
+"""Tests for the hardened disposable reconciliation validator.
 
-``scripts/validate_reconciliation.py`` is the 10A.4 live-idempotence validator.
-The F10 defect: it defined ``_fingerprint`` but never called it (no production
+``scripts/validate_reconciliation.py`` is the live-idempotence validator.
+The original defect: it defined ``_fingerprint`` but never called it (no production
 SQL/Chroma fingerprints despite its own docstring) and used an in-memory
 vector-store substitute instead of a disposable Chroma collection. These tests
 prove the hardened contract:
 
-* happy path: exit 0 with exactly the plan-pinned converged second-run JSON;
+* happy path: exit 0 with exactly the pinned converged second-run JSON;
 * a seeded reconciliation counter lie fails non-zero with a machine-readable
   error (counters are ASSERTED, never merely printed);
 * a configured-production fingerprint mismatch fails non-zero;
@@ -139,7 +139,7 @@ def _run_validator_script(monkeypatch, tmp_path, mode=""):
 
 
 def test_validator_happy_path_exits_0_with_pinned_json(monkeypatch, tmp_path):
-    """An intact reconciliation run exits 0 and prints exactly the plan-pinned
+    """An intact reconciliation run exits 0 and prints exactly the pinned
     converged second-run JSON."""
     result = _run_validator_script(monkeypatch, tmp_path)
 

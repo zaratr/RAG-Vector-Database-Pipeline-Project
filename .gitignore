@@ -21,7 +21,11 @@ data/processed/
 # Validation artifacts
 query*.json
 
+# Local gate/validation reports
+.hermes/reports/
+
 
 # Editor junk
 *~
 *.un~
+

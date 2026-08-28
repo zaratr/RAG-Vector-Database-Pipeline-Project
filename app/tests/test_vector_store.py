@@ -43,13 +43,29 @@ def test_ephemeral_mode_when_no_host_no_persist(monkeypatch):
 
 
 def test_http_mode_when_host_set(monkeypatch):
-    """When chroma_host is set, _create_client returns an HttpClient."""
+    """When chroma_host is set, _create_client builds an HttpClient bound to
+    that host/port. chromadb.HttpClient eagerly connects, so a recording stub
+    is installed in its place: the construction contract (client type + bound
+    host/port) is pinned without a live Chroma server."""
     from app.config import Settings
+    import app.services.vector_store as vector_store_module
+
+    created = {}
+
+    class RecordingHttpClient:
+        def __init__(self, host, port):
+            created["host"] = host
+            created["port"] = port
+
+    monkeypatch.setattr(
+        vector_store_module.chromadb, "HttpClient", RecordingHttpClient
+    )
     monkeypatch.setattr("app.services.vector_store.get_settings", lambda: Settings(
-        chroma_host="vectordb", chroma_port=8000
+        chroma_host="vectordb.example", chroma_port=8000
     ))
     client = _create_client()
-    assert _client_backend_name(client) == "FastAPI"
+    assert isinstance(client, RecordingHttpClient)
+    assert created == {"host": "vectordb.example", "port": 8000}
 
 
 def test_persistent_mode_when_directory_set(monkeypatch, tmp_path):
@@ -63,6 +79,41 @@ def test_persistent_mode_when_directory_set(monkeypatch, tmp_path):
     # Persistent and ephemeral share the same Rust backend — distinguish by
     # checking that the client's identifier is NOT "ephemeral"
     assert client._identifier != "ephemeral"
+
+
+@pytest.mark.asyncio
+async def test_persistent_client_survives_across_client_instances(tmp_path):
+    """Persistent mode is genuinely persistent: records written through one
+    client instance are visible to a fresh client opened on the same
+    directory (and absent from an unrelated directory)."""
+    import chromadb
+
+    name = "persist-" + uuid.uuid4().hex[:8]
+    writer = ChromaVectorStore(
+        collection_name=name, client=chromadb.PersistentClient(path=str(tmp_path))
+    )
+    await writer.index_embeddings(
+        embeddings=[[0.1] * 8],
+        metadatas=[{"doc": "persisted"}],
+        ids=["p-1"],
+        documents=["persisted payload"],
+    )
+
+    reader = ChromaVectorStore(
+        collection_name=name, client=chromadb.PersistentClient(path=str(tmp_path))
+    )
+    hits = await reader.query([0.1] * 8, top_k=1)
+    assert len(hits) == 1
+    assert hits[0].vector_id == "p-1"
+    assert hits[0].text == "persisted payload"
+    assert hits[0].metadata["doc"] == "persisted"
+
+    unrelated_dir = tmp_path / "elsewhere"
+    unrelated_dir.mkdir()
+    stranger = ChromaVectorStore(
+        collection_name=name, client=chromadb.PersistentClient(path=str(unrelated_dir))
+    )
+    assert len(await stranger.query([0.1] * 8, top_k=1)) == 0
 
 
 # ── Roundtrip tests ────────────────────────────────────────────────

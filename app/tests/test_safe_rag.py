@@ -97,6 +97,9 @@ def safe_client(monkeypatch, tmp_path):
     monkeypatch.setenv("RAG_INGEST_RATE_LIMIT_REQUESTS", "1000")
     monkeypatch.setenv("RAG_CONTENT_SAFETY_ENABLED", "true")
     monkeypatch.setenv("RAG_SAFETY_LLM_MODE", "disabled")
+    monkeypatch.setenv(
+        "RAG_CONTENT_SAFETY_POLICY_PATH",
+        str(PROJECT_ROOT / "config" / "content-safety-policy.json"))
     get_settings.cache_clear()
 
     Base.metadata.drop_all(bind=engine)
@@ -312,6 +315,9 @@ def _seed_ready(monkeypatch, safe_client, title, text):
             data={"title": title, "source": f"src-{title}", "text": text})
     finally:
         monkeypatch.setenv("RAG_CONTENT_SAFETY_ENABLED", "true")
+        monkeypatch.setenv(
+            "RAG_CONTENT_SAFETY_POLICY_PATH",
+            str(PROJECT_ROOT / "config" / "content-safety-policy.json"))
         get_settings.cache_clear()
     assert resp.status_code == 201, resp.text
     return resp.json()["document_id"]

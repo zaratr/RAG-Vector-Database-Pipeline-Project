@@ -57,10 +57,10 @@ def _add_document(session, title, status, vector_id, *, chunk_text=None):
 
 
 def _add_extraction(session, chunk_id, status="succeeded"):
-    # Fixture adaptation: the plan-mandated ck_graph_extractions_lifecycle
-    # CHECK (10A.3 W4) requires completed_at NOT NULL for terminal rows and
+    # Fixture adaptation: the ck_graph_extractions_lifecycle
+    # CHECK requires completed_at NOT NULL for terminal rows and
     # error_code NOT NULL for failed rows, so the helper fills those where the
-    # status requires them. Every appendix assertion is unaffected.
+    # status requires them. Every crash-matrix assertion is unaffected.
     from datetime import datetime, timezone
 
     completed_at = (
@@ -199,7 +199,7 @@ async def test_reconciliation_terminalizes_pending_extractions_with_completed_at
     session.close()
 
 
-# ── 10A.4 crash matrix tests (phase10-test-specifications appendix) ──
+# ── Crash matrix tests ──
 
 
 @pytest.mark.asyncio
