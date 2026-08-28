@@ -37,6 +37,97 @@ Query ── vector search ───────────────┐
 
 Text ingestion records an explicit `staged → ready` lifecycle. A document becomes query-visible only after its deterministic Chroma vectors and relational graph provenance have been written successfully. Failed or interrupted cross-store operations can be repaired with the reconciliation command documented below.
 
+## Phase 10 Status, Claims, and Evidence
+
+Phase 10 work is complete and independently validated per phase. Every
+completion or quantitative claim in this README is anchored with an
+`[EVID-*]` identifier that maps to a row in
+[`docs/phase10-evidence.md`](docs/phase10-evidence.md); a clean clone can
+re-derive each claim by running the cited hermetic command.
+
+**Phase 10 completion is not public production readiness.** The system is
+not production ready for public, multi-tenant deployment, and no separate
+release certification has been performed. Two structural limitations follow
+from the current security model:
+
+- **Single-operator, static-token authorization.** The operator API (when
+  enabled with `RAG_OPERATOR_API_ENABLED=true`) authenticates exactly one
+  static bearer token (`RAG_OPERATOR_TOKEN`); there are no per-user
+  identities, no rotation, and no scopes [EVID-10B-OPAUTH].
+- **No multi-tenancy.** All documents, vectors, graph provenance, audits,
+  and safety findings live in one shared store with no tenant isolation;
+  any client of the API can read all ingested content.
+
+Claim taxonomy:
+
+- **F1–F4 (prerequisite foundations) — approved and regression-green:**
+  durable persistent Chroma vector store [EVID-F1]; runnable graph
+  traversal (F2's original NetworkX technology choice was amended under
+  10A.5 and removed — NetworkX is history only, production traversal is
+  relational) [EVID-F2AMENDED]; truthful document ingestion [EVID-F3];
+  Alembic-owned schema evolution [EVID-F4].
+- **10A (ML Engineer) — amended and approved:** deterministic hybrid RRF
+  retrieval [EVID-10A-01]; persisted graph provenance [EVID-10A-02]; exact
+  durable migration head `d9b5f7c1e4a3` [EVID-10A-03]; SQL-authoritative
+  query visibility and reconciliation convergence [EVID-10A-06].
+- **10B (LLM Security Engineer) — approved:** complete-envelope ingestion
+  byte limits enforced before handlers on both the `Content-Length`
+  fast-reject and streamed-count paths [EVID-10B-01]; atomic cross-worker
+  rate limiting [EVID-10B-02]; persisted security audits with bounded
+  retention, pruned by `scripts/prune_security_audits.py`
+  [EVID-10B-04]; retrieval-security policy regime pinning that fails
+  closed [EVID-10B-05].
+- **10C (AI Safety Specialist) — approved:** byte-pinned content-safety
+  policy [EVID-10C-01]; fail-closed generation-time safety enforcement —
+  when every retrieved candidate is blocked, `/query` still returns `200`
+  with the deterministic no-safe-context answer [EVID-10C-02].
+- **10D (AI Red Teamer) — approved:** isolated, byte-pinned attack corpus
+  [EVID-10D-01]; closed control registry mapped to its owner phases
+  [EVID-10D-02]; reproducible report schema [EVID-10D-03]; documented
+  defense-effectiveness acceptance bound of relative ASR reduction
+  ≥ 0.60 [EVID-10D-04].
+
+**Red-team isolation and report locations (10D).** The attack harness
+(`scripts/run_redteam.py`) runs as one-shot containers against disposable
+per-mode SQLite databases and Chroma collections — never the production
+store. Reports (JSON, Markdown, and the source binding) are written to a
+host output directory supplied to the harness, validated against
+`app/tests/fixtures/redteam-report.schema.json`
+(`scripts/validate_redteam_report.py`), and normalized with
+`scripts/normalize_redteam_report.py` [EVID-10D-03]. The methodology and
+metric definitions live in `docs/red-team-methodology.md` [EVID-10D-04].
+
+**Safety and security audit behavior.** Retrieval, context-security, and
+content-safety controls fail closed: a missing, invalid, or
+regime-mismatched policy refuses startup or policy load
+[EVID-10B-05][EVID-10C-01]. Security audits are persisted relationally
+with bounded retention (`RAG_SECURITY_AUDIT_RETENTION_DAYS`, default 30)
+and can be pruned explicitly [EVID-10B-04].
+
+**Image hygiene (DOC.1).** `scripts/validate_image_hygiene.py` is a
+host-side scanner (it refuses to run inside a container) that verifies the
+built images' OCI source-provenance labels and scans the final merged
+rootfs of each service — via `docker create --entrypoint /bin/true` plus
+`docker export` — for forbidden artifacts (`.git`, `.env*`, `.hermes`,
+local databases, report files, host absolute paths, credential
+sentinels, out-of-allowlist attack fixtures) and verifies the pinned
+policy hash inventory. It never mounts the Docker socket and never echoes
+matched credential bytes. Run it as:
+
+```bash
+python scripts/validate_image_hygiene.py --manifest <source-manifest.json> --services api migrate
+```
+
+Its behavior is pinned by 27 hermetic lanes with zero Docker dependency
+[EVID-DOC1-04][EVID-DOC1-05][EVID-DOC1-06][EVID-DOC1-07].
+
+**Test suite.** A clean clone collects the full hermetic suite with zero
+collection errors (951 tests at the DOC.1 branch point) [EVID-DOC1-SUITE];
+see *Running the tests without any services* below for the recipe. The
+evidence map itself was validated on a bare Windows host; the POSIX-only
+lanes documented below have never been executed on POSIX
+[EVID-DOC1-SUITE].
+
 ## Quick Start with Docker Compose
 
 Docker Compose is the authoritative runtime for this project.
@@ -418,6 +509,15 @@ All application settings use the `RAG_` prefix and load from `.env`.
 | `RAG_CHROMA_PORT` | `8000` | `8000` | Chroma server port |
 | `RAG_CHROMA_PERSIST_DIRECTORY` | empty | empty | Standalone persistent-client path when host is empty |
 | `RAG_OPENAI_API_KEY` | empty | placeholder | Used only by OpenAI-oriented provider paths |
+| `RAG_OPERATOR_API_ENABLED` | `false` | `true` | Enable the single-operator API surface (see the Phase 10 limitations above) |
+| `RAG_OPERATOR_TOKEN` | empty | set in `.env` | The one static operator bearer token; single-operator, no rotation, no scopes |
+| `RAG_SECURITY_AUDIT_RETENTION_DAYS` | `30` | `30` | Bounded retention for persisted security audits; prune with `scripts/prune_security_audits.py` |
+| `RAG_SOURCE_TRUST_POLICY_PATH` | `config/source-trust-policy.json` | `/app/config/source-trust-policy.json` | Source-trust policy (startup fails when missing/invalid) |
+| `RAG_RETRIEVAL_SECURITY_POLICY_PATH` | `config/retrieval-security-policy.json` | `/app/config/retrieval-security-policy.json` | Distance-calibrated retrieval policy; must match the embedding regime |
+| `RAG_CONTEXT_SECURITY_POLICY_PATH` | `config/context-security-policy.json` | `/app/config/context-security-policy.json` | Context-security policy (injection controls) |
+| `RAG_CONTENT_SAFETY_ENABLED` | `true` | `true` | Content-safety enforcement toggle |
+| `RAG_CONTENT_SAFETY_POLICY_PATH` | `config/content-safety-policy.json` | `/app/config/content-safety-policy.json` | Byte-pinned content-safety policy |
+| `RAG_SAFETY_LLM_MODE` | provider default | set in `.env` | Safety-review LLM mode for 10C enforcement |
 
 ### Embedding regimes and the retrieval-security policy
 
