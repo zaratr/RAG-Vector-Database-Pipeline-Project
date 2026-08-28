@@ -93,10 +93,16 @@ def main() -> int:
     parser.add_argument("--deployment-output")
     parser.add_argument("--settings-output")
     args = parser.parse_args()
-    if args.deployment_output:
-        snapshot_deployment(args.deployment_output)
-    if args.settings_output:
-        snapshot_settings(args.settings_output)
+    try:
+        if args.deployment_output:
+            snapshot_deployment(args.deployment_output)
+        if args.settings_output:
+            snapshot_settings(args.settings_output)
+    except Exception as exc:
+        # Failure exits 2 with no partial file (plan §10B.2): outputs are
+        # written only after filtering/serialization fully succeed.
+        sys.stderr.write(f"snapshot_nonsecret_deployment: {type(exc).__name__}\n")
+        return 2
     return 0
 
 

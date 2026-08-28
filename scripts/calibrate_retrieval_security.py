@@ -46,8 +46,8 @@ from app.services.retrieval_security import (  # noqa: E402
 # Backward-compatible alias for earlier callers.
 validate_corpus = validate_calibration_corpus
 
-# 10C.4 moves the chain head to d9b5f7c1e4a3; the calibrator verifies
-# the disposable wrapper applied the complete current chain.
+# The merged chain head is d9b5f7c1e4a3 (c8 -> c9 -> d9); the calibrator
+# verifies the disposable wrapper applied the complete current chain.
 EXPECTED_MIGRATION_HEAD = "d9b5f7c1e4a3"
 PRODUCTION_COLLECTION_NAME = "rag-collection"
 DISPOSABLE_RUN_ID_RE = re.compile(r"^[0-9a-f]{32}$")

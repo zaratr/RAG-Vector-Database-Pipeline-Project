@@ -62,7 +62,11 @@ def _context_key(context: dict) -> tuple:
     metadata = context.get("metadata") or {}
     chunk_id = metadata.get("chunk_id")
     if chunk_id is not None:
-        return ("chunk", str(chunk_id))
+        # Numeric SQL chunk identity: fused contexts key and tie-break by the
+        # integer chunk id (2 before 10). The stringified form would order
+        # multi-digit ids lexicographically and invert the deterministic
+        # (-hybrid_score, chunk_id) ordering.
+        return ("chunk", int(chunk_id))
     return ("text", context.get("text", ""))
 
 
@@ -300,7 +304,7 @@ async def retrieve_contexts_detailed(
                 metadata["graph_score"] = graph_score
 
     for key, context in fused.items():
-        # Exact RRF-60 sum, never rounded: the plan pins hybrid_score as the
+        # Exact RRF-60 sum, never rounded: hybrid_score is the
         # sum of 1/(60+rank) over the candidate's sides, and rounding would
         # perturb that arithmetic (and could fabricate ties).
         context["metadata"]["hybrid_score"] = rrf_scores[key]
@@ -379,14 +383,20 @@ def _apply_security_filter(session: Session, contexts: list[dict], mode: str = "
         else:
             origin = "vector"
 
-        # Look up trust tier from SQL.
+        # Look up trust tier and grounding inputs from SQL.
         trust_tier = "standard"
         document_ready = True
+        ingestion_origin = ""
         if doc_id:
             doc = session.get(models.Document, doc_id)
             if doc:
                 trust_tier = doc.trust_tier or "standard"
                 document_ready = doc.ingestion_status == "ready"
+                ingestion_origin = doc.ingestion_origin or ""
+        # Graph evidence with valid chunk/document/extraction FKs: candidates
+        # reached through the graph lane were hydrated from validated graph
+        # paths, so graph support is the recorded evidence indicator.
+        has_graph_evidence = "graph" in sources
 
         # Native L2 distance exists only for vector-supported candidates; the
         # Chroma score IS the distance for vector hits and must never be
@@ -407,6 +417,8 @@ def _apply_security_filter(session: Session, contexts: list[dict], mode: str = "
                 meta.get("min_hop", meta.get("hop")), int
             ) else None,
             hybrid_score=meta.get("hybrid_score"),
+            ingestion_origin=ingestion_origin,
+            has_graph_evidence=has_graph_evidence,
         )
         candidates.append(cand)
         context_by_chunk[chunk_id] = ctx

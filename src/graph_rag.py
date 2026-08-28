@@ -1,6 +1,6 @@
 """Operator CLI for querying the persisted GraphRAG relationship graph.
 
-Phase 10A.5: migrated to ``retrieve_graph_paths`` returning complete
+Traverses via ``retrieve_graph_paths`` returning complete
 ``GraphPath`` objects, with ``--hops`` capped at 1–3, ``--direction`` support,
 and ``--filters`` accepting repeated ``key=value`` document filters from the
 scalar filter matrix (document_id, title, source, tags).

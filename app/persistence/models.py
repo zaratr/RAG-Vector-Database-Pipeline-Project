@@ -193,7 +193,7 @@ class GraphExtraction(Base):
     error_code = Column(String(100), nullable=True)
     error_detail = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    # 10A.3 lifecycle/identity columns.
+    # Lifecycle/identity columns.
     input_sha256 = Column(String(64), nullable=False)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     completed_at = Column(DateTime(timezone=True), nullable=True)
@@ -369,6 +369,10 @@ class RetrievalCandidateDecision(Base):
             "provenance_score >= 0 AND provenance_score <= 1",
             name="ck_candidate_decisions_provenance_score",
         ),
+        # The complete 10B.3 decision enum (enforced physically by revision
+        # c9f5b3e7a1d8 on top of c8a4e6b0d3f2) extended with 10C.4's
+        # ``rejected_safety`` (enforced physically by d9b5f7c1e4a3, chained
+        # c8 -> c9 -> d9).
         CheckConstraint(
             "decision IN ('selected', 'rejected_distance', "
             "'rejected_blocked_source', 'rejected_source_cap', "

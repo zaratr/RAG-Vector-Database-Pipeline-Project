@@ -15,9 +15,8 @@ and generated answers (scopes: `ingestion`, `context`, `answer`).
   schema `content-safety-fixtures-v1`. Cases are lexical by ID and are the
   authoritative evidence for rule behavior — never regenerate them.
 
-Both payloads are pinned bytes from the Phase 10 plan; the plan-payload
-validator (`scripts/validate_phase10_plan_payloads.py`) locates and
-byte-verifies them.
+Both payloads are pinned bytes from the Phase 10 plan;
+`app/tests/test_safety_policy.py` locates and byte-verifies them.
 
 ## Categories (stable IDs)
 

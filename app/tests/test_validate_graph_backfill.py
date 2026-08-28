@@ -1,17 +1,17 @@
-"""Tests for the hardened disposable graph backfill validator (F11 remediation).
+"""Tests for the hardened disposable graph backfill validator.
 
-``scripts/validate_graph_backfill.py`` is the 10A.8 live validator. The F11
+``scripts/validate_graph_backfill.py`` is the live validator. The original
 defect: it asserted NOTHING (always exited 0 with ``restored:true``), invoked
 the service directly instead of the ``backfill_graph.py`` CLI, and took no
 fingerprints. These tests prove the hardened contract:
 
-* happy path: exit 0 with exactly the plan-pinned ``first``/``second``/
+* happy path: exit 0 with exactly the pinned ``first``/``second``/
   ``restored`` JSON, produced by actually invoking the CLI;
 * a lying backfill report (CLI subprocess and in-process lanes) fails
   non-zero with a machine-readable error (counters are ASSERTED, never
   merely printed);
 * a configured-production fingerprint mismatch fails non-zero;
-* the two-worker duplicate-protection expectation (plan 10A.8: exactly one
+* the two-worker duplicate-protection expectation (exactly one
   worker ``processed=1/lease_lost=0``, the other ``lease_lost=1``) is proved
   deterministically (injected clock, no sleeps) with the conservation
   equations holding for both workers;
@@ -37,7 +37,7 @@ _CLI_PATH = (
     Path(__file__).resolve().parents[2] / "scripts" / "backfill_graph.py"
 )
 
-# Plan 10A.8 pins the validator's expected JSON exactly.
+# The validator's expected JSON is pinned exactly.
 PINNED_FIRST = {
     "scanned": 1,
     "eligible": 1,
@@ -146,7 +146,7 @@ def _run_validator_script(monkeypatch, tmp_path, mode=""):
 
 
 def test_validator_happy_path_exits_0_with_pinned_json(monkeypatch, tmp_path):
-    """An intact backfill scenario exits 0 and prints exactly the plan-pinned
+    """An intact backfill scenario exits 0 and prints exactly the pinned
     first/second/restored JSON."""
     result = _run_validator_script(monkeypatch, tmp_path)
 
@@ -246,7 +246,7 @@ async def test_run_invokes_cli_asserts_lanes_and_cleans_up(monkeypatch, tmp_path
 
 @pytest.mark.asyncio
 async def test_run_proves_two_worker_duplicate_protection(monkeypatch, tmp_path):
-    """The validator's concurrency lane proves the plan's two-worker
+    """The validator's concurrency lane proves the two-worker
     expectation deterministically: exactly one worker reports
     processed=1/succeeded=1/lease_lost=0, the other reports lease_lost=1;
     every conservation equation holds for both and exactly one terminal

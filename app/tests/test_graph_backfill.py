@@ -1,15 +1,20 @@
-"""Phase 10A.8 — idempotent graph backfill tests."""
+"""Idempotent graph backfill tests."""
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
 from app.core.db import Base
+from app.core.migrations import upgrade_database
 from app.persistence import models
-from app.persistence.graph_repository import begin_chunk_extraction
+from app.persistence.graph_repository import begin_chunk_extraction, persist_chunk_extraction
 from app.services.graph_backfill import backfill
 from app.services.graph_extraction import (
     PROMPT_VERSION,
@@ -18,6 +23,8 @@ from app.services.graph_extraction import (
     ExtractedRelation,
     GraphExtractionError,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class _StaticExtractor:
@@ -506,7 +513,7 @@ async def test_backfill_conservation_equations_hold_when_lease_lost_mid_processi
     Drives the REAL backfill() service loop through expiry-during-processing:
     worker A begins the lease and starts the provider call; while the call is
     in flight the lease expires and a second worker reclaims it; worker A's
-    complete then raises ExtractionLeaseLost. The plan's conservation
+    complete then raises ExtractionLeaseLost. The conservation
     equations must hold for every report in every interleaving:
 
         eligible = processed + lease_lost
@@ -514,7 +521,7 @@ async def test_backfill_conservation_equations_hold_when_lease_lost_mid_processi
         scanned = skipped + processed + lease_lost
         skipped = sum(skip_reasons.values())
 
-    Two-worker expectation (plan 10A.8): exactly one worker reports
+    Two-worker expectation: exactly one worker reports
     processed=1/lease_lost=0; the other reports lease_lost=1.
     """
     session, engine = _transactional_session()
@@ -613,3 +620,186 @@ async def test_backfill_conservation_equations_hold_when_lease_lost_on_fail_tran
 
     session.close()
     engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Version migration, partial provider failure, and CLI exit-2 lanes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_changed_model_version_reprocesses_chunk():
+    """A chunk extracted under an older model version becomes eligible again
+    when backfill runs under a new model: the model is part of the extraction
+    identity, so no owner row exists for the new identity. The old-version
+    owner row must remain untouched (never-modify-older-version-rows)."""
+    session, engine = _session()
+    _, chunk = _ready_chunk(session)
+    session.commit()
+
+    # Prior terminal extraction under model gemma3 (distinct identity).
+    prior = persist_chunk_extraction(
+        session,
+        chunk=chunk,
+        relations=[ExtractedRelation(
+            source=ExtractedEntity(name="Subject", canonical_name="subject", entity_type="concept"),
+            predicate="describes",
+            target=ExtractedEntity(name="Object", canonical_name="object", entity_type="concept"),
+            evidence=chunk.text,
+            evidence_start=0,
+            evidence_end=len(chunk.text),
+            confidence=0.9,
+        )],
+        provider="ollama",
+        model="gemma3:latest",
+    )
+    session.commit()
+    prior_fingerprint = (
+        prior.id, prior.status, prior.attempt_count, prior.completed_at, prior.error_code,
+    )
+
+    report = await backfill(
+        session, extractor=_StaticExtractor(), provider="ollama", model="gemma4:latest"
+    )
+
+    assert report.eligible == 1
+    assert report.processed == 1
+    assert report.succeeded == 1
+    # eligible = processed + lease_lost
+    assert report.eligible == report.processed + report.lease_lost
+    # processed = succeeded + empty + failed
+    assert report.processed == report.succeeded + report.empty + report.failed
+    # scanned = skipped + processed + lease_lost
+    assert report.scanned == report.skipped + report.processed + report.lease_lost
+    # skipped = sum(skip_reasons.values())
+    assert report.skipped == sum(report.skip_reasons.values())
+
+    # Exactly two identity-owner rows: the untouched gemma3 row and the new
+    # gemma4 row, both terminal succeeded.
+    rows = (
+        session.query(models.GraphExtraction)
+        .filter(models.GraphExtraction.chunk_id == chunk.id)
+        .all()
+    )
+    assert len(rows) == 2
+    old_row = next(row for row in rows if row.model == "gemma3:latest")
+    new_row = next(row for row in rows if row.model == "gemma4:latest")
+    assert old_row.is_identity_owner is True
+    assert new_row.is_identity_owner is True
+    assert new_row.status == "succeeded"
+    # The old-version row is byte-for-byte the terminal extraction it was.
+    session.refresh(old_row)
+    assert (old_row.id, old_row.status, old_row.attempt_count, old_row.completed_at,
+            old_row.error_code) == prior_fingerprint
+    assert old_row.status == "succeeded"
+
+    session.close()
+    engine.dispose()
+
+
+class _FailSecond:
+    """Succeeds on the first provider call, raises on the second."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def extract(self, text: str):
+        self.calls += 1
+        if self.calls == 2:
+            raise GraphExtractionError("boom")
+        return [
+            ExtractedRelation(
+                source=ExtractedEntity(name="Subject", canonical_name="subject", entity_type="concept"),
+                predicate="describes",
+                target=ExtractedEntity(name="Object", canonical_name="object", entity_type="concept"),
+                evidence=text,
+                evidence_start=0,
+                evidence_end=len(text),
+                confidence=0.9,
+            )
+        ]
+
+
+@pytest.mark.asyncio
+async def test_backfill_partial_provider_failure_continues_and_commits_prior_chunks():
+    """A provider failure on one chunk fails that chunk durably while the run
+    continues, and prior successful chunks stay committed."""
+    session, engine = _session()
+    _, chunk1 = _ready_chunk(session)
+    _, chunk2 = _ready_chunk(session)
+    session.commit()
+
+    extractor = _FailSecond()
+    report = await backfill(
+        session, extractor=extractor, provider="ollama", model="gemma4:latest"
+    )
+
+    assert extractor.calls == 2  # the run continued past the first failure
+    assert report.scanned == 2
+    assert report.processed == 2
+    assert report.succeeded == 1
+    assert report.failed == 1
+    # eligible = processed + lease_lost
+    assert report.eligible == report.processed + report.lease_lost
+    # processed = succeeded + empty + failed
+    assert report.processed == report.succeeded + report.empty + report.failed
+    # scanned = skipped + processed + lease_lost
+    assert report.scanned == report.skipped + report.processed + report.lease_lost
+    # skipped = sum(skip_reasons.values())
+    assert report.skipped == sum(report.skip_reasons.values())
+
+    # Force fresh reads from the database (not the identity map) so the row
+    # states observed are the committed post-run states.
+    session.expire_all()
+    row1 = (
+        session.query(models.GraphExtraction)
+        .filter(models.GraphExtraction.chunk_id == chunk1.id)
+        .one()
+    )
+    assert row1.status == "succeeded"
+    assert row1.completed_at is not None
+    row2 = (
+        session.query(models.GraphExtraction)
+        .filter(models.GraphExtraction.chunk_id == chunk2.id)
+        .one()
+    )
+    assert row2.status == "failed"
+    assert row2.error_code == "GraphExtractionError"
+    assert row2.completed_at is not None
+
+    session.close()
+    engine.dispose()
+
+
+def test_backfill_unknown_document_id_cli_exit_2_no_writes(tmp_path):
+    """CLI: an unknown --document-id exits 2 through the ValueError branch
+    (not argparse) and writes zero extraction rows to the database."""
+    db_path = tmp_path / "backfill-cli-unknown-doc.db"
+    db_url = f"sqlite:///{db_path}"
+    upgrade_database(db_url)
+
+    env = {**os.environ, "RAG_DATABASE_URL": db_url}
+    argv = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / "backfill_graph.py"),
+        "--document-id", "999999",
+    ]
+    result = subprocess.run(
+        argv, env=env, capture_output=True, text=True,
+        cwd=PROJECT_ROOT, check=False, timeout=180,
+    )
+
+    assert result.returncode == 2
+    # Pin the branch: exit 2 came from the unknown-document ValueError, not
+    # from argparse or an extractor configuration failure.
+    assert "unknown document id" in result.stderr
+
+    verify_engine = create_engine(db_url)
+    try:
+        with verify_engine.connect() as connection:
+            count = connection.execute(
+                text("SELECT COUNT(*) FROM graph_extractions")
+            ).scalar_one()
+        assert count == 0
+    finally:
+        verify_engine.dispose()

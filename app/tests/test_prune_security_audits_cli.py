@@ -415,3 +415,67 @@ def test_prune_c8_head_non_dry_still_prunes(tmp_path):
         "SELECT COUNT(*) FROM retrieval_audits").fetchone()[0] == 0
     conn.close()
     db_path.unlink(missing_ok=True)
+
+
+# Appendix 10B.2 subprocess entries: two-batch atomic deletion over 1001
+# eligible audits and unknown-argument refusal.
+
+def test_c8_disposable_subprocess_contract_1001_audits_two_batches(tmp_path):
+    db_path = _make_disposable_db(tmp_path, audit_count=1001, completed_days_ago=60)
+    try:
+        result = _run_prune(db_path, before_days=30)
+        assert result.returncode == 0, result.stderr
+        data = json.loads(result.stdout)
+        assert data["eligible_audits"] == 1001
+        assert data["eligible_candidate_decisions"] == 1001
+        assert data["planned_batches"] == 2
+        assert data["applied_batches"] == 2
+        assert data["deleted_audits"] == 1001
+        assert data["deleted_candidate_decisions"] == 1001
+        conn = sqlite3.connect(str(db_path))
+        remaining_audits = conn.execute(
+            "SELECT COUNT(*) FROM retrieval_audits WHERE status != 'pending'"
+        ).fetchone()[0]
+        remaining_decisions = conn.execute(
+            "SELECT COUNT(*) FROM retrieval_candidate_decisions"
+        ).fetchone()[0]
+        conn.close()
+        assert remaining_audits == 0
+        assert remaining_decisions == 0
+        # Second run is idempotent (zero-count success).
+        second = _run_prune(db_path, before_days=30)
+        assert second.returncode == 0, second.stderr
+        data2 = json.loads(second.stdout)
+        assert data2["eligible_audits"] == 0
+        assert data2["deleted_audits"] == 0
+        assert data2["applied_batches"] == 0
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            p = db_path.with_name(db_path.name + suffix)
+            if p.exists():
+                p.unlink()
+
+
+def test_c8_disposable_subprocess_contract_rejects_unknown_args(tmp_path):
+    db_path = _make_disposable_db(tmp_path, audit_count=1, completed_days_ago=60)
+    try:
+        argv = [
+            sys.executable, str(PRUNE_SCRIPT),
+            "--before-days", "30",
+            "--database-url", f"sqlite:///{db_path}",
+            "--allow-disposable-database",
+            "--bogus",
+        ]
+        result = subprocess.run(argv, capture_output=True, text=True, check=False,
+                                cwd=str(PROJECT_ROOT))
+        assert result.returncode == 2
+        # The refused invocation deleted nothing.
+        conn = sqlite3.connect(str(db_path))
+        count = conn.execute("SELECT COUNT(*) FROM retrieval_audits").fetchone()[0]
+        conn.close()
+        assert count == 2  # one completed + one pending
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            p = db_path.with_name(db_path.name + suffix)
+            if p.exists():
+                p.unlink()

@@ -27,9 +27,11 @@ ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
 BASELINE_REVISION = "dee48bc24a7f"
 GRAPH_REVISION = "4c9a8d7e6f5b"
 # Merged chain head: the 10C safety-review revision d9 on top of the 10B
-# security/provenance revision c8, which sits on the 10A.3 b7 lifecycle
-# rebuild of graph_extractions.
+# decision-CHECK revision c9, which sits on the 10B security/provenance
+# revision c8 and the 10A.3 b7 lifecycle rebuild of graph_extractions.
 REVISION = "d9b5f7c1e4a3"
+SECURITY_HEAD = "c8a4e6b0d3f2"
+DECISION_CHECK_HEAD = "c9f5b3e7a1d8"
 PREDECESSOR_HEAD = "a6e2c4f8b1d9"
 NEW_HEAD = "b7f3d5a9c2e1"
 HEAD_TABLES = {
@@ -1613,7 +1615,7 @@ def test_b7_migration_fails_on_unrecognized_predecessor_status(tmp_path):
 def test_b7_migrated_schema_rejects_lifecycle_violations(
     tmp_path, status, input_sha256, attempt_count, completed_at, error_code
 ):
-    """W4: the migrated table enforces the plan's exact per-status lifecycle CHECKs."""
+    """The migrated table enforces exact per-status lifecycle CHECKs."""
     db_url = _db_url(tmp_path / f"lifecycle-{status}-{attempt_count}-{completed_at}.db")
     upgrade_database(db_url)
     engine = create_engine(db_url)
@@ -1727,7 +1729,7 @@ def test_b7_mid_upgrade_failure_rolls_back_completely_and_retry_succeeds(tmp_pat
 def test_export_unrepresentable_rows_exports_skipped_rows_preserving_database(
     tmp_path, capsys
 ):
-    """Plan B-14 (10A.3 half): the b7 downgrade-refusal export is deterministic,
+    """The b7 downgrade-refusal export is deterministic,
     exports exactly the skipped rows, and preserves every database row."""
     from scripts.export_unrepresentable_rows import export_unrepresentable_rows
 

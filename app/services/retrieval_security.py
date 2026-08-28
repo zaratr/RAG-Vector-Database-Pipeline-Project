@@ -183,6 +183,11 @@ class Candidate:
     graph_score: float | None = None    # graph relevance score (graph origins)
     hop: int | None = None              # minimum hop count (graph origins)
     hybrid_score: float | None = None   # fused RRF score (hybrid mode)
+    # Grounding inputs (plan §10B.2 five-component formula): the nonempty
+    # server-recorded ingestion origin and graph-evidence presence feed the
+    # +0.15/+0.15 components of the persisted provenance score.
+    ingestion_origin: str = ""
+    has_graph_evidence: bool = False
 
     def native_distance(self) -> float:
         """The candidate's native L2 distance (explicit distance, else native_score)."""
@@ -393,16 +398,28 @@ def _sequential_filter(
         doc_counts[cand.document_id] = doc_count + 1
         source_counts[cand.source] = source_count + 1
         emitted += 1
-        # Compute actual provenance score from trust tier + grounding factors.
-        from app.services.provenance import provenance_score as compute_ps
+        # Selected: compute the provenance score from the documented
+        # five-component grounding formula (plan §10B.2): +0.25 canonical
+        # vector ID matched SQL, +0.25 authoritative SQL text hash matched,
+        # +0.20 ready document, +0.15 nonempty server-recorded ingestion
+        # origin, +0.15 graph evidence with valid FKs. Every candidate here
+        # was hydrated through the exact SQL vector-ID lookup, so the first
+        # two components hold by construction; the remaining three come from
+        # the candidate's SQL-hydrated document state and retrieval origin.
+        from app.services.provenance import (
+            compute_grounding_score,
+            provenance_score as compute_ps,
+        )
         trust_map = {"trusted": 1.0, "standard": 0.5, "untrusted": 0.2, "blocked": 0.0}
         t_score = trust_map.get(cand.trust_tier, 0.2)
-        g_score = 0.0
-        if cand.document_ready:
-            g_score += 0.20
-        g_score += 0.25  # vector ID matched SQL (already hydrated)
-        g_score += 0.25  # text hash matched (SQL authoritative)
-        ps = compute_ps(trust_score=t_score, grounding_score=min(1.0, g_score))
+        g_score, _grounding_reasons = compute_grounding_score(
+            vector_id_matches_sql=True,
+            text_hash_matches=True,
+            document_ready=cand.document_ready,
+            has_ingestion_origin=bool(cand.ingestion_origin),
+            has_graph_evidence=cand.has_graph_evidence,
+        )
+        ps = compute_ps(trust_score=t_score, grounding_score=g_score)
         decisions.append(RetrievalSecurityDecision(
             chunk_id=cand.chunk_id, decision="selected",
             native_score=cand.native_score, provenance_score=ps,

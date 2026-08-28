@@ -1,15 +1,14 @@
-"""Phase 10A.7 — graph inspection API tests (appendix 10A.7, P7 remediation).
+"""Graph inspection API tests.
 
-Implements every test function specified in the phase-10 test specifications
-appendix (Task 10A.7) plus the P7 remediation regressions:
+Covers the graph inspection surface plus regression tests:
 
-- F8: OpenAPI must document the canonical ``GraphPath``/``GraphPathStep``
+- OpenAPI must document the canonical ``GraphPath``/``GraphPathStep``
   step fields for ``POST /graph/paths`` (impossible while ``paths`` was
   typed ``List[dict]``).
-- F15(a): relationship items sort by canonical names, not entity IDs.
-- F15(b): ``POST /graph/paths`` ``limit`` outside 1–50 returns 422.
-- W5: ``document_id`` filters reject non-integer forms ("7", 7.0, booleans).
-- W6: prefix/contains matching escapes LIKE wildcards so literal ``%`` and
+- Relationship items sort by canonical names, not entity IDs.
+- ``POST /graph/paths`` ``limit`` outside 1–50 returns 422.
+- ``document_id`` filters reject non-integer forms ("7", 7.0, booleans).
+- Prefix/contains matching escapes LIKE wildcards so literal ``%`` and
   ``_`` in entity names match literally.
 """
 from __future__ import annotations
@@ -164,7 +163,7 @@ def seeded_graph():
 
 
 # ---------------------------------------------------------------------------
-# Appendix 10A.7 — GET /graph/entities
+# GET /graph/entities
 # ---------------------------------------------------------------------------
 
 
@@ -241,7 +240,7 @@ def test_get_graph_entities_excludes_orphans_without_ready_evidence():
 
 
 # ---------------------------------------------------------------------------
-# Appendix 10A.7 — GET /graph/entities/{entity_id}/relationships
+# GET /graph/entities/{entity_id}/relationships
 # ---------------------------------------------------------------------------
 
 
@@ -299,7 +298,7 @@ def test_get_relationships_valid_entity_with_no_ready_evidence_returns_200_empty
 
 
 # ---------------------------------------------------------------------------
-# Appendix 10A.7 — POST /graph/paths
+# POST /graph/paths
 # ---------------------------------------------------------------------------
 
 
@@ -317,7 +316,7 @@ def test_post_graph_paths_returns_complete_graphpathstep_objects(seeded_graph):
     for key in ("seed_entity_id", "terminal_entity_id", "hop_count", "steps", "score"):
         assert key in first
     step = first["steps"][0]
-    # exact GraphPathStep field set from 10A.5
+    # exact GraphPathStep field set
     for key in ("edge_id", "evidence_id", "source_entity_id", "source",
                 "source_type", "predicate", "target_entity_id", "target",
                 "target_type", "chunk_id", "document_id", "evidence",
@@ -380,7 +379,7 @@ def test_post_graph_paths_unsupported_filter_returns_422(seeded_graph):
 
 
 # ---------------------------------------------------------------------------
-# Appendix 10A.7 — /query pin + inspection-route purity + OpenAPI
+# /query pin + inspection-route purity + OpenAPI
 # ---------------------------------------------------------------------------
 
 
@@ -413,7 +412,7 @@ def test_graph_paths_openapi_schema_documents_all_fields():
     schema = client.get("/openapi.json").json()
     assert "/graph/paths" in schema["paths"]
     assert "post" in schema["paths"]["/graph/paths"]
-    # F8: the canonical GraphPath/GraphPathStep models must document every
+    # The canonical GraphPath/GraphPathStep models must document every
     # step field (impossible while paths was typed List[dict]).
     components = schema["components"]["schemas"]
     assert "GraphPath" in components
@@ -429,13 +428,13 @@ def test_graph_paths_openapi_schema_documents_all_fields():
 
 
 # ---------------------------------------------------------------------------
-# P7 remediation — F15(b): POST /graph/paths limit bounds
+# POST /graph/paths limit bounds
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("limit", [0, 51])
 def test_post_graph_paths_rejects_out_of_range_limit(limit, seeded_graph):
-    """Plan 10A.5 caps returned paths at 50; limit outside 1-50 is invalid
+    """Returned paths are capped at 50; limit outside 1-50 is invalid
     input and must map to 422, never a 200."""
     response = client.post("/graph/paths", json={
         "query": "User", "max_hops": 2, "direction": "outbound",
@@ -445,7 +444,7 @@ def test_post_graph_paths_rejects_out_of_range_limit(limit, seeded_graph):
 
 
 # ---------------------------------------------------------------------------
-# P7 remediation — F15(a): relationship items sort by canonical names
+# Relationship items sort by canonical names
 # ---------------------------------------------------------------------------
 
 
@@ -464,7 +463,7 @@ def reverse_order_targets(seeded_graph):
 
 
 def test_get_relationships_items_sort_by_canonical_names(seeded_graph, reverse_order_targets):
-    """Plan 10A.7 ~L822: items sort by source canonical name, predicate,
+    """Items sort by source canonical name, predicate,
     target canonical name, edge ID — not by entity IDs."""
     document, user_entity_id = seeded_graph
     response = client.get(f"/graph/entities/{user_entity_id}/relationships",
@@ -484,13 +483,13 @@ def test_get_relationships_items_sort_by_canonical_names(seeded_graph, reverse_o
 
 
 # ---------------------------------------------------------------------------
-# P7 remediation — W5: typed document_id filter validation
+# Typed document_id filter validation
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("bad_value", ["7", 7.0, True])
 def test_post_graph_paths_rejects_non_integer_document_id_filter(bad_value, seeded_graph):
-    """Plan 10A.5 scalar filter matrix: document_id is integer equality;
+    """Scalar filter matrix: document_id is integer equality;
     strings, floats, and booleans are invalid integer forms -> 422."""
     response = client.post("/graph/paths", json={
         "query": "User", "max_hops": 2, "direction": "outbound",
@@ -517,7 +516,7 @@ def test_post_graph_paths_accepts_integer_document_id_filter(seeded_graph):
 
 
 # ---------------------------------------------------------------------------
-# P7 remediation — W6: LIKE wildcard escaping in prefix/contains matching
+# LIKE wildcard escaping in prefix/contains matching
 # ---------------------------------------------------------------------------
 
 

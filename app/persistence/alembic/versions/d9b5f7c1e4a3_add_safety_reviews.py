@@ -1,7 +1,7 @@
 """add safety reviews
 
 Revision ID: d9b5f7c1e4a3
-Revises: c8a4e6b0d3f2
+Revises: c9f5b3e7a1d8
 Create Date: 2026-08-15
 
 Task 10C.4 sole forward owner of all 10C physical changes:
@@ -14,15 +14,22 @@ Task 10C.4 sole forward owner of all 10C physical changes:
   ``safety_blocked`` (skipped rows still require ``completed_at IS NOT NULL``
   and ``attempt_count = 0``);
 * deterministically rebuilds ``retrieval_candidate_decisions`` with the exact
-  c8 layout but expands the decision vocabulary to include
+  predecessor layout but expands the decision vocabulary to include
   ``rejected_safety``.
+
+Chain note (content-safety + rag-poisoning merge): this revision is layered
+on ``c9f5b3e7a1d8`` (decision CHECK), which sits on ``c8a4e6b0d3f2``. The
+rebuilt ``ck_candidate_decisions_decision`` CHECK is the c9 seven-value
+vocabulary plus ``rejected_safety``, so the merge preserves c9's physical
+constraint at and below this revision; the downgrade rebuild restores the
+exact c9 layout.
 
 Rebuild procedure: create ``_d9_new`` with the literal schema, copy every
 column ordered by PK, assert source/destination row counts and canonical PK
 fingerprints equal, drop the predecessor, rename, recreate every index.
 ``PRAGMA foreign_key_check`` must pass before commit. Downgrade refuses with
 a typed error while any ``safety_blocked`` or ``rejected_safety`` row exists,
-then performs the inverse rebuilds restoring the exact b7/c8 checks.
+then performs the inverse rebuilds restoring the exact b7/c9 checks.
 """
 from __future__ import annotations
 
@@ -34,7 +41,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "d9b5f7c1e4a3"
-down_revision: Union[str, None] = "c8a4e6b0d3f2"
+down_revision: Union[str, None] = "c9f5b3e7a1d8"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -157,6 +164,16 @@ _DECISION_CONSTRAINT_D9 = (
     "'rejected_injection', 'rejected_safety'))"
 )
 
+# The direct predecessor c9f5b3e7a1d8 constrains decisions to the seven
+# 10B.3 values; the downgrade rebuild restores that exact layout (the
+# further c9 -> c8 downgrade drops the CHECK itself).
+_DECISION_CONSTRAINT_C9 = (
+    ",\n    CONSTRAINT ck_candidate_decisions_decision CHECK (decision IN "
+    "('selected', 'rejected_distance', 'rejected_blocked_source', "
+    "'rejected_source_cap', 'rejected_document_cap', 'rejected_duplicate', "
+    "'rejected_injection'))"
+)
+
 
 def _decisions_ddl(decision_constraint: str) -> str:
     return (
@@ -186,7 +203,7 @@ def _decisions_ddl(decision_constraint: str) -> str:
 
 
 _DECISIONS_D9_DDL = _decisions_ddl(_DECISION_CONSTRAINT_D9)
-_DECISIONS_C8_DDL = _decisions_ddl("")
+_DECISIONS_C9_DDL = _decisions_ddl(_DECISION_CONSTRAINT_C9)
 
 _DECISIONS_INDEXES = tuple(
     f"CREATE INDEX {name} ON retrieval_candidate_decisions "
@@ -442,7 +459,7 @@ def downgrade() -> None:
             f"d9b5f7c1e4a3 while {rejected} rejected_safety row(s) exist"
         )
 
-    # Inverse rebuilds restore the exact b7/c8 checks; rows/IDs preserved.
+    # Inverse rebuilds restore the exact b7/c9 checks; rows/IDs preserved.
     _drop_indexes(bind, ("uq_graph_extractions_identity_owner",))
     _rebuild_table(
         bind, "graph_extractions", _GRAPH_EXTRACTION_COLUMNS,
@@ -450,7 +467,7 @@ def downgrade() -> None:
     _drop_indexes(bind, _DECISION_INDEX_NAMES)
     _rebuild_table(
         bind, "retrieval_candidate_decisions", _DECISION_COLUMNS,
-        _DECISIONS_C8_DDL, _DECISIONS_INDEXES)
+        _DECISIONS_C9_DDL, _DECISIONS_INDEXES)
 
     op.drop_table("safety_findings")
     op.drop_table("safety_review_runs")

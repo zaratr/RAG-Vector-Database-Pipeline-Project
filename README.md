@@ -55,7 +55,7 @@ The committed example uses `gemma4`. Adjust the model name if your Ollama instal
 cp .env.example .env
 ```
 
-The default Docker-oriented settings are:
+Copying `.env.example` enables the production recipe below (the hermetic/local recipe is documented in the same file and needs no services):
 
 ```env
 RAG_LLM_PROVIDER=ollama
@@ -240,7 +240,7 @@ docker compose exec api python scripts/backfill_graph.py --document-id 3
 docker compose exec api python scripts/backfill_graph.py --retry-failed
 ```
 
-`--batch-size` accepts `1–100` (default 20). `--document-id` restricts the scan to one document. `--dry-run` classifies eligibility without calling the extraction provider. `--retry-failed` re-attempts chunks whose current identity owner previously failed or whose lease has expired. Backfill never modifies vector IDs, Chroma records, document readiness, or provenance rows owned by other extraction identities. Each run prints one sorted JSON counter report (`scanned`, `eligible`, `processed`, `succeeded`, `skipped`, `empty`, `failed`, `lease_lost`, `relations`, and `skip_reasons`).
+`--document-id` restricts the scan to one document. `--dry-run` classifies eligibility without calling the extraction provider. `--retry-failed` re-attempts chunks whose current identity owner previously failed or whose lease has expired. Backfill never modifies vector IDs, Chroma records, document readiness, or provenance rows owned by other extraction identities. Each run prints one sorted JSON counter report (`scanned`, `eligible`, `processed`, `succeeded`, `skipped`, `empty`, `failed`, `lease_lost`, `relations`, and `skip_reasons`).
 
 Exit codes: `0` when no chunk failed (including no-op runs), `1` when one or more chunks failed (successful chunks remain committed), and `2` for invalid arguments, configuration failure, or a fatal database error.
 
@@ -257,6 +257,28 @@ The CLI traverses the persisted relational graph through the SQL-authoritative `
 ```bash
 docker compose exec api python -m pytest -q
 ```
+
+#### Running the tests without any services
+
+The suite is hermetic: it needs no Ollama, no Chroma server, and no
+`fastembed` model downloads. From a clean checkout, with only the pinned
+dependencies installed (for example in a project venv):
+
+```bash
+python -m pytest -q
+```
+
+The application defaults already select the hermetic configuration
+(`RAG_EMBEDDING_PROVIDER=local`, no Chroma host → ephemeral client). If a
+local `.env` selects the production recipe instead, override it for the run:
+
+```bash
+RAG_EMBEDDING_PROVIDER=local RAG_CHROMA_HOST= python -m pytest -q
+```
+
+One test is skipped by default: `test_rag_api.py::test_query_answer_lane_with_live_llm_optin`
+is an opt-in lane that exercises the real LLM only when the `RAG_LIVE_LLM`
+environment variable is set and the configured `RAG_LLM_BASE_URL` answers.
 
 
 ### 10. Stop or reset
@@ -352,7 +374,9 @@ a6e2c4f8b1d9  database constraint for document lifecycle states
       ↓
 b7f3d5a9c2e1  hardened graph extraction lifecycle: idempotent identity owner, attempt counters, pending lease
       ↓
-c8a4e6b0d3f2  security provenance and audits: document trust fields, retrieval audits/decisions, ingestion rate buckets (head)
+c8a4e6b0d3f2  security provenance and audits: document trust fields, retrieval audits/decisions, ingestion rate buckets
+      ↓
+c9f5b3e7a1d8  candidate decision CHECK: retrieval_candidate_decisions.decision restricted to the 10B.3 decision enum (head)
 ```
 
 Application import and API startup do not run migrations. The one-shot `migrate` Compose service owns schema adoption and upgrades.
@@ -370,7 +394,7 @@ All application settings use the `RAG_` prefix and load from `.env`.
 | `RAG_GRAPH_EXTRACTION_MODEL` | answer model | `gemma4` | Optional extraction-specific model |
 | `RAG_GRAPH_MAX_HOPS` | `2` | `2` | Configured hop bound; HTTP requests currently use their own validated `graph_max_hops` field (default 2, range 1–3) |
 | `RAG_EXTRACTION_LEASE_SECONDS` | `600` | `600` | Graph extraction lease duration in seconds (range 60–3600); an expired pending lease can be reclaimed by a backfill retry, and reconciliation terminalizes still-pending extractions as failed |
-| `RAG_EMBEDDING_PROVIDER` | `fastembed` | `fastembed` | `local`, `fastembed`, or `openai` |
+| `RAG_EMBEDDING_PROVIDER` | `local` | `fastembed` | `local`, `fastembed`, or `openai`; `local` uses deterministic hash embeddings (no model download), `fastembed` produces real 768-dimensional CLIP embeddings |
 | `RAG_EMBEDDING_MODEL` | `jinaai/jina-clip-v1` | same | Embedding model |
 | `RAG_DATABASE_URL` | `sqlite:///./rag.db` | `sqlite:////data/rag.db` | SQLAlchemy database URL |
 | `RAG_CHROMA_HOST` | empty | `vectordb` | Chroma host; empty selects standalone modes |

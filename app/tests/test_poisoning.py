@@ -317,6 +317,15 @@ def _run_calibrator(monkeypatch, tmp_path, *, db_url=None, run_id=None,
         sys.argv = old_argv
 
 
+_POSIX_ONLY_CALIBRATOR = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="calibration CLI pins disposable/production DB URLs to POSIX "
+    "absolute /tmp paths as an operational-safety guard (destructive-tool "
+    "path restriction); this lane executes on POSIX filesystems only",
+)
+
+
+@_POSIX_ONLY_CALIBRATOR
 def test_two_calibration_runs_produce_byte_identical_policy(tmp_path):
     run1, run2 = _two_disposable_runs(tmp_path)
     assert run1["policy_bytes"] == run2["policy_bytes"]
@@ -474,6 +483,7 @@ def test_sentinel_distance_greater_than_last_is_used_when_finite():
     assert math.isfinite(sentinel)
 
 
+@_POSIX_ONLY_CALIBRATOR
 def test_no_passing_threshold_exits_one_without_replacement(tmp_path, monkeypatch):
     import importlib.util
 
@@ -677,6 +687,7 @@ def test_disposable_sql_isolation_refuses_symlink_to_production(tmp_path, monkey
         link.unlink(missing_ok=True)
 
 
+@_POSIX_ONLY_CALIBRATOR
 def test_disposable_collection_cleanup_in_finally(tmp_path, monkeypatch):
     from unittest.mock import patch
 
