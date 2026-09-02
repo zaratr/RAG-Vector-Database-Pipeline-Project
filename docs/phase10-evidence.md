@@ -41,11 +41,11 @@ test path :: name, live command (hermetic), expected invariant.
 | [EVID-DOC1-06] | DOC.1 | Cleanup of temporary container and tarball in `finally` | `scripts/validate_image_hygiene.py` :: `main` (finally) | `app/tests/test_image_hygiene_script.py` :: `test_cleanup_removes_container_and_tarball_in_finally` | `RAG_EMBEDDING_PROVIDER=local RAG_CHROMA_HOST= python -m pytest -q app/tests/test_image_hygiene_script.py` | `docker rm` issued even on scan failure; `cleanup_complete: true`; rm/export failure → exit 2 |
 | [EVID-DOC1-07] | DOC.1 | Subprocess argv discipline: exact docker argv, `shell=False`, no socket mount | `scripts/validate_image_hygiene.py` :: `_run` | `app/tests/test_image_hygiene_script.py` :: `test_export_uses_docker_export_to_host_tar`, `::test_no_shell_true_in_any_subprocess_call`, `::test_no_docker_socket_mounted` | `RAG_EMBEDDING_PROVIDER=local RAG_CHROMA_HOST= python -m pytest -q app/tests/test_image_hygiene_script.py` | `docker create --entrypoint /bin/true`, exactly `["docker","export",<id>]`, `docker rm`; no `shell=True`; no `/var/run/docker.sock` in any argv |
 | [EVID-DOC1-08] | DOC.1 (Amendment 2 split) | Envelope over-limit rejection is pinned per path | `app/main.py` :: `BoundedReceiveMiddleware` | `app/tests/test_ingestion_limits.py` :: `test_request_envelope_one_byte_over_limit_rejected_before_handler` (pins `request_too_large`) and `::test_request_envelope_streamed_count_over_limit_rejected_before_handler` (pins `request_envelope_too_large`) | `RAG_EMBEDDING_PROVIDER=local RAG_CHROMA_HOST= python -m pytest -q app/tests/test_ingestion_limits.py` | Production behavior unchanged: 413 before the handler on both the Content-Length fast path and the streamed-count path |
-| [EVID-DOC1-SUITE] | DOC.1 (Amendment 1 R1) | Hermetic full-suite collection count | repository test suite | `app/tests/` (full suite) | `RAG_EMBEDDING_PROVIDER=local RAG_CHROMA_HOST= python -m pytest --collect-only -q` | A clean clone collects the full suite with zero errors (951 tests at the DOC.1 branch point); full run passes with only declared environment-conditional skips |
+| [EVID-DOC1-SUITE] | DOC.1 (Amendment 1 R1) | Hermetic full-suite collection count | repository test suite | `app/tests/` (full suite) | `RAG_EMBEDDING_PROVIDER=local RAG_CHROMA_HOST= python -m pytest --collect-only -q` | A clean clone collects the full suite with zero errors (954 tests after the post-approval scanner defect fixes and their three regression lanes); full run passes with only declared environment-conditional skips |
 
 ## Limitations
 
-Windows-bare only; 20 lanes never executed on POSIX (POSIX CI deferred by
+Windows-bare only; 19 lanes never executed on POSIX (POSIX CI deferred by
 owner). Every command recorded in this map was executed on a bare Windows
 host with the project virtualenv interpreter. The suite's POSIX-only lanes
 (retrieval-security calibration runs, the phase-10D attack-harness
@@ -95,6 +95,12 @@ adaptation versus the appendix sketch:
    context-security still match, and retrieval-security
    (`1cc5310fffaf28bbefcf2debf6aa5fbf31ff88d81d7997d77d5c96f0c2acf1bf`)
    was added so the inventory covers all four committed policies.
+
+Post-approval corrections recorded here: (a) the owner's "20 lanes never
+executed on POSIX" figure was corrected to the verified on-disk actuals
+(19 POSIX-only + 3 opt-in = 22 skipped); and (b) the 10D D4 envelope
+over-limit lane split (Amendment 2) is necessarily net +1 test, which is
+the ratified basis for the final collected count.
 
 Additionally, the `test_allowed_attack_fixtures_pass` lane maps image paths
 to repository paths by stripping the image root prefix (`/app/`) — the

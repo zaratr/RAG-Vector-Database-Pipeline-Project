@@ -122,7 +122,8 @@ Its behavior is pinned by 27 hermetic lanes with zero Docker dependency
 [EVID-DOC1-04][EVID-DOC1-05][EVID-DOC1-06][EVID-DOC1-07].
 
 **Test suite.** A clean clone collects the full hermetic suite with zero
-collection errors (951 tests at the DOC.1 branch point) [EVID-DOC1-SUITE];
+collection errors (954 tests after the post-approval scanner defect
+fixes and their three regression lanes) [EVID-DOC1-SUITE];
 see *Running the tests without any services* below for the recipe. The
 evidence map itself was validated on a bare Windows host; the POSIX-only
 lanes documented below have never been executed on POSIX
