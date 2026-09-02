@@ -118,12 +118,13 @@ matched credential bytes. Run it as:
 python scripts/validate_image_hygiene.py --manifest <source-manifest.json> --services api migrate
 ```
 
-Its behavior is pinned by 27 hermetic lanes with zero Docker dependency
+Its behavior is pinned by 31 hermetic lanes with zero Docker dependency
 [EVID-DOC1-04][EVID-DOC1-05][EVID-DOC1-06][EVID-DOC1-07].
 
 **Test suite.** A clean clone collects the full hermetic suite with zero
-collection errors (954 tests after the post-approval scanner defect
-fixes and their three regression lanes) [EVID-DOC1-SUITE];
+collection errors (955 tests after the post-approval scanner defect
+fixes and their four regression lanes, plus the dev-seed child-env
+hermeticity fix) [EVID-DOC1-SUITE];
 see *Running the tests without any services* below for the recipe. The
 evidence map itself was validated on a bare Windows host; the POSIX-only
 lanes documented below have never been executed on POSIX
