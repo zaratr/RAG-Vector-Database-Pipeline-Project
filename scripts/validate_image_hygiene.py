@@ -64,7 +64,9 @@ ATTACK_FIXTURE_ALLOWLIST = {
 
 _FORBIDDEN_DB_BASENAMES = {"rag.db", "rag.db-wal", "rag.db-shm"}
 _REPORT_FILE_RE = re.compile(r"^(redteam|red-team|phase10).*\.(json|md)$", re.IGNORECASE)
-_DRIVE_LETTER_RE = re.compile(r"^[a-z]$")
+# Host-absolute path forms: POSIX single-letter roots ("/c/Users/...") and
+# Windows drive+colon forms ("C:/Users/...", "C:\\Users\\...").
+_HOST_ABSOLUTE_COMPONENT_RE = re.compile(r"^[a-z](?::|$)", re.IGNORECASE)
 _HOST_ROOT_COMPONENTS = {"users", "host", "host_mnt"}
 
 # Credential key/value sentinels: an uppercase env-style KEY=VALUE line with
@@ -103,8 +105,17 @@ def _is_inside_container() -> bool:
 
 def _run(argv: list[str], *, text: bool = True) -> subprocess.CompletedProcess:
     """Every subprocess call in this scanner goes through here: argv list,
-    never a shell string, never ``shell=True``, never a Docker socket mount."""
-    return subprocess.run(argv, capture_output=True, text=text)
+    never a shell string, never ``shell=True``, never a Docker socket mount.
+
+    A missing required binary (e.g. no ``docker`` on PATH) is a clean,
+    bounded failure — never an unhandled traceback."""
+    try:
+        return subprocess.run(argv, capture_output=True, text=text)
+    except FileNotFoundError:
+        empty = "" if text else b""
+        return subprocess.CompletedProcess(
+            argv, 127, stdout=empty,
+            stderr=f"required executable not found: {Path(argv[0]).name}")
 
 
 def _normalize_member(name: str) -> str:
@@ -210,6 +221,17 @@ def _scan_tarball(tar_path: Path, forbidden: list[str]) -> int:
     with tarfile.open(tar_path, "r") as tf:
         members = tf.getmembers()
         hidden, prefixes = _whiteouts(members)
+        # The image namespace: every member path visible in the final merged
+        # rootfs (after whiteout filtering).  A symlink whose lexical target
+        # resolves to a path that is not part of the image points outside the
+        # image namespace.
+        namespace = set()
+        for info in members:
+            if PurePosixPath(info.name.replace("\\", "/")).name.startswith(".wh."):
+                continue
+            member_path = _normalize_member(info.name)
+            if not _is_hidden(member_path, hidden, prefixes):
+                namespace.add(member_path)
         for info in members:
             path = _normalize_member(info.name)
             base = PurePosixPath(path).name
@@ -223,9 +245,21 @@ def _scan_tarball(tar_path: Path, forbidden: list[str]) -> int:
                     ".." in parts:
                 forbidden.append(f"path traversal member: {info.name}")
                 continue
-            # Escaping symlink: lexically resolved target outside /app.
+            # Escaping symlink.  A symlink is "escaping" only when it
+            # (i) resolves via a ".." chain above the image's virtual root,
+            # (ii) targets a host-absolute path form (Windows drive+colon
+            # or POSIX single-letter root), or (iii) resolves to a path
+            # outside the image namespace.  A symlink that merely points
+            # elsewhere WITHIN the image filesystem (e.g. a Debian OS
+            # symlink "/bin -> usr/bin") is legitimate and not flagged.
             if info.issym():
                 target = info.linkname.replace("\\", "/")
+                stripped = target.lstrip("/")
+                host_absolute = bool(
+                    stripped
+                    and _HOST_ABSOLUTE_COMPONENT_RE.match(
+                        stripped.split("/")[0])
+                )
                 if target.startswith("/"):
                     base_path = ""
                 else:
@@ -233,6 +267,7 @@ def _scan_tarball(tar_path: Path, forbidden: list[str]) -> int:
                 stack: list[str] = [
                     p for p in base_path.split("/") if p not in ("", ".")
                 ]
+                escaped_root = False
                 for part in target.split("/"):
                     if part in ("", "."):
                         continue
@@ -240,11 +275,15 @@ def _scan_tarball(tar_path: Path, forbidden: list[str]) -> int:
                         if stack:
                             stack.pop()
                         else:
-                            break
+                            escaped_root = True
                     else:
                         stack.append(part)
                 norm = "/" + "/".join(stack)
-                if not (norm == "/app" or norm.startswith("/app/")):
+                if host_absolute:
+                    forbidden.append(
+                        f"host absolute path member: {path} "
+                        f"(symlink target)")
+                elif escaped_root or norm not in namespace:
                     forbidden.append(f"escaping symlink member: {info.name}")
                 continue
             if info.islnk():
@@ -258,7 +297,8 @@ def _scan_tarball(tar_path: Path, forbidden: list[str]) -> int:
             first = lowered_parts[0] if lowered_parts else ""
             # Host absolute path members (Windows drive-style roots, /Users,
             # host bind mounts) never belong in a Linux image rooted at /app.
-            if _DRIVE_LETTER_RE.match(first) or first in _HOST_ROOT_COMPONENTS:
+            if _HOST_ABSOLUTE_COMPONENT_RE.match(first) or \
+                    first in _HOST_ROOT_COMPONENTS:
                 forbidden.append(f"host absolute path member: {path}")
                 continue
             if ".git" in lowered_parts:

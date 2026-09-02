@@ -21,7 +21,6 @@ import runpy
 import subprocess
 import sys
 import tarfile
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -157,7 +156,7 @@ def _load_scanner_module():
 # substance, runnable anywhere with zero Docker dependency.)
 # ---------------------------------------------------------------------------
 
-def test_script_is_host_side_never_runs_inside_api(monkeypatch, capsys):
+def test_script_is_host_side_never_runs_inside_api(monkeypatch, tmp_path, capsys):
     scanner = _load_scanner_module()
     # Positive: when container markers are present the scanner refuses.
     monkeypatch.setattr(scanner, "_is_inside_container", lambda: True)
@@ -167,18 +166,15 @@ def test_script_is_host_side_never_runs_inside_api(monkeypatch, capsys):
     assert "host" in err or "container" in err
     # Negative: on the host the guard passes and a clean scan proceeds.
     monkeypatch.setattr(scanner, "_is_inside_container", lambda: False)
-    scratch = Path(tempfile.mkdtemp())
-    tarball = _build_synthetic_tarball(scratch, members=[("/app/app/main.py", b"")])
+    tarball = _build_synthetic_tarball(tmp_path, members=[("/app/app/main.py", b"")])
     monkeypatch.setattr(subprocess, "run", _fake_run_creating_container(tarball))
-    assert scanner.main(["--manifest", str(scratch / "manifest.json"),
+    assert scanner.main(["--manifest", str(tmp_path / "manifest.json"),
                          "--services", "api"]) == 0
 
 
-def test_no_docker_socket_mounted(monkeypatch):
+def test_no_docker_socket_mounted(monkeypatch, tmp_path):
     # Inspect every subprocess.run argv the script issues; assert no -v /var/run/docker.sock.
-    import tempfile
-    scratch = Path(tempfile.mkdtemp())
-    tarball = _build_synthetic_tarball(scratch, members=[])
+    tarball = _build_synthetic_tarball(tmp_path, members=[])
     base = _fake_run_creating_container(tarball)
     recorded = []
 
@@ -195,11 +191,9 @@ def test_no_docker_socket_mounted(monkeypatch):
             f"scanner must not mount the Docker socket: {argv}"
 
 
-def test_missing_image_returns_exit_two(monkeypatch):
+def test_missing_image_returns_exit_two(monkeypatch, tmp_path):
     # Mock `docker compose images -q api` to return empty; assert exit 2.
-    import tempfile
-    scratch = Path(tempfile.mkdtemp())
-    tarball = _build_synthetic_tarball(scratch, members=[])
+    tarball = _build_synthetic_tarball(tmp_path, members=[])
     base = _fake_run_creating_container(tarball)
 
     def fake_run(argv, **kwargs):
@@ -212,11 +206,9 @@ def test_missing_image_returns_exit_two(monkeypatch):
     assert result.returncode == 2
 
 
-def test_ambiguous_image_id_returns_exit_two(monkeypatch):
+def test_ambiguous_image_id_returns_exit_two(monkeypatch, tmp_path):
     # Mock two image IDs returned; assert exit 2.
-    import tempfile
-    scratch = Path(tempfile.mkdtemp())
-    tarball = _build_synthetic_tarball(scratch, members=[])
+    tarball = _build_synthetic_tarball(tmp_path, members=[])
     base = _fake_run_creating_container(tarball)
 
     def fake_run(argv, **kwargs):
@@ -233,12 +225,10 @@ def test_ambiguous_image_id_returns_exit_two(monkeypatch):
     assert result.returncode == 2
 
 
-def test_label_mismatch_returns_exit_two(monkeypatch):
+def test_label_mismatch_returns_exit_two(monkeypatch, tmp_path):
     # Mock docker inspect to return labels that don't match the manifest;
     # assert exit 2.
-    import tempfile
-    scratch = Path(tempfile.mkdtemp())
-    tarball = _build_synthetic_tarball(scratch, members=[])
+    tarball = _build_synthetic_tarball(tmp_path, members=[])
     base = _fake_run_creating_container(tarball)
 
     def fake_run(argv, **kwargs):
@@ -256,11 +246,9 @@ def test_label_mismatch_returns_exit_two(monkeypatch):
     assert result.returncode == 2
 
 
-def test_default_label_rejected(monkeypatch):
+def test_default_label_rejected(monkeypatch, tmp_path):
     # Labels containing the zero/unknown defaults -> exit 2.
-    import tempfile
-    scratch = Path(tempfile.mkdtemp())
-    tarball = _build_synthetic_tarball(scratch, members=[])
+    tarball = _build_synthetic_tarball(tmp_path, members=[])
     base = _fake_run_creating_container(tarball)
 
     def fake_run(argv, **kwargs):
@@ -518,11 +506,9 @@ def test_synthetic_tarball_whiteout_honored(monkeypatch, tmp_path):
                    for a in out["forbidden_artifacts"])
 
 
-def test_create_uses_entrypoint_bin_true(monkeypatch):
+def test_create_uses_entrypoint_bin_true(monkeypatch, tmp_path):
     # Inspect the docker create argv; assert --entrypoint /bin/true.
-    import tempfile
-    scratch = Path(tempfile.mkdtemp())
-    tarball = _build_synthetic_tarball(scratch, members=[])
+    tarball = _build_synthetic_tarball(tmp_path, members=[])
     base = _fake_run_creating_container(tarball)
     recorded = []
 
@@ -541,11 +527,9 @@ def test_create_uses_entrypoint_bin_true(monkeypatch):
         assert call[idx + 1] == "/bin/true"
 
 
-def test_export_uses_docker_export_to_host_tar(monkeypatch):
+def test_export_uses_docker_export_to_host_tar(monkeypatch, tmp_path):
     # Inspect the export argv; assert docker export <id> > tar.
-    import tempfile
-    scratch = Path(tempfile.mkdtemp())
-    tarball = _build_synthetic_tarball(scratch, members=[])
+    tarball = _build_synthetic_tarball(tmp_path, members=[])
     base = _fake_run_creating_container(tarball)
     recorded = []
 
@@ -566,11 +550,9 @@ def test_export_uses_docker_export_to_host_tar(monkeypatch):
         assert len(call) == 3
 
 
-def test_no_shell_true_in_any_subprocess_call(monkeypatch):
+def test_no_shell_true_in_any_subprocess_call(monkeypatch, tmp_path):
     # Every subprocess.run issued by the scanner must use shell=False (default).
-    import tempfile
-    scratch = Path(tempfile.mkdtemp())
-    tarball = _build_synthetic_tarball(scratch, members=[])
+    tarball = _build_synthetic_tarball(tmp_path, members=[])
     base = _fake_run_creating_container(tarball)
     seen_kwargs = []
 
@@ -620,3 +602,57 @@ def test_exit_two_on_export_failure(monkeypatch, tmp_path):
     assert result.returncode == 2
     # The finally clause must still remove the temporary container.
     assert any(a[:2] == ["docker", "rm"] for a in recorded)
+
+
+# ---------------------------------------------------------------------------
+# Regression lanes (post-approval scanner defect fixes A/B): an in-image OS
+# symlink is legitimate; Windows drive+colon member forms are host-absolute.
+# ---------------------------------------------------------------------------
+
+def test_regression_in_image_os_symlink_not_flagged(monkeypatch, tmp_path):
+    # A Debian-style "/bin -> usr/bin" OS symlink lives entirely within the
+    # image filesystem (its target is an image member); the scan must pass.
+    tarball = tmp_path / "debian-style.tar"
+    with tarfile.open(tarball, "w") as tf:
+        link = tarfile.TarInfo("/bin")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "usr/bin"
+        tf.addfile(link)
+        usr_bin = tarfile.TarInfo("/usr/bin/")
+        usr_bin.type = tarfile.DIRTYPE
+        tf.addfile(usr_bin)
+        normal = tarfile.TarInfo("/app/app/main.py")
+        normal.size = 0
+        tf.addfile(normal)
+    monkeypatch.setattr(subprocess, "run", _fake_run_creating_container(tarball))
+    result = subprocess.run(_argv("manifest.json"), capture_output=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = json.loads(result.stdout)
+    assert out["forbidden_artifacts"] == []
+    assert out["status"] == "passed"
+
+
+def test_regression_windows_drive_colon_member_flagged(monkeypatch, tmp_path):
+    # "C:/Users/..." member: Windows drive+colon host-absolute form -> exit 2
+    # with a host-absolute-path violation.
+    tarball = _build_synthetic_tarball(tmp_path,
+        members=[("C:/Users/zarat/secret.txt", b"x")])
+    monkeypatch.setattr(subprocess, "run", _fake_run_creating_container(tarball))
+    result = subprocess.run(_argv("manifest.json"), capture_output=True, check=False)
+    assert result.returncode == 2
+    out = json.loads(result.stdout)
+    assert any("host absolute path member" in a
+               for a in out["forbidden_artifacts"])
+
+
+def test_regression_windows_backslash_member_flagged(monkeypatch, tmp_path):
+    # "C:\Users\..." member: backslash drive form -> same host-absolute
+    # violation, exit 2.
+    tarball = _build_synthetic_tarball(tmp_path,
+        members=[(r"C:\Users\zarat\secret.txt", b"x")])
+    monkeypatch.setattr(subprocess, "run", _fake_run_creating_container(tarball))
+    result = subprocess.run(_argv("manifest.json"), capture_output=True, check=False)
+    assert result.returncode == 2
+    out = json.loads(result.stdout)
+    assert any("host absolute path member" in a
+               for a in out["forbidden_artifacts"])
