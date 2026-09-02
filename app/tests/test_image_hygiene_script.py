@@ -656,3 +656,40 @@ def test_regression_windows_backslash_member_flagged(monkeypatch, tmp_path):
     out = json.loads(result.stdout)
     assert any("host absolute path member" in a
                for a in out["forbidden_artifacts"])
+
+
+def test_regression_docker_absent_clean_exit_two(monkeypatch, tmp_path):
+    # The docker binary absent from PATH (a real spawn raises FileNotFoundError,
+    # exactly what `docker ...` does when PATH lacks it) must be a clean,
+    # bounded failure: exit 2, a single JSON report line, no traceback on
+    # stderr, and no docker create/export/rm issued after the failure.
+    tarball = _build_synthetic_tarball(tmp_path, members=[])
+    recorded = []
+
+    def fake_run(argv, **kwargs):
+        argv = [str(a) for a in argv]
+        recorded.append(argv)
+        if argv[:1] == ["docker"]:
+            raise FileNotFoundError(
+                "[Errno 2] No such file or directory: 'docker'")
+        return _fake_run_creating_container(tarball)(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = subprocess.run(_argv("manifest.json"), capture_output=True,
+                            check=False)
+    assert result.returncode == 2
+    # Exactly one JSON report line on stdout; nothing (no traceback) on stderr.
+    assert result.stderr == b""
+    lines = result.stdout.decode().splitlines()
+    assert len(lines) == 1
+    out = json.loads(lines[0])
+    assert out["status"] == "failed"
+    assert out["cleanup_complete"] is True
+    # Bounded diagnostic naming the failed service resolution — no argv dump.
+    assert out["forbidden_artifacts"] == [
+        "image id resolution failed: service api"]
+    assert all(len(a) < 200 for a in out["forbidden_artifacts"])
+    # The scan aborted before any container was created; no further docker
+    # create/export/rm commands may be issued after the absent-binary failure.
+    assert not any(a[:2] in (["docker", "create"], ["docker", "export"],
+                             ["docker", "rm"]) for a in recorded)

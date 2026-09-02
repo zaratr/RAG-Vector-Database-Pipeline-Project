@@ -39,10 +39,34 @@ def seed_env(tmp_path, monkeypatch):
     # Chroma ephemeral per process; nothing to clean outside the tmp db.
 
 
+def _child_env() -> dict[str, str]:
+    """Explicit environment for the dev_seed child process.
+
+    The overrides must be applied IN THE DICT, not relied upon via
+    ``monkeypatch.setenv`` + platform env inheritance: Windows drops
+    empty-valued variables when a child inherits the parent environment, so a
+    ``RAG_CHROMA_HOST=""`` override set that way never reaches the child and
+    ``scripts/dev_seed.py`` then falls back to the tree's ``.env`` (selecting
+    the Chroma HttpClient). Building the dict explicitly and passing it via
+    ``env=`` keeps the child hermetic regardless of platform inheritance
+    behavior or an ``.env`` file being present.
+
+    ``RAG_CHROMA_HOST=""`` is the config's "no host" form — an explicitly set
+    (empty) env var takes precedence over ``.env`` in pydantic-settings, and
+    ``Settings.chroma_host`` is falsy so ``_create_client`` selects the
+    EphemeralClient.
+    """
+    env = dict(os.environ)
+    env["RAG_CHROMA_HOST"] = ""  # '' is falsy -> ephemeral client in the child
+    env["RAG_EMBEDDING_PROVIDER"] = "local"  # no model downloads in the child
+    return env
+
+
 def _run_dev_seed() -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(PROJECT_ROOT / "scripts" / "dev_seed.py")],
         capture_output=True, text=True, cwd=str(PROJECT_ROOT), check=False,
+        env=_child_env(),
     )
 
 
